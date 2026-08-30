@@ -48,7 +48,19 @@ Panel {
   property bool showingHidden: false
 
   readonly property bool configured: !!(status && status.configured)
-  readonly property string syncState: String((status && status.sync_state) || (configured ? "in-sync" : "not-configured"))
+  readonly property string reportedSyncState: String((status && status.sync_state) || (configured ? "in-sync" : "not-configured"))
+  readonly property string syncState: {
+    var raw = reportedSyncState
+    // File-level "incoming" with nothing to review (comment-only bindings.lua,
+    // hidden rows) must not keep the header on Incoming updates.
+    if ((raw === "remote-ahead" || raw === "local-ahead") && !hasReviewable) {
+      var ahead = Number((status && status.ahead) || 0)
+      var behind = Number((status && status.behind) || 0)
+      if (ahead === 0 && behind === 0)
+        return "in-sync"
+    }
+    return raw
+  }
   readonly property bool alarming: syncState === "conflicts" || syncState === "diverged" || syncState === "invalid"
   readonly property bool pending: syncState === "ready" || syncState === "empty" || syncState === "remote-ahead" || syncState === "local-ahead" || alarming
   readonly property color stateColor: alarming ? urgent : (pending ? accent : foreground)
@@ -1368,7 +1380,7 @@ Panel {
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }
         TablePair { label: "Last publish"; value: Model.relativeAgo(root.status.last_publish_at) }
-        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.6") }
+        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.7") }
         TablePair {
           label: "Theme"
           value: {

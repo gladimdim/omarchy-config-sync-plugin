@@ -44,7 +44,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.6"
+PLUGIN_VERSION = "1.2.7"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -1455,6 +1455,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
     )
     for s in shortcuts:
         s["hidden"] = is_hidden_item("s", s["keys"], hidden_keys)
+    drop_bindings_file_without_shortcut_diffs(files, counts, shortcuts)
     plugins = plugin_groups(files)
     for plugin in plugins:
         manifest = load_json(repo / "plugins" / plugin["id"] / "manifest.json", default=None) or load_json(
@@ -1508,6 +1509,37 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         "theme": theme_diff,
         "hidden": list(hidden_keys),
     }
+
+
+def drop_bindings_file_without_shortcut_diffs(
+    files: list[dict[str, Any]], counts: dict[str, int], shortcuts: list[dict[str, Any]]
+) -> None:
+    """Ignore hypr/bindings.lua when every effective keybind already matches.
+
+    Comment, order, and cherry-pick-section drift still change the file hash, but
+    the Changes list is per-shortcut. Counting that file as incoming left the
+    header on "Incoming updates" with an empty review list.
+    """
+    if any(not s.get("hidden") for s in shortcuts):
+        return
+    for item in files:
+        if item.get("path") != "hypr/bindings.lua":
+            continue
+        status = str(item.get("status") or "identical")
+        if status in {"identical", "machine"}:
+            return
+        hidden = bool(item.get("hidden"))
+        item["status"] = "identical"
+        item["preview"] = ""
+        item["default_apply"] = False
+        item["default_publish"] = False
+        if hidden:
+            counts["hidden"] = max(0, int(counts.get("hidden") or 0) - 1)
+        else:
+            counts["changed"] = max(0, int(counts.get("changed") or 0) - 1)
+            counts[status] = max(0, int(counts.get(status) or 0) - 1)
+            counts["identical"] = int(counts.get("identical") or 0) + 1
+        return
 
 
 def rollup_sync_state(git_fields: dict[str, Any], counts: dict[str, int], has_baseline: bool) -> str:

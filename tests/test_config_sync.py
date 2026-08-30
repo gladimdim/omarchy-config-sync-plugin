@@ -257,6 +257,22 @@ class ShortcutTests(unittest.TestCase):
             self.assertEqual(cs.shortcut_diff(local, repo, stored), [])
             self.assertNotEqual(cs.file_hash(local, "hypr/bindings.lua"), cs.file_hash(repo, "hypr/bindings.lua"))
 
+    def test_comment_only_bindings_does_not_report_incoming(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            applied = cs.cmd_apply(env.ctx, argparse_ns())
+            self.assertTrue(applied["ok"], applied)
+            original = (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8")
+            write(repo / "hypr" / "bindings.lua", "-- only a comment changed\n" + original)
+            commit_all(repo, "comment-only bindings")
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertEqual(snap["sync_state"], "in-sync", snap["status"].get("counts"))
+            bindings = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/bindings.lua")
+            self.assertEqual(bindings["status"], "identical")
+            self.assertEqual(snap["diff"]["shortcuts"], [])
+            self.assertEqual(snap["status"]["repo_changes"], 0)
+
     def test_incoming_changed_and_added_are_not_both(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             local = Path(tmp) / "local.lua"

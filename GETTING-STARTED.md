@@ -131,7 +131,7 @@ When the badge lights up, **Review Changes** (or press `c`) opens a checklist. Y
 
 The selected Omarchy theme (`omarchy theme current`) is part of that list. Stock themes only need the name. If you customized a theme under `~/.config/omarchy/themes/<slug>/`, those overlay files sync too (wallpapers and preview images are skipped so the repo stays small). Apply runs `omarchy theme set` on the other machine.
 
-Both machines need the **same Config Sync plugin version** (Overview shows `Plugin: config-sync 1.2.6`). Incoming/outgoing groups, Include checkboxes, and Resync live in that version. Update with `omarchy plugin update gladimdim.config-sync --yes`, or copy `~/.config/omarchy/plugins/gladimdim.config-sync/` from the machine that already has 1.2.6, then `omarchy restart shell`. Removing the plugin also forgets the linked repo, so a reinstall starts at Connect.
+Both machines need the **same Config Sync plugin version** (Overview shows `Plugin: config-sync 1.2.7`). Incoming/outgoing groups, Include checkboxes, and Resync live in that version. Update with `omarchy plugin update gladimdim.config-sync --yes`, or copy `~/.config/omarchy/plugins/gladimdim.config-sync/` from the machine that already has 1.2.7, then `omarchy restart shell`. Removing the plugin also forgets the linked repo, so a reinstall starts at Connect.
 
 | You did this | Open the icon | Press |
 | --- | --- | --- |
