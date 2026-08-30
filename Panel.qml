@@ -44,7 +44,6 @@ Panel {
   property var pluginDiffs: []
   property var bundleDiffs: []
   property var themeDiff: null
-  property string lastNotifiedKey: ""
   property bool openOnChanges: false
   property bool showingHidden: false
 
@@ -620,21 +619,7 @@ Panel {
       } else {
         root.openOnChanges = false
       }
-      root.maybeNotify()
     })
-  }
-
-  function maybeNotify() {
-    if (!configured || !root.opened) return
-    var key = syncState + ":" + String(status.head || "") + ":" + String(status.local_changes || 0) + ":" + String(status.repo_changes || 0)
-    if (key === lastNotifiedKey) return
-    if (syncState === "in-sync" || syncState === "not-configured") return
-    if (syncState === "empty" && !root.opened) return
-    lastNotifiedKey = key
-    var title = Model.stateTitle(syncState)
-    var body = Model.stateHint(syncState, status)
-    notifyProc.command = ["omarchy-notification-send", "-u", alarming ? "critical" : "normal", "-g", "󰘿", title, body]
-    notifyProc.running = true
   }
 
   function run(args) {
@@ -722,8 +707,6 @@ Panel {
     }
     stderr: StdioCollector { waitForEnd: true }
   }
-
-  Process { id: notifyProc }
 
   IpcHandler {
     target: "gladimdim.config-sync"
@@ -1448,7 +1431,7 @@ Panel {
         width: parent.width
         textFormat: Text.PlainText
         text: root.showingHidden
-          ? "Hidden changes are ignored during sync and do not trigger notifications. Press Unhide on any item to restore it."
+          ? "Hidden changes are ignored during sync. Press Unhide on any item to restore it."
           : "Incoming is from git (Apply). Outgoing is this machine (Publish). Groups start collapsed — press one to tick each item. On = sync that row, Off = leave it alone."
         color: root.foreground
         font.family: root.fontFamily
@@ -1663,7 +1646,7 @@ Panel {
               Text {
                 width: parent.width
                 textFormat: Text.PlainText
-                text: "These changes are ignored and will not sync or trigger notifications."
+                text: "These changes are ignored and will not sync."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
