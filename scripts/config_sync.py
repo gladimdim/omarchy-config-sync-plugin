@@ -667,24 +667,195 @@ def strip_lua_comments(text: str) -> str:
 
 
 def parse_shortcuts(text: str) -> list[dict[str, str]]:
+    return [
+        {"keys": e["keys"], "label": e["label"], "kind": e["kind"]}
+        for e in extract_bind_statements(text)
+    ]
+
+
+def extract_bind_statements(text: str) -> list[dict[str, Any]]:
+    """One-line o.bind / hl.unbind entries, first occurrence of each key wins."""
     seen: set[str] = set()
-    out: list[dict[str, str]] = []
-    text = strip_lua_comments(text)
-    for match in BIND_RE.finditer(text):
-        keys = match.group(1).strip()
-        label = (match.group(2) or "").strip()
+    out: list[dict[str, Any]] = []
+    for index, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("--"):
+            continue
+        bind = BIND_RE.search(line)
+        unbind = UNBIND_RE.search(line) if not bind else None
+        if bind:
+            keys = bind.group(1).strip()
+            label = (bind.group(2) or "").strip() or "Custom binding"
+            kind = "bind"
+        elif unbind:
+            keys = unbind.group(1).strip()
+            label = "Unbound default"
+            kind = "unbind"
+        else:
+            continue
         if keys in seen:
             continue
         seen.add(keys)
-        if not label:
-            label = "Custom binding"
-        out.append({"keys": keys, "label": label, "kind": "bind"})
-    for match in UNBIND_RE.finditer(text):
-        keys = match.group(1).strip()
-        if keys in seen:
+        out.append(
+            {
+                "keys": keys,
+                "label": label,
+                "kind": kind,
+                "line": index,
+                "raw": line.rstrip("\n"),
+            }
+        )
+    return out
+
+
+def shortcut_diff(local_path: Path, repo_path: Path) -> list[dict[str, Any]]:
+    local_text = read_text(local_path) if local_path.is_file() else ""
+    repo_text = read_text(repo_path) if repo_path.is_file() else ""
+    local_map = {e["keys"]: e for e in extract_bind_statements(local_text)}
+    repo_map = {e["keys"]: e for e in extract_bind_statements(repo_text)}
+    rows = []
+    for keys in sorted(set(local_map) | set(repo_map)):
+        local_e = local_map.get(keys)
+        repo_e = repo_map.get(keys)
+        local_raw = local_e["raw"] if local_e else ""
+        repo_raw = repo_e["raw"] if repo_e else ""
+        if local_e and repo_e and local_raw.strip() == repo_raw.strip():
             continue
-        seen.add(keys)
-        out.append({"keys": keys, "label": "Unbound default", "kind": "unbind"})
+        if local_e and not repo_e:
+            status = "added-local"
+        elif repo_e and not local_e:
+            status = "added-repo"
+        else:
+            status = "both"
+        rows.append(
+            {
+                "keys": keys,
+                "label": (local_e or repo_e or {}).get("label") or keys,
+                "kind": (local_e or repo_e or {}).get("kind") or "bind",
+                "status": status,
+                "local_label": (local_e or {}).get("label") or "",
+                "repo_label": (repo_e or {}).get("label") or "",
+                "local_raw": local_raw,
+                "repo_raw": repo_raw,
+                "default_apply": status in {"added-repo", "repo"},
+                "default_publish": status in {"added-local", "local"},
+            }
+        )
+    return rows
+
+
+def upsert_shortcut_lines(dest_text: str, source_entries: dict[str, dict[str, Any]], selected_keys: list[str]) -> str:
+    dest_entries = {e["keys"]: e for e in extract_bind_statements(dest_text)}
+    lines = dest_text.splitlines(keepends=True)
+    replacements: dict[int, str] = {}
+    append: list[str] = []
+    for key in selected_keys:
+        src = source_entries.get(key)
+        if not src:
+            continue
+        raw = src["raw"].rstrip("\n") + "\n"
+        dest = dest_entries.get(key)
+        if dest is not None and 0 <= dest["line"] < len(lines):
+            replacements[dest["line"]] = raw
+        else:
+            append.append(raw)
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        out.append(replacements[i] if i in replacements else line)
+    if append:
+        body = "".join(out)
+        if body and not body.endswith("\n"):
+            out.append("\n")
+        if "-- config-sync cherry-pick" not in body:
+            out.append("\n-- config-sync cherry-pick\n")
+        out.extend(append)
+    return "".join(out)
+
+
+def merge_shortcuts_file(dest: Path, source: Path, selected_keys: list[str]) -> bool:
+    if not selected_keys:
+        return False
+    source_text = read_text(source) if source.is_file() else ""
+    source_entries = {e["keys"]: e for e in extract_bind_statements(source_text)}
+    dest_text = read_text(dest) if dest.is_file() else ""
+    merged = upsert_shortcut_lines(dest_text, source_entries, selected_keys)
+    if merged == dest_text:
+        return False
+    ensure_parent(dest)
+    dest.write_text(merged, encoding="utf-8")
+    return True
+
+
+def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for item in files:
+        if item.get("group") != "plugin":
+            continue
+        pid = plugin_id_from_path(item["path"])
+        if not pid:
+            continue
+        g = groups.setdefault(
+            pid,
+            {
+                "id": pid,
+                "name": pid,
+                "files": [],
+                "statuses": [],
+                "git_managed": bool(item.get("git_managed")),
+            },
+        )
+        g["files"].append(item["path"])
+        g["statuses"].append(item.get("status") or "identical")
+        if item.get("git_managed"):
+            g["git_managed"] = True
+    out = []
+    for pid, g in sorted(groups.items()):
+        statuses = [s for s in g["statuses"] if s not in {"identical", "machine"}]
+        if not statuses:
+            continue
+        unique = set(statuses)
+        if "both" in unique or ("local" in unique and "repo" in unique) or ("added-local" in unique and "added-repo" in unique):
+            status = "both"
+        elif unique <= {"local", "added-local"}:
+            status = "added-local" if "added-local" in unique else "local"
+        elif unique <= {"repo", "added-repo"}:
+            status = "added-repo" if "added-repo" in unique else "repo"
+        else:
+            status = "differs"
+        out.append(
+            {
+                "id": pid,
+                "name": pid,
+                "status": status,
+                "files": g["files"],
+                "file_count": len(g["files"]),
+                "changed_count": len(statuses),
+                "git_managed": g["git_managed"],
+                "default_apply": status in {"repo", "added-repo", "differs", "both"} and not g["git_managed"],
+                "default_publish": status in {"local", "added-local", "differs", "both"},
+            }
+        )
+    return out
+
+
+def plugin_id_from_path(rel: str) -> str:
+    if not rel.startswith("plugins/"):
+        return ""
+    parts = rel.split("/")
+    return parts[1] if len(parts) > 1 else ""
+
+
+def expand_plugin_paths(files: list[dict[str, Any]], plugin_ids: list[str], direction: str) -> set[str]:
+    wanted = set(plugin_ids)
+    out: set[str] = set()
+    for item in files:
+        pid = plugin_id_from_path(item["path"])
+        if pid not in wanted:
+            continue
+        if direction == "apply" and item.get("repo_exists"):
+            out.add(item["path"])
+        elif direction == "publish" and item.get("local_exists"):
+            out.add(item["path"])
     return out
 
 
@@ -887,7 +1058,15 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             item["preview"] = ""
         counts[status] = counts.get(status, 0) + 1
         files.append(item)
-    return {"files": files, "counts": counts}
+    shortcuts = shortcut_diff(ctx.config_hypr / "bindings.lua", repo / "hypr" / "bindings.lua")
+    plugins = plugin_groups(files)
+    for plugin in plugins:
+        manifest = load_json(repo / "plugins" / plugin["id"] / "manifest.json", default=None) or load_json(
+            ctx.config_plugins / plugin["id"] / "manifest.json", default=None
+        )
+        if isinstance(manifest, dict) and manifest.get("name"):
+            plugin["name"] = str(manifest.get("name"))
+    return {"files": files, "counts": counts, "shortcuts": shortcuts, "plugins": plugins}
 
 
 def rollup_sync_state(git_fields: dict[str, Any], counts: dict[str, int], has_baseline: bool) -> str:
@@ -970,6 +1149,8 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "repo_changes": diff["counts"].get("repo", 0) + diff["counts"].get("added-repo", 0),
         "both_changed": diff["counts"].get("both", 0),
         "unknown_differs": diff["counts"].get("differs", 0),
+        "shortcut_changes": len(diff.get("shortcuts") or []),
+        "plugin_changes": len(diff.get("plugins") or []),
     }
     return ok(
         {
@@ -1141,11 +1322,11 @@ def selected_items(diff_files: list[dict[str, Any]], wanted: set[str] | None, in
     return chosen
 
 
-def parse_files_arg(raw: str | None) -> set[str] | None:
-    if not raw:
-        return None
+def parse_files_arg(raw: str | None, explicit: bool = False) -> set[str] | None:
+    if raw is None or raw == "":
+        return set() if explicit else None
     parts = [p.strip() for p in raw.split(",") if p.strip()]
-    return set(parts) if parts else None
+    return set(parts)
 
 
 def extract_widget_entry(shell_data: Any) -> tuple[str | None, dict[str, Any] | None, int]:
@@ -1220,7 +1401,16 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
     diff = annotate_diff(ctx, repo, state)
-    wanted = parse_files_arg(args.files)
+    explicit = bool(getattr(args, "explicit", False))
+    shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
+    plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
+    wanted = parse_files_arg(args.files, explicit=explicit)
+    if plugin_ids:
+        extra = expand_plugin_paths(diff["files"], plugin_ids, "apply")
+        wanted = set() if wanted is None else set(wanted)
+        wanted |= extra
+    if shortcut_keys and wanted is not None:
+        wanted.discard("hypr/bindings.lua")
     unresolved_both = [
         i
         for i in diff["files"]
@@ -1232,7 +1422,9 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"both": [i["path"] for i in unresolved_both]},
         )
     chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "apply")
-    if not chosen:
+    if shortcut_keys:
+        chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
+    if not chosen and not shortcut_keys:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["message"] = "Nothing to apply."
@@ -1240,13 +1432,26 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
     shell_path = ctx.config_omarchy / "shell.json"
     section, widget_entry, widget_index = extract_widget_entry(load_json(shell_path, default={}))
-    backup_dir = backup_local(ctx, [i for i in chosen if i["local_exists"]])
+    backup_targets = [i for i in chosen if i["local_exists"]]
+    bindings_local = ctx.config_hypr / "bindings.lua"
+    if shortcut_keys and bindings_local.is_file():
+        backup_targets.append(
+            {
+                "path": "hypr/bindings.lua",
+                "local_path": str(bindings_local),
+                "local_exists": True,
+            }
+        )
+    backup_dir = backup_local(ctx, backup_targets)
     applied = []
     for item in chosen:
         if not Path(item["repo_path"]).is_file():
             continue
         copy_mapped_file(item, "apply")
         applied.append(item["path"])
+    if shortcut_keys:
+        if merge_shortcuts_file(bindings_local, repo / "hypr" / "bindings.lua", shortcut_keys):
+            applied.append("hypr/bindings.lua")
     restore_widget_entry(shell_path, section, widget_entry, widget_index)
 
     # Refresh hashes for every tracked file after apply.
@@ -1307,7 +1512,16 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
     diff = annotate_diff(ctx, repo, state)
-    wanted = parse_files_arg(args.files)
+    explicit = bool(getattr(args, "explicit", False))
+    shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
+    plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
+    wanted = parse_files_arg(args.files, explicit=explicit)
+    if plugin_ids:
+        extra = expand_plugin_paths(diff["files"], plugin_ids, "publish")
+        wanted = set() if wanted is None else set(wanted)
+        wanted |= extra
+    if shortcut_keys and wanted is not None:
+        wanted.discard("hypr/bindings.lua")
     unresolved_both = [
         i
         for i in diff["files"]
@@ -1319,7 +1533,9 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"both": [i["path"] for i in unresolved_both]},
         )
     chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "publish")
-    if not chosen:
+    if shortcut_keys:
+        chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
+    if not chosen and not shortcut_keys:
         if args.push and git_fields["ahead"] and not git_fields["behind"]:
             result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
             snap = build_snapshot(ctx, fetch=False)
@@ -1343,6 +1559,9 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             continue
         copy_mapped_file(item, "publish")
         published.append(item["path"])
+    if shortcut_keys:
+        if merge_shortcuts_file(repo / "hypr" / "bindings.lua", ctx.config_hypr / "bindings.lua", shortcut_keys):
+            published.append("hypr/bindings.lua")
 
     # Strip any accidental .git dirs copied with plugins
     plugins_dir = repo / "plugins"
@@ -1495,6 +1714,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--push", action="store_true")
     parser.add_argument("--include-machine", action="store_true")
     parser.add_argument("--files", default=None)
+    parser.add_argument("--explicit", action="store_true")
+    parser.add_argument("--shortcut", action="append", default=None)
+    parser.add_argument("--plugin", action="append", default=None)
     parser.add_argument("--message", default=None)
     parser.add_argument("--delete-clone", action="store_true")
     parser.add_argument("--side", default=None)

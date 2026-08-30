@@ -35,9 +35,12 @@ Panel {
   property bool includeMachine: false
   property string confirmKind: ""
   property var bothPicks: ({})
+  property var picks: ({})
   property var status: ({})
   property var inspect: null
   property var diffFiles: []
+  property var shortcutDiffs: []
+  property var pluginDiffs: []
   property string lastNotifiedKey: ""
 
   readonly property bool configured: !!(status && status.configured)
@@ -53,15 +56,42 @@ Panel {
     { name: "Configs", icon: "󰒓" }
   ]
 
-  readonly property var incomingFiles: Model.filesByStatus(diffFiles, ["repo", "added-repo"])
-  readonly property var localFiles: Model.filesByStatus(diffFiles, ["local", "added-local"])
-  readonly property var bothFiles: Model.filesByStatus(diffFiles, ["both"])
-  readonly property var differsFiles: Model.filesByStatus(diffFiles, ["differs"])
+  readonly property var incomingFiles: Model.filesByStatus(otherFiles, ["repo", "added-repo"])
+  readonly property var localFiles: Model.filesByStatus(otherFiles, ["local", "added-local"])
+  readonly property var bothFiles: Model.filesByStatus(otherFiles, ["both"])
+  readonly property var differsFiles: Model.filesByStatus(otherFiles, ["differs"])
   readonly property var conflictFiles: (status && status.conflicts) ? status.conflicts : []
+  readonly property var otherFiles: {
+    var out = []
+    for (var i = 0; i < diffFiles.length; i++) {
+      var f = diffFiles[i]
+      if (f.status === "identical" || f.status === "machine") continue
+      if (!includeMachine && !f.portable) continue
+      if (f.group === "plugin") continue
+      if (f.path === "hypr/bindings.lua") continue
+      out.push(f)
+    }
+    return out
+  }
+  readonly property var incomingShortcuts: Model.filesByStatus(shortcutDiffs, ["repo", "added-repo"])
+  readonly property var localShortcuts: Model.filesByStatus(shortcutDiffs, ["local", "added-local"])
+  readonly property var bothShortcuts: Model.filesByStatus(shortcutDiffs, ["both"])
+  readonly property var incomingPlugins: Model.filesByStatus(pluginDiffs, ["repo", "added-repo"])
+  readonly property var localPlugins: Model.filesByStatus(pluginDiffs, ["local", "added-local"])
+  readonly property var bothPlugins: Model.filesByStatus(pluginDiffs, ["both"])
+  readonly property var differsPlugins: Model.filesByStatus(pluginDiffs, ["differs"])
+  readonly property bool hasReviewable: otherFiles.length + shortcutDiffs.length + pluginDiffs.length + conflictFiles.length > 0
   readonly property int unresolvedBoth: {
     var n = 0
-    for (var i = 0; i < bothFiles.length; i++) {
-      if (!bothPicks[bothFiles[i].path]) n++
+    var i
+    for (i = 0; i < bothFiles.length; i++) {
+      if (isPicked("f", bothFiles[i].path) && !bothPicks[bothFiles[i].path]) n++
+    }
+    for (i = 0; i < bothShortcuts.length; i++) {
+      if (isPicked("s", bothShortcuts[i].keys) && !bothPicks["s:" + bothShortcuts[i].keys]) n++
+    }
+    for (i = 0; i < bothPlugins.length; i++) {
+      if (isPicked("p", bothPlugins[i].id) && !bothPicks["p:" + bothPlugins[i].id]) n++
     }
     return n
   }
@@ -80,32 +110,178 @@ Panel {
     run(["connect", url])
   }
 
+  function cloneMap(obj) {
+    var next = {}
+    var keys = Object.keys(obj || {})
+    for (var i = 0; i < keys.length; i++) next[keys[i]] = obj[keys[i]]
+    return next
+  }
+
+  function pickId(kind, id) { return kind + ":" + id }
+
+  function isPicked(kind, id) { return !!picks[pickId(kind, id)] }
+
+  function togglePick(kind, id) {
+    var key = pickId(kind, id)
+    var next = cloneMap(picks)
+    next[key] = !next[key]
+    picks = next
+  }
+
+  function setPicked(kind, id, on) {
+    var next = cloneMap(picks)
+    next[pickId(kind, id)] = on
+    picks = next
+  }
+
+  function seedPicks() {
+    var next = {}
+    var i, key, item
+    for (i = 0; i < otherFiles.length; i++) {
+      item = otherFiles[i]
+      key = pickId("f", item.path)
+      next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish || item.status === "differs")
+    }
+    for (i = 0; i < shortcutDiffs.length; i++) {
+      item = shortcutDiffs[i]
+      key = pickId("s", item.keys)
+      next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish)
+    }
+    for (i = 0; i < pluginDiffs.length; i++) {
+      item = pluginDiffs[i]
+      key = pickId("p", item.id)
+      next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish || item.status === "differs")
+    }
+    picks = next
+  }
+
+  function reviewChanges() { activeTab = 1 }
+
+  function bulkPick(mode) {
+    var next = cloneMap(picks)
+    var keys = Object.keys(next)
+    var i, k, on
+    function sideOf(key) {
+      if (key.indexOf("s:") === 0) {
+        for (i = 0; i < shortcutDiffs.length; i++)
+          if (pickId("s", shortcutDiffs[i].keys) === key)
+            return shortcutDiffs[i].status
+      } else if (key.indexOf("p:") === 0) {
+        for (i = 0; i < pluginDiffs.length; i++)
+          if (pickId("p", pluginDiffs[i].id) === key)
+            return pluginDiffs[i].status
+      } else if (key.indexOf("f:") === 0) {
+        for (i = 0; i < otherFiles.length; i++)
+          if (pickId("f", otherFiles[i].path) === key)
+            return otherFiles[i].status
+      }
+      return ""
+    }
+    for (var ki = 0; ki < keys.length; ki++) {
+      k = keys[ki]
+      var st = sideOf(k)
+      if (mode === "all") on = true
+      else if (mode === "none") on = false
+      else if (mode === "in") on = st === "repo" || st === "added-repo" || st === "differs" || st === "both"
+      else on = st === "local" || st === "added-local" || st === "differs" || st === "both"
+      next[k] = on
+    }
+    picks = next
+  }
+
   function selectedApplyFiles() {
     var out = []
-    for (var i = 0; i < diffFiles.length; i++) {
-      var f = diffFiles[i]
-      if (!includeMachine && !f.portable) continue
+    var i, f
+    for (i = 0; i < otherFiles.length; i++) {
+      f = otherFiles[i]
+      if (!isPicked("f", f.path)) continue
       if (f.status === "both") {
         if (bothPicks[f.path] === "repo") out.push(f.path)
         continue
       }
-      if (f.default_apply) out.push(f.path)
+      if (f.status === "repo" || f.status === "added-repo" || f.status === "differs") out.push(f.path)
     }
     return out
   }
 
   function selectedPublishFiles() {
     var out = []
-    for (var i = 0; i < diffFiles.length; i++) {
-      var f = diffFiles[i]
-      if (!includeMachine && !f.portable) continue
+    var i, f
+    for (i = 0; i < otherFiles.length; i++) {
+      f = otherFiles[i]
+      if (!isPicked("f", f.path)) continue
       if (f.status === "both") {
         if (bothPicks[f.path] === "local") out.push(f.path)
         continue
       }
-      if (f.default_publish) out.push(f.path)
+      if (f.status === "local" || f.status === "added-local" || f.status === "differs") out.push(f.path)
     }
     return out
+  }
+
+  function selectedApplyShortcuts() {
+    var out = []
+    var i, s
+    for (i = 0; i < shortcutDiffs.length; i++) {
+      s = shortcutDiffs[i]
+      if (!isPicked("s", s.keys)) continue
+      if (s.status === "both") {
+        if (bothPicks["s:" + s.keys] === "repo") out.push(s.keys)
+        continue
+      }
+      if (s.status === "added-repo" || s.status === "repo") out.push(s.keys)
+    }
+    return out
+  }
+
+  function selectedPublishShortcuts() {
+    var out = []
+    var i, s
+    for (i = 0; i < shortcutDiffs.length; i++) {
+      s = shortcutDiffs[i]
+      if (!isPicked("s", s.keys)) continue
+      if (s.status === "both") {
+        if (bothPicks["s:" + s.keys] === "local") out.push(s.keys)
+        continue
+      }
+      if (s.status === "added-local" || s.status === "local") out.push(s.keys)
+    }
+    return out
+  }
+
+  function selectedApplyPlugins() {
+    var out = []
+    var i, p
+    for (i = 0; i < pluginDiffs.length; i++) {
+      p = pluginDiffs[i]
+      if (!isPicked("p", p.id) || p.git_managed) continue
+      if (p.status === "both") {
+        if (bothPicks["p:" + p.id] === "repo") out.push(p.id)
+        continue
+      }
+      if (p.status === "added-repo" || p.status === "repo" || p.status === "differs") out.push(p.id)
+    }
+    return out
+  }
+
+  function selectedPublishPlugins() {
+    var out = []
+    var i, p
+    for (i = 0; i < pluginDiffs.length; i++) {
+      p = pluginDiffs[i]
+      if (!isPicked("p", p.id)) continue
+      if (p.status === "both") {
+        if (bothPicks["p:" + p.id] === "local") out.push(p.id)
+        continue
+      }
+      if (p.status === "added-local" || p.status === "local" || p.status === "differs") out.push(p.id)
+    }
+    return out
+  }
+
+  function selectSide(kind, id, side) {
+    setPick(kind === "f" ? id : (kind + ":" + id), side)
+    setPicked(kind, id, true)
   }
 
   function requestApply() {
@@ -119,8 +295,8 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedApplyFiles().length === 0) {
-      lastError = "Nothing from the repo is selected to apply."
+    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length === 0) {
+      lastError = "Check the incoming shortcuts, plugins, or files you want to apply."
       activeTab = 1
       return
     }
@@ -138,8 +314,8 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedPublishFiles().length === 0 && Number(status.ahead || 0) === 0) {
-      lastError = "No local changes to publish."
+    if (selectedPublishFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length === 0 && Number(status.ahead || 0) === 0) {
+      lastError = "Check the local shortcuts, plugins, or files you want to publish."
       activeTab = 1
       return
     }
@@ -151,15 +327,23 @@ Panel {
     confirmKind = ""
     if (kind === "apply") {
       var files = selectedApplyFiles()
-      var args = ["apply"]
+      var args = ["apply", "--explicit", "--files", files.join(",")]
       if (includeMachine) args.push("--include-machine")
-      args.push("--files", files.join(","))
+      var ashort = selectedApplyShortcuts()
+      var aplugs = selectedApplyPlugins()
+      var ai
+      for (ai = 0; ai < ashort.length; ai++) args.push("--shortcut", ashort[ai])
+      for (ai = 0; ai < aplugs.length; ai++) args.push("--plugin", aplugs[ai])
       run(args)
     } else if (kind === "publish") {
       var pub = selectedPublishFiles()
-      var pargs = ["publish", "--push"]
+      var pargs = ["publish", "--push", "--explicit", "--files", pub.join(",")]
       if (includeMachine) pargs.push("--include-machine")
-      if (pub.length > 0) pargs.push("--files", pub.join(","))
+      var pshort = selectedPublishShortcuts()
+      var pplugs = selectedPublishPlugins()
+      var pi
+      for (pi = 0; pi < pshort.length; pi++) pargs.push("--shortcut", pshort[pi])
+      for (pi = 0; pi < pplugs.length; pi++) pargs.push("--plugin", pplugs[pi])
       run(pargs)
     } else if (kind === "disconnect") {
       run(["disconnect"])
@@ -188,11 +372,13 @@ Panel {
     status = data.status || {}
     inspect = data.inspect || null
     diffFiles = (data.diff && data.diff.files) ? data.diff.files : []
+    shortcutDiffs = (data.diff && data.diff.shortcuts) ? data.diff.shortcuts : []
+    pluginDiffs = (data.diff && data.diff.plugins) ? data.diff.plugins : []
     if (data.sync_state && status)
       status = Object.assign({}, status, { sync_state: data.sync_state })
     if (!repoUrlInput && status.repo_url)
       repoUrlInput = String(status.repo_url)
-    maybeNotify()
+    Qt.callLater(function() { root.seedPicks(); root.maybeNotify() })
   }
 
   function maybeNotify() {
@@ -361,6 +547,7 @@ Panel {
         if (t === "r" || t === "R") root.refresh(true)
         else if (t === "a" || t === "A") root.requestApply()
         else if (t === "p" || t === "P") root.requestPublish()
+        else if (t === "c" || t === "C") root.reviewChanges()
         else if (t >= "1" && t <= "5") root.activeTab = parseInt(t) - 1
       }
 
@@ -670,11 +857,11 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               text: root.confirmKind === "apply"
-                ? "Apply repo configs to this laptop? A timestamped backup is written first. Display layout stays local unless you opted in."
+                ? "Apply the checked incoming shortcuts, plugins, and files onto this laptop? A timestamped backup is written first."
                 : root.confirmKind === "publish"
                   ? (root.syncState === "empty"
-                    ? "Seed this private GitHub repo with this laptop's Omarchy config, then push? Keep the repo private so shortcuts, hooks, and scripts are not public."
-                    : "Copy this laptop's changes into the repo, commit, and push so your other machines can pull them?")
+                    ? "Seed this private GitHub repo with the checked items from this laptop, then push? Keep the repo private so shortcuts, hooks, and scripts are not public."
+                    : "Copy the checked local shortcuts, plugins, and files into the repo, commit, and push?")
                   : "Unlink the config repo on this laptop? Local files are left as they are."
               color: root.foreground
               font.family: root.fontFamily
@@ -760,10 +947,20 @@ Panel {
         spacing: Style.space(8)
 
         Button {
+          visible: root.hasReviewable
+          text: "Review Changes"
+          iconText: "󰦓"
+          tooltipText: "Cherry-pick shortcuts, plugins, and files (c)"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          onClicked: root.reviewChanges()
+        }
+        Button {
           visible: root.syncState !== "empty"
           text: "Apply"
           iconText: "󰁨"
-          tooltipText: "Copy repo → this laptop (a)"
+          tooltipText: "Apply checked incoming items (a)"
           foreground: root.foreground
           fontFamily: root.fontFamily
           bordered: true
@@ -775,7 +972,7 @@ Panel {
           iconText: "󰓂"
           tooltipText: root.syncState === "empty"
             ? "Seed the empty private repo from this machine, then push"
-            : "Copy this laptop → repo and push (p)"
+            : "Publish checked local items (p)"
           foreground: root.foreground
           fontFamily: root.fontFamily
           bordered: true
@@ -828,14 +1025,79 @@ Panel {
       spacing: Style.space(12)
 
       Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Check only what you want. Incoming items Apply onto this laptop. Local items Publish to the repo. Unchecked shortcuts, plugins, and files stay as they are."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+
+      Text {
         visible: root.unresolvedBoth > 0
         width: parent.width
         textFormat: Text.PlainText
-        text: "Choose Keep local or Take repo for every file that changed on both sides before Apply or Publish."
+        text: "Checked items that changed on both sides still need Keep local or Take repo."
         color: root.urgent
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         wrapMode: Text.WordWrap
+      }
+
+      Row {
+        spacing: Style.space(6)
+        Button {
+          text: "Select incoming"
+          fontSize: Style.font.caption
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.bulkPick("in")
+        }
+        Button {
+          text: "Select local"
+          fontSize: Style.font.caption
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.bulkPick("out")
+        }
+        Button {
+          text: "Select all"
+          fontSize: Style.font.caption
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.bulkPick("all")
+        }
+        Button {
+          text: "Clear"
+          fontSize: Style.font.caption
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.bulkPick("none")
+        }
+      }
+
+      Row {
+        spacing: Style.space(8)
+        Button {
+          visible: root.syncState !== "empty"
+          text: "Apply selected"
+          iconText: "󰁨"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          enabled: !root.busy
+          onClicked: root.requestApply()
+        }
+        Button {
+          text: root.syncState === "empty" ? "Publish selected" : "Publish selected"
+          iconText: "󰓂"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          enabled: !root.busy
+          onClicked: root.requestPublish()
+        }
       }
 
       Toggle {
@@ -844,7 +1106,10 @@ Panel {
         checked: root.includeMachine
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onClicked: root.includeMachine = !root.includeMachine
+        onClicked: {
+          root.includeMachine = !root.includeMachine
+          Qt.callLater(function() { root.seedPicks() })
+        }
       }
 
       Column {
@@ -882,12 +1147,64 @@ Panel {
         }
       }
 
-      ChangeSection { title: "INCOMING FROM REPO"; files: root.incomingFiles.concat(root.differsFiles) }
-      ChangeSection { title: "CHANGED ON THIS LAPTOP"; files: root.localFiles }
-      ChangeSection { title: "BOTH CHANGED"; files: root.bothFiles; both: true }
+      ChangeSection {
+        title: "INCOMING SHORTCUTS"
+        kind: "s"
+        idField: "keys"
+        files: root.incomingShortcuts
+        labelField: "keys"
+        summaryField: "label"
+      }
+      ChangeSection {
+        title: "LOCAL SHORTCUTS"
+        kind: "s"
+        idField: "keys"
+        files: root.localShortcuts
+        labelField: "keys"
+        summaryField: "label"
+      }
+      ChangeSection {
+        title: "SHORTCUTS CHANGED ON BOTH SIDES"
+        kind: "s"
+        idField: "keys"
+        files: root.bothShortcuts
+        labelField: "keys"
+        summaryField: "label"
+        both: true
+      }
+
+      ChangeSection {
+        title: "INCOMING PLUGINS"
+        kind: "p"
+        idField: "id"
+        files: root.incomingPlugins.concat(root.differsPlugins)
+        labelField: "name"
+        summaryField: "id"
+      }
+      ChangeSection {
+        title: "LOCAL PLUGINS"
+        kind: "p"
+        idField: "id"
+        files: root.localPlugins
+        labelField: "name"
+        summaryField: "id"
+      }
+      ChangeSection {
+        title: "PLUGINS CHANGED ON BOTH SIDES"
+        kind: "p"
+        idField: "id"
+        files: root.bothPlugins
+        labelField: "name"
+        summaryField: "id"
+        both: true
+      }
+
+      ChangeSection { title: "INCOMING FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
+      ChangeSection { title: "LOCAL FILES"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
+      ChangeSection { title: "FILES CHANGED ON BOTH SIDES"; kind: "f"; idField: "path"; files: root.bothFiles; labelField: "path"; summaryField: "summary"; both: true }
 
       Text {
-        visible: root.incomingFiles.length + root.localFiles.length + root.bothFiles.length + root.differsFiles.length + root.conflictFiles.length === 0
+        visible: !root.hasReviewable
         width: parent.width
         textFormat: Text.PlainText
         text: "No portable config differences. This laptop matches the repo."
@@ -1141,9 +1458,14 @@ Panel {
   }
 
   component ChangeSection: Column {
+    id: sectionRoot
     property string title: ""
     property var files: []
     property bool both: false
+    property string kind: "f"
+    property string idField: "path"
+    property string labelField: "path"
+    property string summaryField: "summary"
     width: parent.width
     spacing: Style.space(6)
     visible: files && files.length > 0
@@ -1156,34 +1478,125 @@ Panel {
 
     Repeater {
       model: files
-      FileRow {
+      PickRow {
         required property var modelData
         width: parent.width
-        pathLabel: modelData.path
-        summary: modelData.summary
-        statusLabel: Model.fileStatusLabel(modelData.status)
-        extra: both ? bothButtons : null
-        property Component bothButtons: Row {
-          spacing: Style.space(4)
-          Button {
-            text: "Keep local"
-            fontSize: Style.font.caption
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            selected: root.bothPicks[modelData.path] === "local"
-            bordered: true
-            onClicked: root.setPick(modelData.path, "local")
-          }
-          Button {
-            text: "Take repo"
-            fontSize: Style.font.caption
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            selected: root.bothPicks[modelData.path] === "repo"
-            bordered: true
-            onClicked: root.setPick(modelData.path, "repo")
-          }
+        kind: sectionRoot.kind
+        itemId: String(modelData[sectionRoot.idField] || "")
+        pathLabel: String(modelData[sectionRoot.labelField] || "")
+        summary: {
+          var extra = String(modelData[sectionRoot.summaryField] || "")
+          if (sectionRoot.kind === "p")
+            extra = extra + " · " + String(modelData.changed_count || 0) + " files"
+          return extra
         }
+        statusLabel: Model.fileStatusLabel(modelData.status)
+        both: sectionRoot.both
+      }
+    }
+  }
+
+  component PickRow: Rectangle {
+    property string kind: "f"
+    property string itemId: ""
+    property string pathLabel: ""
+    property string summary: ""
+    property string statusLabel: ""
+    property bool both: false
+    readonly property bool checked: root.isPicked(kind, itemId)
+    readonly property string bothKey: kind === "f" ? itemId : (kind + ":" + itemId)
+
+    width: parent ? parent.width : 100
+    implicitHeight: Math.max(checkBox.implicitHeight, pickCol.implicitHeight, bothRow.implicitHeight) + Style.space(12)
+    radius: Style.cornerRadius
+    color: checked ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.08) : root.cardBg
+    border.width: 1
+    border.color: checked ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.45) : root.cardBorder
+
+    MouseArea {
+      anchors.left: parent.left
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.right: both ? bothRow.left : parent.right
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.togglePick(kind, itemId)
+    }
+
+    Rectangle {
+      id: checkBox
+      width: Style.space(16)
+      height: Style.space(16)
+      radius: 3
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      color: checked ? root.accent : "transparent"
+      border.width: 1
+      border.color: checked ? root.accent : root.cardBorder
+      Text {
+        anchors.centerIn: parent
+        text: checked ? "✓" : ""
+        color: Color.background
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+    }
+
+    Column {
+      id: pickCol
+      anchors.left: checkBox.right
+      anchors.leftMargin: Style.space(8)
+      anchors.right: bothRow.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: 2
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: pathLabel
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        elide: Text.ElideMiddle
+      }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: summary + (statusLabel ? " · " + statusLabel : "")
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+    }
+
+    Row {
+      id: bothRow
+      visible: both
+      spacing: Style.space(4)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      z: 2
+      Button {
+        text: "Keep local"
+        fontSize: Style.font.caption
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        selected: root.bothPicks[bothKey] === "local"
+        bordered: true
+        onClicked: root.selectSide(kind, itemId, "local")
+      }
+      Button {
+        text: "Take repo"
+        fontSize: Style.font.caption
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        selected: root.bothPicks[bothKey] === "repo"
+        bordered: true
+        onClicked: root.selectSide(kind, itemId, "repo")
       }
     }
   }

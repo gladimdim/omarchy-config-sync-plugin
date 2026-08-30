@@ -127,6 +127,8 @@ On the new Omarchy machine:
 
 After that, daily life is:
 
+When the badge lights up, **Review Changes** (or press `c`) opens a checklist. You can apply or publish only some shortcuts, only certain plugins, or only some config files. Unchecked items stay as they are on that machine.
+
 | You did this | Open the icon | Press |
 | --- | --- | --- |
 | Added a shortcut / plugin on this laptop | Badge: local changes | **Publish** |

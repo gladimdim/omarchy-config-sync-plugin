@@ -6,6 +6,8 @@ A status-bar plugin that keeps [Omarchy](https://omarchy.org/) configs in a **pr
 
 Click the cloud-sync tray icon, paste the git URL of your config repo, preview what would land on this machine, then **Apply**. When you add a shortcut or plugin locally, open the panel again and **Publish** to send it to the next laptop.
 
+When there is drift, **Review Changes** opens a checklist: incoming vs local **shortcuts** (individual keybindings), **plugins** (whole plugin), and other config files. Uncheck anything you do not want. Apply and Publish only touch the checked items.
+
 ## Features
 
 - **Tray icon** in the Omarchy bar, with a badge when this laptop and the repo have drifted.
@@ -74,8 +76,9 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | Right click | Refresh + fetch |
 | `1`–`5` or `←` `→` | Switch tabs |
 | `r` | Refresh |
-| `a` | Apply |
-| `p` | Publish |
+| `c` | Review Changes (cherry-pick) |
+| `a` | Apply selected |
+| `p` | Publish selected |
 | `Esc` | Close |
 
 ## Dependencies

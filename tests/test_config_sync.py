@@ -215,6 +215,25 @@ class ShortcutTests(unittest.TestCase):
         rows = cs.parse_shortcuts('hl.unbind("SUPER + SHIFT + B")\n')
         self.assertEqual(rows, [{"keys": "SUPER + SHIFT + B", "label": "Unbound default", "kind": "unbind"}])
 
+    def test_upsert_keeps_other_binds(self) -> None:
+        dest = (
+            'o.bind("SUPER + A", "Alpha", "a")\n'
+            'o.bind("SUPER + B", "Beta", "b")\n'
+        )
+        src = extract_map(
+            'o.bind("SUPER + B", "Beta 2", "b2")\n'
+            'o.bind("SUPER + C", "Gamma", "c")\n'
+        )
+        merged = cs.upsert_shortcut_lines(dest, src, ["SUPER + B", "SUPER + C"])
+        self.assertIn('o.bind("SUPER + A", "Alpha", "a")', merged)
+        self.assertIn('o.bind("SUPER + B", "Beta 2", "b2")', merged)
+        self.assertIn('o.bind("SUPER + C", "Gamma", "c")', merged)
+        self.assertNotIn('o.bind("SUPER + B", "Beta", "b")', merged)
+
+
+def extract_map(text: str) -> dict:
+    return {e["keys"]: e for e in cs.extract_bind_statements(text)}
+
 
 class ClassifyTests(unittest.TestCase):
     def _item(self, local: str | None, repo: str | None) -> dict:
@@ -377,6 +396,35 @@ class InspectAndSyncTests(unittest.TestCase):
             with self.assertRaises(cs.SyncError):
                 cs.cmd_connect(env.ctx, argparse_ns(args=[str(junk)]))
 
+    def test_cherrypick_one_shortcut_and_one_plugin(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_apply(env.ctx, argparse_ns())
+            bindings = env.ctx.config_hypr / "bindings.lua"
+            bindings.write_text(
+                bindings.read_text(encoding="utf-8")
+                + 'o.bind("SUPER + Y", "Only this", "true")\n'
+                + 'o.bind("SUPER + Z", "Leave this", "true")\n',
+                encoding="utf-8",
+            )
+            write(env.ctx.config_plugins / "demo.widget" / "Main.qml", "import QtQuick\nItem { objectName: \"changed\" }\n")
+            write(
+                env.ctx.config_plugins / "other.widget" / "manifest.json",
+                json.dumps({"schemaVersion": 1, "id": "other.widget", "name": "Other", "kinds": ["bar-widget"], "entryPoints": {"barWidget": "Main.qml"}}),
+            )
+            write(env.ctx.config_plugins / "other.widget" / "Main.qml", "Item {}\n")
+            published = cs.cmd_publish(
+                env.ctx,
+                argparse_ns(explicit=True, files="", shortcut=["SUPER + Y"], plugin=["other.widget"]),
+            )
+            self.assertTrue(published["ok"], published)
+            repo_bind = (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8")
+            self.assertIn("Only this", repo_bind)
+            self.assertNotIn("Leave this", repo_bind)
+            self.assertTrue((repo / "plugins" / "other.widget" / "manifest.json").is_file())
+            self.assertNotIn("changed", (repo / "plugins" / "demo.widget" / "Main.qml").read_text(encoding="utf-8"))
+
     def test_connect_empty_repo_and_publish_seeds(self) -> None:
         with TempHome() as env:
             empty = env.home / "empty"
@@ -444,6 +492,9 @@ def argparse_ns(**kwargs):
         push = False
         include_machine = False
         files = None
+        explicit = False
+        shortcut = None
+        plugin = None
         message = None
         delete_clone = False
         side = None
