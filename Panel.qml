@@ -1523,11 +1523,15 @@ Panel {
 
       Toggle {
         visible: !root.showingHidden
+        width: parent.width
         label: "Include display layout"
-        description: "hypr/monitors.lua is machine-specific and skipped by default."
+        description: "hypr/monitors.lua is machine-specific and skipped by default unless enabled here."
         checked: root.includeMachine
         foreground: root.foreground
+        accent: root.accent
         fontFamily: root.fontFamily
+        titleSize: Style.font.body
+        descriptionSize: Style.font.caption
         onClicked: {
           root.includeMachine = !root.includeMachine
           Qt.callLater(function() { root.seedPicks() })
