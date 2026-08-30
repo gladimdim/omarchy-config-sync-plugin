@@ -2346,6 +2346,72 @@ def cmd_open(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return ok({"opened": str(target), "success": success})
 
 
+def open_in_terminal(target_path: str | Path) -> bool:
+    target = Path(target_path).expanduser().resolve()
+    directory = target if target.is_dir() else target.parent
+    if not directory.exists() and directory.parent.exists():
+        directory = directory.parent
+    if not directory.exists():
+        return False
+
+    # 1. Try uwsm-app + xdg-terminal-exec (Omarchy standard)
+    if shutil.which("uwsm-app") and shutil.which("xdg-terminal-exec"):
+        try:
+            subprocess.Popen(["uwsm-app", "--", "xdg-terminal-exec", f"--dir={directory}"])
+            return True
+        except OSError:
+            pass
+
+    if shutil.which("xdg-terminal-exec"):
+        try:
+            subprocess.Popen(["xdg-terminal-exec", f"--dir={directory}"])
+            return True
+        except OSError:
+            pass
+
+    # 2. Try specific terminals
+    for term, flag in [("foot", "-D"), ("ghostty", "--working-directory="), ("alacritty", "--working-directory"), ("kitty", "--directory")]:
+        binary = shutil.which(term)
+        if binary:
+            try:
+                if flag.endswith("="):
+                    subprocess.Popen([binary, f"{flag}{directory}"])
+                else:
+                    subprocess.Popen([binary, flag, str(directory)])
+                return True
+            except OSError:
+                pass
+
+    return False
+
+
+def cmd_terminal(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    raw_path = args.args[0] if args.args else getattr(args, "files", None) or ""
+    if not raw_path:
+        raise SyncError("No path provided to open in terminal.")
+    target = Path(raw_path).expanduser()
+    if not target.is_absolute():
+        try:
+            repo = configured_repo(ctx)
+        except Exception:
+            repo = ctx.default_clone
+        inv = collect_inventory(ctx, repo)
+        mapped = next((i for i in inv if i["path"] == raw_path), None)
+        if mapped and Path(mapped["local_path"]).exists():
+            target = Path(mapped["local_path"])
+        elif mapped and Path(mapped["repo_path"]).exists():
+            target = Path(mapped["repo_path"])
+        elif (ctx.home / ".config" / raw_path).exists():
+            target = ctx.home / ".config" / raw_path
+        elif (ctx.local_bin / raw_path.removeprefix("bin/")).exists():
+            target = ctx.local_bin / raw_path.removeprefix("bin/")
+        elif (repo / raw_path).exists():
+            target = repo / raw_path
+
+    success = open_in_terminal(target)
+    return ok({"opened_terminal": str(target), "success": success})
+
+
 def cmd_hide(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     state = load_state(ctx)
     hidden = list(state.get("hidden") or [])
@@ -2423,6 +2489,7 @@ def build_parser() -> argparse.ArgumentParser:
             "hide",
             "unhide",
             "open",
+            "terminal",
         ],
     )
     parser.add_argument("args", nargs="*")
@@ -2469,6 +2536,8 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_unhide(ctx, args)
     if command == "open":
         return cmd_open(ctx, args)
+    if command == "terminal":
+        return cmd_terminal(ctx, args)
     raise SyncError(f"Unknown command: {command}")
 
 

@@ -852,6 +852,15 @@ class SecurityTests(unittest.TestCase):
             self.assertTrue(res["ok"])
             self.assertEqual(res["opened"], str(local_file))
 
+    def test_cmd_terminal(self) -> None:
+        with TempHome() as env:
+            local_file = env.home / ".config" / "hypr" / "looknfeel.lua"
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            local_file.write_text("content", encoding="utf-8")
+            res = cs.cmd_terminal(env.ctx, argparse_ns(args=["hypr/looknfeel.lua"]))
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["opened_terminal"], str(local_file))
+
 
 if __name__ == "__main__":
     unittest.main()

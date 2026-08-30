@@ -599,6 +599,18 @@ Panel {
     Quickshell.execDetached(["python3", root.scriptPath, "open", target])
   }
 
+  function openTerminal(path, localPath, repoPath) {
+    var target = String(localPath || "").trim()
+    if (!target) {
+      target = String(repoPath || "").trim()
+    }
+    if (!target) {
+      target = String(path || "").trim()
+    }
+    if (!target) return
+    Quickshell.execDetached(["python3", root.scriptPath, "terminal", target])
+  }
+
   function applySnapshot(data) {
     status = data.status || {}
     inspect = data.inspect || null
@@ -1772,7 +1784,7 @@ Panel {
           targetPath: "hypr/bindings.lua"
           Row {
             width: parent.width
-            spacing: Style.space(10)
+            spacing: Style.space(8)
             Text {
               textFormat: Text.PlainText
               text: modelData.keys
@@ -1780,7 +1792,7 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               font.bold: true
-              width: parent.width * 0.44
+              width: parent.width * 0.42
               wrapMode: Text.WordWrap
             }
             Text {
@@ -1789,16 +1801,58 @@ Panel {
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
-              width: parent.width * 0.44
+              width: parent.width * 0.38
               wrapMode: Text.WordWrap
             }
-            Text {
-              textFormat: Text.PlainText
-              text: "󰉋"
-              color: Qt.darker(root.foreground, 1.8)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
+            Row {
+              spacing: Style.space(4)
               anchors.verticalCenter: parent.verticalCenter
+              Rectangle {
+                width: Style.space(26)
+                height: Style.space(26)
+                radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                color: scFmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+                border.width: 1
+                border.color: scFmMa.containsMouse ? root.accent : "transparent"
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: "󰉋"
+                  color: scFmMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+                MouseArea {
+                  id: scFmMa
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openFile("hypr/bindings.lua", "", "")
+                }
+              }
+              Rectangle {
+                width: Style.space(26)
+                height: Style.space(26)
+                radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                color: scTermMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+                border.width: 1
+                border.color: scTermMa.containsMouse ? root.accent : "transparent"
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: "󰞷"
+                  color: scTermMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+                MouseArea {
+                  id: scTermMa
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openTerminal("hypr/bindings.lua", "", "")
+                }
+              }
             }
           }
         }
@@ -1840,7 +1894,7 @@ Panel {
                 font.pixelSize: Style.font.body
                 font.bold: true
                 elide: Text.ElideRight
-                width: parent.width - ver.implicitWidth - Style.space(36)
+                width: parent.width - ver.implicitWidth - Style.space(64)
               }
               Text {
                 id: ver
@@ -1851,13 +1905,55 @@ Panel {
                 font.pixelSize: Style.font.caption
                 anchors.verticalCenter: parent.verticalCenter
               }
-              Text {
-                textFormat: Text.PlainText
-                text: "󰉋"
-                color: Qt.darker(root.foreground, 1.8)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
+              Row {
+                spacing: Style.space(4)
                 anchors.verticalCenter: parent.verticalCenter
+                Rectangle {
+                  width: Style.space(26)
+                  height: Style.space(26)
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  color: plFmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+                  border.width: 1
+                  border.color: plFmMa.containsMouse ? root.accent : "transparent"
+                  Text {
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: "󰉋"
+                    color: plFmMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                  MouseArea {
+                    id: plFmMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openFile("plugins/" + modelData.id, "", "")
+                  }
+                }
+                Rectangle {
+                  width: Style.space(26)
+                  height: Style.space(26)
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  color: plTermMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+                  border.width: 1
+                  border.color: plTermMa.containsMouse ? root.accent : "transparent"
+                  Text {
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: "󰞷"
+                    color: plTermMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                  MouseArea {
+                    id: plTermMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openTerminal("plugins/" + modelData.id, "", "")
+                  }
+                }
               }
             }
             Text {
@@ -2889,11 +2985,11 @@ Panel {
     width: parent ? parent.width : 100
     implicitHeight: Math.max(fileCol.implicitHeight, extraLoader.implicitHeight) + Style.space(12)
     radius: Style.cornerRadius
-    color: clickable && fileRowMa.containsMouse
+    color: clickable && rowBodyMa.containsMouse
       ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
       : root.cardBg
-    border.width: clickable && fileRowMa.containsMouse ? 2 : 1
-    border.color: clickable && fileRowMa.containsMouse ? root.accent : root.cardBorder
+    border.width: clickable && rowBodyMa.containsMouse ? 2 : 1
+    border.color: clickable && rowBodyMa.containsMouse ? root.accent : root.cardBorder
 
     Row {
       anchors.fill: parent
@@ -2901,29 +2997,45 @@ Panel {
       anchors.rightMargin: Style.space(8)
       spacing: Style.space(6)
 
-      Column {
-        id: fileCol
-        width: parent.width - (extraLoader.item ? extraLoader.width + parent.spacing : 0) - (fileRowRoot.clickable ? Style.space(24) : 0)
+      Item {
+        id: fileColWrapper
+        width: parent.width - (extraLoader.item ? extraLoader.width + parent.spacing : 0) - (fileRowRoot.clickable ? actionButtons.width + parent.spacing : 0)
+        height: fileCol.implicitHeight
         anchors.verticalCenter: parent.verticalCenter
-        spacing: 2
-        Text {
+
+        Column {
+          id: fileCol
           width: parent.width
-          textFormat: Text.PlainText
-          text: fileRowRoot.pathLabel
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          font.bold: true
-          elide: Text.ElideMiddle
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: 2
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: fileRowRoot.pathLabel
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            elide: Text.ElideMiddle
+          }
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: fileRowRoot.summary + (fileRowRoot.statusLabel ? " · " + fileRowRoot.statusLabel : "")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
         }
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: fileRowRoot.summary + (fileRowRoot.statusLabel ? " · " + fileRowRoot.statusLabel : "")
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
+
+        MouseArea {
+          id: rowBodyMa
+          anchors.fill: parent
+          enabled: fileRowRoot.clickable
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.openFile(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
         }
       }
 
@@ -2933,24 +3045,66 @@ Panel {
         sourceComponent: fileRowRoot.extra
       }
 
-      Text {
+      Row {
+        id: actionButtons
         visible: fileRowRoot.clickable
-        textFormat: Text.PlainText
-        text: "󰉋"
-        color: fileRowMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.8)
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
+        spacing: Style.space(4)
         anchors.verticalCenter: parent.verticalCenter
-      }
-    }
 
-    MouseArea {
-      id: fileRowMa
-      anchors.fill: parent
-      enabled: fileRowRoot.clickable
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onClicked: root.openFile(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
+        Rectangle {
+          id: fmBtn
+          width: Style.space(26)
+          height: Style.space(26)
+          radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+          color: fmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+          border.width: 1
+          border.color: fmMa.containsMouse ? root.accent : "transparent"
+
+          Text {
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: "󰉋"
+            color: fmMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          MouseArea {
+            id: fmMa
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.openFile(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
+          }
+        }
+
+        Rectangle {
+          id: termBtn
+          width: Style.space(26)
+          height: Style.space(26)
+          radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+          color: termMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+          border.width: 1
+          border.color: termMa.containsMouse ? root.accent : "transparent"
+
+          Text {
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: "󰞷"
+            color: termMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          MouseArea {
+            id: termMa
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.openTerminal(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
+          }
+        }
+      }
     }
   }
 
