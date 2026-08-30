@@ -1780,8 +1780,6 @@ Panel {
         model: root.inspect && root.inspect.shortcuts ? root.inspect.shortcuts : []
         CardBox {
           required property var modelData
-          clickable: true
-          targetPath: "hypr/bindings.lua"
           Row {
             width: parent.width
             spacing: Style.space(8)
@@ -1808,17 +1806,17 @@ Panel {
               spacing: Style.space(4)
               anchors.verticalCenter: parent.verticalCenter
               Rectangle {
-                width: Style.space(26)
-                height: Style.space(26)
+                width: Style.space(30)
+                height: Style.space(28)
                 radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                color: scFmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+                color: scFmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
                 border.width: 1
-                border.color: scFmMa.containsMouse ? root.accent : "transparent"
+                border.color: scFmMa.containsMouse ? root.accent : root.cardBorder
                 Text {
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
                   text: "󰉋"
-                  color: scFmMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+                  color: scFmMa.containsMouse ? root.accent : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                 }
@@ -1831,17 +1829,17 @@ Panel {
                 }
               }
               Rectangle {
-                width: Style.space(26)
-                height: Style.space(26)
+                width: Style.space(30)
+                height: Style.space(28)
                 radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                color: scTermMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+                color: scTermMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
                 border.width: 1
-                border.color: scTermMa.containsMouse ? root.accent : "transparent"
+                border.color: scTermMa.containsMouse ? root.accent : root.cardBorder
                 Text {
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
                   text: "󰞷"
-                  color: scTermMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+                  color: scTermMa.containsMouse ? root.accent : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                 }
@@ -1878,8 +1876,6 @@ Panel {
         model: root.inspect && root.inspect.plugins ? root.inspect.plugins : []
         CardBox {
           required property var modelData
-          clickable: true
-          targetPath: "plugins/" + modelData.id
           Column {
             width: parent.width
             spacing: Style.space(4)
@@ -1894,7 +1890,7 @@ Panel {
                 font.pixelSize: Style.font.body
                 font.bold: true
                 elide: Text.ElideRight
-                width: parent.width - ver.implicitWidth - Style.space(64)
+                width: parent.width - ver.implicitWidth - Style.space(74)
               }
               Text {
                 id: ver
@@ -1909,17 +1905,17 @@ Panel {
                 spacing: Style.space(4)
                 anchors.verticalCenter: parent.verticalCenter
                 Rectangle {
-                  width: Style.space(26)
-                  height: Style.space(26)
+                  width: Style.space(30)
+                  height: Style.space(28)
                   radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  color: plFmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+                  color: plFmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
                   border.width: 1
-                  border.color: plFmMa.containsMouse ? root.accent : "transparent"
+                  border.color: plFmMa.containsMouse ? root.accent : root.cardBorder
                   Text {
                     anchors.centerIn: parent
                     textFormat: Text.PlainText
                     text: "󰉋"
-                    color: plFmMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+                    color: plFmMa.containsMouse ? root.accent : root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                   }
@@ -1932,17 +1928,17 @@ Panel {
                   }
                 }
                 Rectangle {
-                  width: Style.space(26)
-                  height: Style.space(26)
+                  width: Style.space(30)
+                  height: Style.space(28)
                   radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  color: plTermMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+                  color: plTermMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
                   border.width: 1
-                  border.color: plTermMa.containsMouse ? root.accent : "transparent"
+                  border.color: plTermMa.containsMouse ? root.accent : root.cardBorder
                   Text {
                     anchors.centerIn: parent
                     textFormat: Text.PlainText
                     text: "󰞷"
-                    color: plTermMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+                    color: plTermMa.containsMouse ? root.accent : root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                   }
@@ -2985,11 +2981,9 @@ Panel {
     width: parent ? parent.width : 100
     implicitHeight: Math.max(fileCol.implicitHeight, extraLoader.implicitHeight) + Style.space(12)
     radius: Style.cornerRadius
-    color: clickable && rowBodyMa.containsMouse
-      ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
-      : root.cardBg
-    border.width: clickable && rowBodyMa.containsMouse ? 2 : 1
-    border.color: clickable && rowBodyMa.containsMouse ? root.accent : root.cardBorder
+    color: root.cardBg
+    border.width: 1
+    border.color: root.cardBorder
 
     Row {
       anchors.fill: parent
@@ -2997,45 +2991,29 @@ Panel {
       anchors.rightMargin: Style.space(8)
       spacing: Style.space(6)
 
-      Item {
-        id: fileColWrapper
+      Column {
+        id: fileCol
         width: parent.width - (extraLoader.item ? extraLoader.width + parent.spacing : 0) - (fileRowRoot.clickable ? actionButtons.width + parent.spacing : 0)
-        height: fileCol.implicitHeight
         anchors.verticalCenter: parent.verticalCenter
-
-        Column {
-          id: fileCol
+        spacing: 2
+        Text {
           width: parent.width
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: 2
-          Text {
-            width: parent.width
-            textFormat: Text.PlainText
-            text: fileRowRoot.pathLabel
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            font.bold: true
-            elide: Text.ElideMiddle
-          }
-          Text {
-            width: parent.width
-            textFormat: Text.PlainText
-            text: fileRowRoot.summary + (fileRowRoot.statusLabel ? " · " + fileRowRoot.statusLabel : "")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
+          textFormat: Text.PlainText
+          text: fileRowRoot.pathLabel
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          elide: Text.ElideMiddle
         }
-
-        MouseArea {
-          id: rowBodyMa
-          anchors.fill: parent
-          enabled: fileRowRoot.clickable
-          hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
-          onClicked: root.openFile(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: fileRowRoot.summary + (fileRowRoot.statusLabel ? " · " + fileRowRoot.statusLabel : "")
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
         }
       }
 
@@ -3053,18 +3031,18 @@ Panel {
 
         Rectangle {
           id: fmBtn
-          width: Style.space(26)
-          height: Style.space(26)
+          width: Style.space(30)
+          height: Style.space(28)
           radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-          color: fmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+          color: fmMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
           border.width: 1
-          border.color: fmMa.containsMouse ? root.accent : "transparent"
+          border.color: fmMa.containsMouse ? root.accent : root.cardBorder
 
           Text {
             anchors.centerIn: parent
             textFormat: Text.PlainText
             text: "󰉋"
-            color: fmMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+            color: fmMa.containsMouse ? root.accent : root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
@@ -3080,18 +3058,18 @@ Panel {
 
         Rectangle {
           id: termBtn
-          width: Style.space(26)
-          height: Style.space(26)
+          width: Style.space(30)
+          height: Style.space(28)
           radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-          color: termMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : "transparent"
+          color: termMa.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
           border.width: 1
-          border.color: termMa.containsMouse ? root.accent : "transparent"
+          border.color: termMa.containsMouse ? root.accent : root.cardBorder
 
           Text {
             anchors.centerIn: parent
             textFormat: Text.PlainText
             text: "󰞷"
-            color: termMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.6)
+            color: termMa.containsMouse ? root.accent : root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
@@ -3152,19 +3130,13 @@ Panel {
   }
 
   component CardBox: Rectangle {
-    id: cardBoxRoot
-    property bool clickable: false
-    property string targetPath: ""
-    signal clicked()
     default property alias content: innerCol.children
     width: parent.width
     implicitHeight: innerCol.implicitHeight + Style.space(16)
     radius: Style.cornerRadius
-    color: (clickable || targetPath !== "") && cardMa.containsMouse
-      ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
-      : root.cardBg
-    border.width: (clickable || targetPath !== "") && cardMa.containsMouse ? 2 : 1
-    border.color: (clickable || targetPath !== "") && cardMa.containsMouse ? root.accent : root.cardBorder
+    color: root.cardBg
+    border.width: 1
+    border.color: root.cardBorder
 
     Column {
       id: innerCol
@@ -3173,20 +3145,6 @@ Panel {
       anchors.top: parent.top
       anchors.margins: Style.space(8)
       spacing: Style.space(6)
-    }
-
-    MouseArea {
-      id: cardMa
-      anchors.fill: parent
-      enabled: cardBoxRoot.clickable || cardBoxRoot.targetPath !== ""
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onClicked: {
-        cardBoxRoot.clicked()
-        if (cardBoxRoot.targetPath !== "") {
-          root.openFile(cardBoxRoot.targetPath, "", "")
-        }
-      }
     }
   }
 

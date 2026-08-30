@@ -2276,6 +2276,7 @@ def open_in_file_manager(target_path: str | Path) -> bool:
         return False
 
     uri = target.as_uri()
+    devnull = subprocess.DEVNULL
     dbus = shutil.which("dbus-send")
     if dbus:
         try:
@@ -2302,7 +2303,14 @@ def open_in_file_manager(target_path: str | Path) -> bool:
         binary = shutil.which(fm)
         if binary:
             try:
-                subprocess.Popen([binary, flag, str(target)])
+                subprocess.Popen(
+                    [binary, flag, str(target)],
+                    start_new_session=True,
+                    stdin=devnull,
+                    stdout=devnull,
+                    stderr=devnull,
+                    close_fds=True,
+                )
                 return True
             except OSError:
                 pass
@@ -2311,7 +2319,14 @@ def open_in_file_manager(target_path: str | Path) -> bool:
     if xdg_open:
         open_target = target if target.is_dir() else target.parent
         try:
-            subprocess.Popen([xdg_open, str(open_target)])
+            subprocess.Popen(
+                [xdg_open, str(open_target)],
+                start_new_session=True,
+                stdin=devnull,
+                stdout=devnull,
+                stderr=devnull,
+                close_fds=True,
+            )
             return True
         except OSError:
             pass
@@ -2354,17 +2369,33 @@ def open_in_terminal(target_path: str | Path) -> bool:
     if not directory.exists():
         return False
 
-    # 1. Try uwsm-app + xdg-terminal-exec (Omarchy standard)
+    devnull = subprocess.DEVNULL
+
+    # 1. Try omarchy / uwsm-app + xdg-terminal-exec
     if shutil.which("uwsm-app") and shutil.which("xdg-terminal-exec"):
         try:
-            subprocess.Popen(["uwsm-app", "--", "xdg-terminal-exec", f"--dir={directory}"])
+            subprocess.Popen(
+                ["uwsm-app", "--", "xdg-terminal-exec", f"--dir={directory}"],
+                start_new_session=True,
+                stdin=devnull,
+                stdout=devnull,
+                stderr=devnull,
+                close_fds=True,
+            )
             return True
         except OSError:
             pass
 
     if shutil.which("xdg-terminal-exec"):
         try:
-            subprocess.Popen(["xdg-terminal-exec", f"--dir={directory}"])
+            subprocess.Popen(
+                ["xdg-terminal-exec", f"--dir={directory}"],
+                start_new_session=True,
+                stdin=devnull,
+                stdout=devnull,
+                stderr=devnull,
+                close_fds=True,
+            )
             return True
         except OSError:
             pass
@@ -2374,10 +2405,15 @@ def open_in_terminal(target_path: str | Path) -> bool:
         binary = shutil.which(term)
         if binary:
             try:
-                if flag.endswith("="):
-                    subprocess.Popen([binary, f"{flag}{directory}"])
-                else:
-                    subprocess.Popen([binary, flag, str(directory)])
+                cmd = [binary, f"{flag}{directory}"] if flag.endswith("=") else [binary, flag, str(directory)]
+                subprocess.Popen(
+                    cmd,
+                    start_new_session=True,
+                    stdin=devnull,
+                    stdout=devnull,
+                    stderr=devnull,
+                    close_fds=True,
+                )
                 return True
             except OSError:
                 pass
