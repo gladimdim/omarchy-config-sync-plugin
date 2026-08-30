@@ -20,7 +20,11 @@
     "defaultSection": "right",
     "aliases": [
       "config-sync",
-      "omarchy-config"
+      "omarchy-config",
+      "sync",
+      "dotfiles",
+      "backup",
+      "git-sync"
     ]
   }
 }
