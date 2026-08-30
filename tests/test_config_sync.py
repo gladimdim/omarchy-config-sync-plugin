@@ -391,9 +391,15 @@ class CliTests(unittest.TestCase):
         with TempHome() as env:
             os.environ["HOME"] = str(env.home)
             os.environ["XDG_DATA_HOME"] = str(env.data)
-            code = cs.main(["snapshot"])
-            # main writes to stdout; we just care it does not crash
-            self.assertIn(code, (0, 1))
+            from io import StringIO
+            from unittest.mock import patch
+            buf = StringIO()
+            with patch("sys.stdout", buf):
+                code = cs.main(["snapshot"])
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(code, 0)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["configured"])
 
 
 def argparse_ns(**kwargs):
