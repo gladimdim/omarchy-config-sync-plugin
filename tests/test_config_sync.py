@@ -433,6 +433,39 @@ class InspectAndSyncTests(unittest.TestCase):
             cs.cmd_apply(env.ctx, argparse_ns(include_machine=True, files="hypr/monitors.lua"))
             self.assertIn("eDP-1", (env.ctx.config_hypr / "monitors.lua").read_text(encoding="utf-8"))
 
+    def test_new_plugin_is_one_bundle(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            for i in range(17):
+                write(repo / "plugins" / "news.reader" / f"file{i}.qml", f"Item {{ /* {i} */ }}\n")
+            write(
+                repo / "plugins" / "news.reader" / "manifest.json",
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "id": "news.reader",
+                        "name": "News Reader",
+                        "kinds": ["bar-widget"],
+                        "entryPoints": {"barWidget": "file0.qml"},
+                    }
+                ),
+            )
+            commit_all(repo, "add news plugin")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            bundles = snap["diff"]["bundles"]
+            plugin_bundles = [b for b in bundles if b["kind"] == "plugin" and b["plugin_id"] == "news.reader"]
+            self.assertEqual(len(plugin_bundles), 1, bundles)
+            self.assertGreaterEqual(plugin_bundles[0]["changed_count"], 17)
+            self.assertEqual(plugin_bundles[0]["status"], "added-repo")
+            self.assertIn("New plugin", plugin_bundles[0]["summary"])
+            incoming_files = [
+                f["path"]
+                for f in snap["diff"]["files"]
+                if f["status"] == "added-repo" and not str(f["path"]).startswith("plugins/")
+            ]
+            self.assertNotIn("plugins/news.reader/file0.qml", incoming_files)
+
     def test_switch_git_repo(self) -> None:
         with TempHome() as env:
             first = make_config_repo(env.home / "first")

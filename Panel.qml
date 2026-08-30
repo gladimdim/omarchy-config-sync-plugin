@@ -42,6 +42,7 @@ Panel {
   property var diffFiles: []
   property var shortcutDiffs: []
   property var pluginDiffs: []
+  property var bundleDiffs: []
   property var themeDiff: null
   property string lastNotifiedKey: ""
   property bool openOnChanges: false
@@ -70,7 +71,7 @@ Panel {
       var f = diffFiles[i]
       if (f.status === "identical" || f.status === "machine") continue
       if (!includeMachine && !f.portable) continue
-      if (f.group === "plugin") continue
+      if (root.isBundledPath(f.path)) continue
       if (f.group === "theme" && f.path !== "omarchy/theme.name") continue
       if (f.path === "hypr/bindings.lua") continue
       out.push(f)
@@ -88,7 +89,10 @@ Panel {
   readonly property var localPlugins: Model.filesByStatus(pluginDiffs, ["local", "added-local"])
   readonly property var bothPlugins: Model.filesByStatus(pluginDiffs, ["both"])
   readonly property var differsPlugins: Model.filesByStatus(pluginDiffs, ["differs"])
-  readonly property bool hasReviewable: otherFiles.length + shortcutDiffs.length + pluginDiffs.length + conflictFiles.length + (themeDiff ? 1 : 0) > 0
+  readonly property var incomingBundles: Model.filesByStatus(bundleDiffs, ["repo", "added-repo", "differs"])
+  readonly property var localBundles: Model.filesByStatus(bundleDiffs, ["local", "added-local"])
+  readonly property var bothBundles: Model.filesByStatus(bundleDiffs, ["both"])
+  readonly property bool hasReviewable: otherFiles.length + shortcutDiffs.length + bundleDiffs.length + pluginDiffs.length + conflictFiles.length + (themeDiff ? 1 : 0) > 0
   readonly property int unresolvedBoth: {
     var n = 0
     var i
@@ -100,6 +104,9 @@ Panel {
     }
     for (i = 0; i < bothPlugins.length; i++) {
       if (isPicked("p", bothPlugins[i].id) && !bothPicks["p:" + bothPlugins[i].id]) n++
+    }
+    for (i = 0; i < bothBundles.length; i++) {
+      if (isPicked("g", bothBundles[i].id) && !bothPicks["g:" + bothBundles[i].id]) n++
     }
     if (themeDiff && themeDiff.status === "both" && isPicked("t", "selected") && !bothPicks["t:selected"]) n++
     return n
@@ -127,6 +134,17 @@ Panel {
   }
 
   function pickId(kind, id) { return kind + ":" + id }
+
+  function isBundledPath(path) {
+    var p = String(path || "")
+    if (p.indexOf("plugins/") === 0) return true
+    if (p.indexOf("omarchy/hooks/") === 0) return true
+    if (p.indexOf("omarchy/agents/") === 0) return true
+    if (p.indexOf("omarchy/branding/") === 0) return true
+    if (p.indexOf("omarchy/extensions/") === 0) return true
+    if (p.indexOf("bin/") === 0) return true
+    return false
+  }
 
   function isPicked(kind, id) { return !!picks[pickId(kind, id)] }
 
@@ -159,6 +177,11 @@ Panel {
     for (i = 0; i < pluginDiffs.length; i++) {
       item = pluginDiffs[i]
       key = pickId("p", item.id)
+      next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish || item.status === "differs")
+    }
+    for (i = 0; i < bundleDiffs.length; i++) {
+      item = bundleDiffs[i]
+      key = pickId("g", item.id)
       next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish || item.status === "differs")
     }
     if (themeDiff) {
@@ -208,6 +231,10 @@ Panel {
         for (i = 0; i < otherFiles.length; i++)
           if (pickId("f", otherFiles[i].path) === key)
             return otherFiles[i].status
+      } else if (key.indexOf("g:") === 0) {
+        for (i = 0; i < bundleDiffs.length; i++)
+          if (pickId("g", bundleDiffs[i].id) === key)
+            return bundleDiffs[i].status
       } else if (key === pickId("t", "selected") && themeDiff) {
         return themeDiff.status
       }
@@ -287,15 +314,34 @@ Panel {
 
   function selectedApplyPlugins() {
     var out = []
-    var i, p
-    for (i = 0; i < pluginDiffs.length; i++) {
-      p = pluginDiffs[i]
-      if (!isPicked("p", p.id) || p.git_managed) continue
-      if (p.status === "both") {
-        if (bothPicks["p:" + p.id] === "repo") out.push(p.id)
+    var i, b
+    for (i = 0; i < bundleDiffs.length; i++) {
+      b = bundleDiffs[i]
+      if (b.kind !== "plugin" || !isPicked("g", b.id)) continue
+      if (b.status === "both") {
+        if (bothPicks["g:" + b.id] === "repo") out.push(b.plugin_id)
         continue
       }
-      if (p.status === "added-repo" || p.status === "repo" || p.status === "differs") out.push(p.id)
+      if (b.status === "added-repo" || b.status === "repo" || b.status === "differs") out.push(b.plugin_id)
+    }
+    return out
+  }
+
+  function selectedBundleFiles(direction) {
+    var out = []
+    var i, b, j
+    for (i = 0; i < bundleDiffs.length; i++) {
+      b = bundleDiffs[i]
+      if (b.kind === "plugin") continue
+      if (!isPicked("g", b.id)) continue
+      if (b.status === "both") {
+        if (direction === "apply" && bothPicks["g:" + b.id] !== "repo") continue
+        if (direction === "publish" && bothPicks["g:" + b.id] !== "local") continue
+      } else if (direction === "apply") {
+        if (!(b.status === "added-repo" || b.status === "repo" || b.status === "differs")) continue
+      } else if (!(b.status === "added-local" || b.status === "local" || b.status === "differs")) continue
+      var list = b.files || []
+      for (j = 0; j < list.length; j++) out.push(list[j])
     }
     return out
   }
@@ -314,15 +360,15 @@ Panel {
 
   function selectedPublishPlugins() {
     var out = []
-    var i, p
-    for (i = 0; i < pluginDiffs.length; i++) {
-      p = pluginDiffs[i]
-      if (!isPicked("p", p.id)) continue
-      if (p.status === "both") {
-        if (bothPicks["p:" + p.id] === "local") out.push(p.id)
+    var i, b
+    for (i = 0; i < bundleDiffs.length; i++) {
+      b = bundleDiffs[i]
+      if (b.kind !== "plugin" || !isPicked("g", b.id)) continue
+      if (b.status === "both") {
+        if (bothPicks["g:" + b.id] === "local") out.push(b.plugin_id)
         continue
       }
-      if (p.status === "added-local" || p.status === "local" || p.status === "differs") out.push(p.id)
+      if (b.status === "added-local" || b.status === "local" || b.status === "differs") out.push(b.plugin_id)
     }
     return out
   }
@@ -343,7 +389,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length === 0 && !selectedApplyTheme()) {
+    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length === 0 && !selectedApplyTheme()) {
       lastError = "Check the incoming shortcuts, plugins, or files you want to apply."
       activeTab = 1
       return
@@ -362,7 +408,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedPublishFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
+    if (selectedPublishFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length + selectedBundleFiles("publish").length === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
       lastError = "Check the local shortcuts, plugins, or files you want to publish."
       activeTab = 1
       return
@@ -374,7 +420,7 @@ Panel {
     var kind = confirmKind
     confirmKind = ""
     if (kind === "apply") {
-      var files = selectedApplyFiles()
+      var files = selectedApplyFiles().concat(selectedBundleFiles("apply"))
       var args = ["apply", "--explicit", "--files", files.join(",")]
       if (includeMachine) args.push("--include-machine")
       var ashort = selectedApplyShortcuts()
@@ -385,7 +431,7 @@ Panel {
       if (selectedApplyTheme()) args.push("--theme")
       run(args)
     } else if (kind === "publish") {
-      var pub = selectedPublishFiles()
+      var pub = selectedPublishFiles().concat(selectedBundleFiles("publish"))
       var pargs = ["publish", "--push", "--explicit", "--files", pub.join(",")]
       if (includeMachine) pargs.push("--include-machine")
       var pshort = selectedPublishShortcuts()
@@ -457,6 +503,7 @@ Panel {
     diffFiles = (data.diff && data.diff.files) ? data.diff.files : []
     shortcutDiffs = (data.diff && data.diff.shortcuts) ? data.diff.shortcuts : []
     pluginDiffs = (data.diff && data.diff.plugins) ? data.diff.plugins : []
+    bundleDiffs = (data.diff && data.diff.bundles) ? data.diff.bundles : []
     themeDiff = (data.diff && data.diff.theme) ? data.diff.theme : null
     if (data.sync_state && status)
       status = Object.assign({}, status, { sync_state: data.sync_state })
@@ -1040,7 +1087,7 @@ Panel {
           width: parent.pillW
           icon: "󰅧"
           label: "Incoming"
-          value: String(root.incomingFiles.length + root.differsFiles.length)
+          value: String(root.incomingBundles.length + root.incomingFiles.length + root.incomingAddedShortcuts.length + root.incomingChangedShortcuts.length)
           highlightColor: (root.incomingFiles.length + root.differsFiles.length) > 0 ? root.accent : root.foreground
         }
         QuickPill {
@@ -1266,8 +1313,8 @@ Panel {
         ChangeSection { title: "INCOMING SHORTCUTS — CHANGED"; kind: "s"; idField: "keys"; files: root.incomingChangedShortcuts; labelField: "keys"; summaryField: "detail" }
         ChangeSection { title: "LOCAL SHORTCUTS — ADDED"; kind: "s"; idField: "keys"; files: root.localAddedShortcuts; labelField: "keys"; summaryField: "label" }
         ChangeSection { title: "LOCAL SHORTCUTS — CHANGED"; kind: "s"; idField: "keys"; files: root.localChangedShortcuts; labelField: "keys"; summaryField: "detail" }
-        ChangeSection { title: "INCOMING PLUGINS"; kind: "p"; idField: "id"; files: root.incomingPlugins.concat(root.differsPlugins); labelField: "name"; summaryField: "id" }
-        ChangeSection { title: "LOCAL PLUGINS"; kind: "p"; idField: "id"; files: root.localPlugins; labelField: "name"; summaryField: "id" }
+        ChangeSection { title: "INCOMING PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.incomingBundles; labelField: "name"; summaryField: "summary" }
+        ChangeSection { title: "LOCAL PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.localBundles; labelField: "name"; summaryField: "summary" }
         ChangeSection { title: "INCOMING FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
         ChangeSection { title: "CHANGED ON THIS LAPTOP"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
       }
@@ -1456,28 +1503,28 @@ Panel {
       }
 
       ChangeSection {
-        title: "INCOMING PLUGINS"
-        kind: "p"
+        title: "INCOMING PLUGINS & FOLDERS"
+        kind: "g"
         idField: "id"
-        files: root.incomingPlugins.concat(root.differsPlugins)
+        files: root.incomingBundles
         labelField: "name"
-        summaryField: "id"
+        summaryField: "summary"
       }
       ChangeSection {
-        title: "LOCAL PLUGINS"
-        kind: "p"
+        title: "LOCAL PLUGINS & FOLDERS"
+        kind: "g"
         idField: "id"
-        files: root.localPlugins
+        files: root.localBundles
         labelField: "name"
-        summaryField: "id"
+        summaryField: "summary"
       }
       ChangeSection {
         title: "PLUGINS CHANGED ON BOTH SIDES"
-        kind: "p"
+        kind: "g"
         idField: "id"
-        files: root.bothPlugins
+        files: root.bothBundles
         labelField: "name"
-        summaryField: "id"
+        summaryField: "summary"
         both: true
       }
 
@@ -1589,11 +1636,11 @@ Panel {
       spacing: Style.space(8)
       ChangeSection {
         title: "CHANGED PLUGINS — INCLUDE TO SYNC"
-        kind: "p"
+        kind: "g"
         idField: "id"
-        files: root.incomingPlugins.concat(root.localPlugins).concat(root.bothPlugins).concat(root.differsPlugins)
+        files: root.incomingBundles.concat(root.localBundles).concat(root.bothBundles)
         labelField: "name"
-        summaryField: "id"
+        summaryField: "summary"
       }
 
       PanelSectionHeader { text: "PLUGINS THAT WILL LOAD"; foreground: root.foreground; fontFamily: root.fontFamily }

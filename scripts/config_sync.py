@@ -888,10 +888,24 @@ def merge_shortcuts_file(dest: Path, source: Path, selected_keys: list[str]) -> 
     return True
 
 
+def _rollup_statuses(statuses: list[str]) -> str | None:
+    unique = set(s for s in statuses if s not in {"identical", "machine"})
+    if not unique:
+        return None
+    if "both" in unique or ("local" in unique and "repo" in unique) or ("added-local" in unique and "added-repo" in unique):
+        return "both"
+    if unique <= {"local", "added-local"}:
+        return "added-local" if "added-local" in unique else "local"
+    if unique <= {"repo", "added-repo"}:
+        return "added-repo" if "added-repo" in unique else "repo"
+    return "differs"
+
+
 def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
     for item in files:
-        if item.get("group") != "plugin":
+        path = str(item.get("path") or "")
+        if item.get("group") != "plugin" and not path.startswith("plugins/"):
             continue
         pid = plugin_id_from_path(item["path"])
         if not pid:
@@ -913,17 +927,9 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
     for pid, g in sorted(groups.items()):
         statuses = [s for s in g["statuses"] if s not in {"identical", "machine"}]
-        if not statuses:
+        status = _rollup_statuses(g["statuses"])
+        if not status:
             continue
-        unique = set(statuses)
-        if "both" in unique or ("local" in unique and "repo" in unique) or ("added-local" in unique and "added-repo" in unique):
-            status = "both"
-        elif unique <= {"local", "added-local"}:
-            status = "added-local" if "added-local" in unique else "local"
-        elif unique <= {"repo", "added-repo"}:
-            status = "added-repo" if "added-repo" in unique else "repo"
-        else:
-            status = "differs"
         out.append(
             {
                 "id": pid,
@@ -935,6 +941,82 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "git_managed": g["git_managed"],
                 "default_apply": status in {"repo", "added-repo", "differs", "both"} and not g["git_managed"],
                 "default_publish": status in {"local", "added-local", "differs", "both"},
+            }
+        )
+    return out
+
+
+def file_bundles(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group plugin trees, hook dirs, and similar folders into one checkbox each."""
+    buckets: dict[str, dict[str, Any]] = {}
+
+    def bucket_for(path: str) -> tuple[str, str, str] | None:
+        parts = path.split("/")
+        if path.startswith("plugins/") and len(parts) >= 2 and parts[1]:
+            pid = parts[1]
+            return "plugin:" + pid, "plugin", pid
+        if path.startswith("omarchy/hooks/") and len(parts) >= 3:
+            event = parts[2]
+            return "hooks:" + event, "hooks", event.replace(".d", "")
+        if path.startswith("omarchy/agents/"):
+            return "agents", "agents", "Agent helpers"
+        if path.startswith("omarchy/branding/"):
+            return "branding", "branding", "Branding"
+        if path.startswith("omarchy/extensions/"):
+            return "extensions", "extensions", "Menu extensions"
+        if path.startswith("bin/") and len(parts) >= 2:
+            return "bin", "bin", "Helper scripts"
+        return None
+
+    for item in files:
+        spec = bucket_for(item.get("path") or "")
+        if not spec:
+            continue
+        bid, kind, title = spec
+        b = buckets.setdefault(
+            bid,
+            {
+                "id": bid,
+                "kind": kind,
+                "plugin_id": title if kind == "plugin" else "",
+                "name": title,
+                "files": [],
+                "statuses": [],
+            },
+        )
+        b["files"].append(item["path"])
+        b["statuses"].append(item.get("status") or "identical")
+
+    out = []
+    for bid, b in sorted(buckets.items()):
+        status = _rollup_statuses(b["statuses"])
+        if not status:
+            continue
+        changed = [s for s in b["statuses"] if s not in {"identical", "machine"}]
+        n = len(changed)
+        if b["kind"] == "plugin":
+            if status == "added-repo":
+                summary = f"New plugin · {n} file{'s' if n != 1 else ''}"
+            elif status == "added-local":
+                summary = f"New on this laptop · {n} file{'s' if n != 1 else ''}"
+            else:
+                summary = f"Plugin updates · {n} file{'s' if n != 1 else ''}"
+        elif b["kind"] == "hooks":
+            summary = f"{n} hook file{'s' if n != 1 else ''}"
+        else:
+            summary = f"{n} file{'s' if n != 1 else ''}"
+        out.append(
+            {
+                "id": b["id"],
+                "kind": b["kind"],
+                "plugin_id": b["plugin_id"],
+                "name": b["name"],
+                "summary": summary,
+                "status": status,
+                "files": [p for p, s in zip(b["files"], b["statuses"]) if s not in {"identical", "machine"}],
+                "changed_count": n,
+                "default_apply": status in {"repo", "added-repo", "differs"},
+                "default_publish": status in {"local", "added-local", "differs"},
             }
         )
     return out
@@ -1223,6 +1305,11 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         )
         if isinstance(manifest, dict) and manifest.get("name"):
             plugin["name"] = str(manifest.get("name"))
+    bundles = file_bundles(files)
+    names = {p["id"]: p["name"] for p in plugins}
+    for bundle in bundles:
+        if bundle["kind"] == "plugin" and bundle["plugin_id"] in names:
+            bundle["name"] = names[bundle["plugin_id"]]
     theme_files = [f for f in files if f.get("group") == "theme"]
     theme_diff = None
     if any(f.get("status") not in {"identical", "machine"} for f in theme_files):
@@ -1252,7 +1339,14 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             "default_apply": status in {"repo", "added-repo", "differs"} or (name_item or {}).get("default_apply"),
             "default_publish": status in {"local", "added-local", "differs"} or (name_item or {}).get("default_publish"),
         }
-    return {"files": files, "counts": counts, "shortcuts": shortcuts, "plugins": plugins, "theme": theme_diff}
+    return {
+        "files": files,
+        "counts": counts,
+        "shortcuts": shortcuts,
+        "plugins": plugins,
+        "bundles": bundles,
+        "theme": theme_diff,
+    }
 
 
 def rollup_sync_state(git_fields: dict[str, Any], counts: dict[str, int], has_baseline: bool) -> str:
