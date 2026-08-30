@@ -1637,6 +1637,7 @@ Panel {
               width: parent.width
               spacing: 2
               Text {
+                textFormat: Text.PlainText
                 text: "HIDDEN SYNCS (" + root.hiddenCount + ")"
                 color: root.foreground
                 font.family: root.fontFamily
@@ -1757,6 +1758,7 @@ Panel {
       spacing: Style.space(6)
       PanelSectionHeader { text: "KEYBOARD BINDINGS (" + (root.inspect && root.inspect.shortcuts ? root.inspect.shortcuts.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
       Text {
+        textFormat: Text.PlainText
         visible: !root.inspect || !root.inspect.shortcuts || root.inspect.shortcuts.length === 0
         text: "No o.bind() shortcuts found in hypr/bindings.lua."
         color: root.dim
@@ -1802,6 +1804,7 @@ Panel {
       spacing: Style.space(6)
       PanelSectionHeader { text: "INSTALLED PLUGINS (" + (root.inspect && root.inspect.plugins ? root.inspect.plugins.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
       Text {
+        textFormat: Text.PlainText
         visible: !root.inspect || !root.inspect.plugins || root.inspect.plugins.length === 0
         text: "No extra plugins in plugins/."
         color: root.dim
@@ -1872,6 +1875,7 @@ Panel {
           spacing: Style.space(4)
           visible: root.inspect && root.inspect.bar && root.inspect.bar.widgets && (root.inspect.bar.widgets[modelData] || []).length > 0
           Text {
+            textFormat: Text.PlainText
             text: modelData.toUpperCase()
             color: root.dim
             font.family: root.fontFamily
@@ -1899,6 +1903,7 @@ Panel {
       spacing: Style.space(6)
       PanelSectionHeader { text: "HOOKS (" + (root.inspect && root.inspect.hooks ? root.inspect.hooks.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
       Text {
+        textFormat: Text.PlainText
         visible: !root.inspect || !root.inspect.hooks || root.inspect.hooks.length === 0
         text: "No event hooks in omarchy/hooks/."
         color: root.dim
@@ -1925,6 +1930,7 @@ Panel {
       spacing: Style.space(6)
       PanelSectionHeader { text: "HELPER SCRIPTS (" + (root.inspect && root.inspect.bins ? root.inspect.bins.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
       Text {
+        textFormat: Text.PlainText
         visible: !root.inspect || !root.inspect.bins || root.inspect.bins.length === 0
         text: "No scripts in bin/."
         color: root.dim
@@ -2074,6 +2080,7 @@ Panel {
       color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
       anchors.top: parent.top
       Text {
+        textFormat: Text.PlainText
         anchors.centerIn: parent
         text: step
         color: root.accent
@@ -2145,6 +2152,7 @@ Panel {
         spacing: Style.space(10)
 
         Text {
+          textFormat: Text.PlainText
           text: catRoot.expanded ? "▼" : "▶"
           color: root.foreground
           font.family: root.fontFamily
@@ -2155,6 +2163,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: catRoot.iconText
           color: root.accent
           font.family: root.fontFamily
@@ -2201,6 +2210,7 @@ Panel {
           spacing: 0
           anchors.verticalCenter: parent.verticalCenter
           Text {
+            textFormat: Text.PlainText
             text: catRoot.changeItems.length > 0 ? (String(catRoot.changeItems.length) + " 󰦓") : String(catRoot.totalCount)
             color: catRoot.changeItems.length > 0 ? root.accent : root.dim
             font.family: root.fontFamily
@@ -2210,6 +2220,7 @@ Panel {
             anchors.right: parent.right
           }
           Text {
+            textFormat: Text.PlainText
             text: catRoot.changeItems.length > 0 ? (catRoot.changeItems.length === 1 ? "change" : "changes") : (catRoot.totalCount === 1 ? "item" : "items")
             color: root.dim
             font.family: root.fontFamily
@@ -2282,6 +2293,7 @@ Panel {
                 border.color: root.foreground
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   text: catRowBox.included ? "✓" : ""
                   color: Color.background
@@ -2454,6 +2466,7 @@ Panel {
         spacing: Style.space(10)
 
         Text {
+          textFormat: Text.PlainText
           text: sectionRoot.expanded ? "▼" : "▶"
           color: root.foreground
           font.family: root.fontFamily
@@ -2500,6 +2513,7 @@ Panel {
           spacing: 0
           anchors.verticalCenter: parent.verticalCenter
           Text {
+            textFormat: Text.PlainText
             text: String(sectionRoot.files ? sectionRoot.files.length : 0)
             color: root.accent
             font.family: root.fontFamily
@@ -2509,6 +2523,7 @@ Panel {
             anchors.right: parent.right
           }
           Text {
+            textFormat: Text.PlainText
             text: (sectionRoot.files && sectionRoot.files.length === 1) ? "item" : "items"
             color: root.dim
             font.family: root.fontFamily
@@ -2577,6 +2592,7 @@ Panel {
             border.color: root.foreground
 
             Text {
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: rowBox.included ? "✓" : ""
               color: Color.background
@@ -2736,6 +2752,7 @@ Panel {
             border.color: pickRoot.checked ? root.accent : root.foreground
           }
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: pickRoot.checked ? "✓" : ""
             color: Color.background
@@ -2787,6 +2804,7 @@ Panel {
           spacing: 2
           anchors.verticalCenter: parent.verticalCenter
           Text {
+            textFormat: Text.PlainText
             text: pickRoot.checked ? "Include" : "Skip"
             color: pickRoot.checked ? root.accent : root.dim
             font.family: root.fontFamily

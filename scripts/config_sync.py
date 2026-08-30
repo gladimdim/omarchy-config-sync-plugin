@@ -212,9 +212,21 @@ def is_skipped_file(name: str) -> bool:
     return name in SKIP_FILE_NAMES or bool(SKIP_NAME_RE.search(name))
 
 
+def validate_safe_rel_path(rel: str) -> bool:
+    if not rel or not isinstance(rel, str):
+        return False
+    rel = rel.strip()
+    if not rel or rel.startswith("/") or rel.startswith("\\") or rel.startswith("-"):
+        return False
+    parts = Path(rel).parts
+    if ".." in parts or "." in parts or "~" in parts:
+        return False
+    return not any(":" in p or "\0" in p or "\n" in p for p in parts)
+
+
 def normalize_source(raw: str) -> tuple[str, str]:
     src = (raw or "").strip()
-    if not src:
+    if not src or src.startswith("-") or "\0" in src or "\n" in src:
         raise SyncError("Paste a git URL or a local path to your Omarchy config repo.")
     if src.startswith("git@") or src.startswith("ssh://") or src.startswith("file://"):
         return "url", src
@@ -222,10 +234,10 @@ def normalize_source(raw: str) -> tuple[str, str]:
         return "url", src
     if src.startswith("github.com/") or src.startswith("gitlab.com/") or src.startswith("codeberg.org/"):
         return "url", "https://" + src
-    if re.fullmatch(r"[\w.-]+/[\w.-]+", src):
+    if re.fullmatch(r"[\w.-]+/[\w.-]+", src) and not src.startswith("-"):
         return "url", f"https://github.com/{src}.git"
     path = Path(os.path.expanduser(src)).resolve()
-    if path.exists():
+    if path.exists() and not str(path).startswith("-"):
         return "path", str(path)
     raise SyncError(
         f"Not a local path, and not a git URL: {src}. "
@@ -1192,12 +1204,14 @@ def apply_omarchy_theme(slug: str, dry_run: bool) -> str:
     slug = (slug or "").strip()
     if dry_run or not slug:
         return ""
+    if not re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9._-]*$", slug) or slug.startswith("-"):
+        return "Invalid theme slug"
     binary = shutil.which("omarchy")
     if not binary:
         return "omarchy CLI not found; theme name was copied but not applied"
     try:
         result = subprocess.run(
-            [binary, "theme", "set", slug],
+            [binary, "theme", "set", "--", slug],
             capture_output=True,
             text=True,
             timeout=90,
@@ -1631,7 +1645,7 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             previous_clone = ctx.state_dir / f"repo.bak.{int(time.time())}"
             clone_path.rename(previous_clone)
             clone_path = ctx.default_clone
-            result = run_git(None, ["clone", value, str(clone_path)], timeout=CLONE_TIMEOUT, cwd=ctx.state_dir)
+            result = run_git(None, ["clone", "--", value, str(clone_path)], timeout=CLONE_TIMEOUT, cwd=ctx.state_dir)
             if result.returncode != 0:
                 if clone_path.exists():
                     shutil.rmtree(clone_path, ignore_errors=True)
@@ -1641,7 +1655,7 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     else:
         if clone_path.exists():
             shutil.rmtree(clone_path)
-        result = run_git(None, ["clone", value, str(clone_path)], timeout=CLONE_TIMEOUT, cwd=ctx.state_dir)
+        result = run_git(None, ["clone", "--", value, str(clone_path)], timeout=CLONE_TIMEOUT, cwd=ctx.state_dir)
         if result.returncode != 0:
             if clone_path.exists():
                 shutil.rmtree(clone_path, ignore_errors=True)
@@ -1702,6 +1716,9 @@ def copy_mapped_file(item: dict[str, Any], direction: str) -> None:
     if not src.is_file():
         raise SyncError(f"Missing source file: {src}")
     ensure_parent(dst)
+    # Prevent symlink hijacking / overwriting external files via symlinks
+    if dst.is_symlink() or os.path.islink(dst):
+        dst.unlink()
     shutil.copy2(src, dst)
     if direction == "apply" and (item["path"].startswith("bin/") or src.suffix == ".py" or src.suffix == ".sh" or item["path"].endswith(".hook")):
         mode = dst.stat().st_mode
@@ -1727,6 +1744,8 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
         else:
             dest = backup_dir / rel
         ensure_parent(dest)
+        if dest.is_symlink() or os.path.islink(dest):
+            dest.unlink()
         shutil.copy2(src, dest)
         copied += 1
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -1763,7 +1782,7 @@ def selected_items(diff_files: list[dict[str, Any]], wanted: set[str] | None, in
 def parse_files_arg(raw: str | None, explicit: bool = False) -> set[str] | None:
     if raw is None or raw == "":
         return set() if explicit else None
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    parts = [p.strip() for p in raw.split(",") if p.strip() and validate_safe_rel_path(p.strip())]
     return set(parts)
 
 

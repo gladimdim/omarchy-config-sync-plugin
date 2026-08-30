@@ -788,6 +788,61 @@ class HideTests(unittest.TestCase):
             self.assertFalse((env.home / ".config" / "hypr" / "looknfeel.lua").is_file())
 
 
+class SecurityTests(unittest.TestCase):
+    def test_validate_safe_rel_path(self) -> None:
+        self.assertTrue(cs.validate_safe_rel_path("hypr/looknfeel.lua"))
+        self.assertTrue(cs.validate_safe_rel_path("plugins/my.plugin/manifest.json"))
+        self.assertTrue(cs.validate_safe_rel_path("bin/helper-script"))
+        self.assertFalse(cs.validate_safe_rel_path("../../../etc/shadow"))
+        self.assertFalse(cs.validate_safe_rel_path("/etc/shadow"))
+        self.assertFalse(cs.validate_safe_rel_path("hypr/../../secret"))
+        self.assertFalse(cs.validate_safe_rel_path("--flag"))
+        self.assertFalse(cs.validate_safe_rel_path("hypr/look\0nfeel.lua"))
+
+    def test_normalize_source_rejects_flags(self) -> None:
+        with self.assertRaises(cs.SyncError):
+            cs.normalize_source("--upload-pack=evil")
+        with self.assertRaises(cs.SyncError):
+            cs.normalize_source("-v")
+        with self.assertRaises(cs.SyncError):
+            cs.normalize_source("https://github.com/you/repo\0.git")
+
+    def test_theme_slug_validation(self) -> None:
+        self.assertEqual(cs.apply_omarchy_theme("--help", dry_run=False), "Invalid theme slug")
+        self.assertEqual(cs.apply_omarchy_theme("cat; rm -rf /", dry_run=False), "Invalid theme slug")
+        self.assertEqual(cs.apply_omarchy_theme("-v", dry_run=False), "Invalid theme slug")
+
+    def test_parse_files_arg_filters_unsafe(self) -> None:
+        parsed = cs.parse_files_arg("hypr/looknfeel.lua, ../../../etc/passwd, bin/tool")
+        self.assertEqual(parsed, {"hypr/looknfeel.lua", "bin/tool"})
+
+    def test_copy_mapped_file_unlinks_destination_symlink(self) -> None:
+        with TempHome() as env:
+            target_outside = env.home / "sensitive.txt"
+            target_outside.write_text("precious", encoding="utf-8")
+
+            local_file = env.home / ".config" / "hypr" / "looknfeel.lua"
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            local_file.symlink_to(target_outside)
+
+            repo_file = env.home / "repo" / "hypr" / "looknfeel.lua"
+            repo_file.parent.mkdir(parents=True, exist_ok=True)
+            repo_file.write_text("new_look_and_feel", encoding="utf-8")
+
+            item = {
+                "path": "hypr/looknfeel.lua",
+                "repo_path": str(repo_file),
+                "local_path": str(local_file),
+            }
+            cs.copy_mapped_file(item, direction="apply")
+
+            # Local file is now a regular file, not a symlink
+            self.assertFalse(local_file.is_symlink())
+            self.assertEqual(local_file.read_text(encoding="utf-8"), "new_look_and_feel")
+            # The target outside was untouched
+            self.assertEqual(target_outside.read_text(encoding="utf-8"), "precious")
+
+
 class RealRepoInspect(unittest.TestCase):
     def test_inspect_live_omarchy_config(self) -> None:
         if not OMARCHY_CONFIG.is_dir():
