@@ -3,7 +3,9 @@
 A status-bar plugin to seamlessly sync all your Omarchy configurations, shortcuts, themes, and plugins between your machines using a private Git repository.
 
 <p align="center">
-  <img src="screenshot.png" alt="Omarchy Config Sync" width="560">
+  <img src="screenshot.png" alt="Overview dashboard" width="410">
+  &nbsp;&nbsp;
+  <img src="screenshot-changes.png" alt="Review and cherry-pick changes" width="410">
 </p>
 
 **New here?** Follow the [first-time setup guide](GETTING-STARTED.md): create an empty **private** GitHub repo, paste its URL into the tray icon, review this machine, then **Publish this machine**. Keep that repo private so shortcuts, hooks, and scripts are not public.
