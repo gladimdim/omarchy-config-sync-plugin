@@ -779,11 +779,15 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
     return out
 
 
-def shortcut_diff(local_path: Path, repo_path: Path) -> list[dict[str, Any]]:
+def shortcut_diff(local_path: Path, repo_path: Path, stored_hash: str | None = None) -> list[dict[str, Any]]:
     local_text = read_text(local_path) if local_path.is_file() else ""
     repo_text = read_text(repo_path) if repo_path.is_file() else ""
     local_map = {e["keys"]: e for e in extract_bind_statements(local_text)}
     repo_map = {e["keys"]: e for e in extract_bind_statements(repo_text)}
+    local_file_hash = file_hash(local_path, "hypr/bindings.lua") if local_path.is_file() else None
+    repo_file_hash = file_hash(repo_path, "hypr/bindings.lua") if repo_path.is_file() else None
+    local_at_baseline = bool(stored_hash) and local_file_hash == stored_hash
+    repo_at_baseline = bool(stored_hash) and repo_file_hash == stored_hash
     rows = []
     for keys in sorted(set(local_map) | set(repo_map)):
         local_e = local_map.get(keys)
@@ -794,18 +798,45 @@ def shortcut_diff(local_path: Path, repo_path: Path) -> list[dict[str, Any]]:
             continue
         if local_e and not repo_e:
             status = "added-local"
+            change = "added"
         elif repo_e and not local_e:
             status = "added-repo"
-        else:
+            change = "added"
+        elif local_at_baseline and not repo_at_baseline:
+            status = "repo"
+            change = "changed"
+        elif repo_at_baseline and not local_at_baseline:
+            status = "local"
+            change = "changed"
+        elif stored_hash:
             status = "both"
+            change = "changed"
+        else:
+            # No sync baseline yet: treat as incoming so Apply can cherry-pick
+            # which repo binds land locally. Uncheck to keep the local bind.
+            status = "repo"
+            change = "changed"
+        local_label = (local_e or {}).get("label") or ""
+        repo_label = (repo_e or {}).get("label") or ""
+        if status in {"added-repo", "repo"}:
+            label = repo_label or local_label or keys
+            detail = f"was: {local_label}" if change == "changed" and local_label else "new in repo"
+        elif status in {"added-local", "local"}:
+            label = local_label or repo_label or keys
+            detail = f"repo has: {repo_label}" if change == "changed" and repo_label else "new on this laptop"
+        else:
+            label = local_label or repo_label or keys
+            detail = f"this laptop: {local_label} · repo: {repo_label}"
         rows.append(
             {
                 "keys": keys,
-                "label": (local_e or repo_e or {}).get("label") or keys,
+                "label": label,
+                "detail": detail,
+                "change": change,
                 "kind": (local_e or repo_e or {}).get("kind") or "bind",
                 "status": status,
-                "local_label": (local_e or {}).get("label") or "",
-                "repo_label": (repo_e or {}).get("label") or "",
+                "local_label": local_label,
+                "repo_label": repo_label,
                 "local_raw": local_raw,
                 "repo_raw": repo_raw,
                 "default_apply": status in {"added-repo", "repo"},
@@ -1180,7 +1211,11 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             item["preview"] = ""
         counts[status] = counts.get(status, 0) + 1
         files.append(item)
-    shortcuts = shortcut_diff(ctx.config_hypr / "bindings.lua", repo / "hypr" / "bindings.lua")
+    shortcuts = shortcut_diff(
+        ctx.config_hypr / "bindings.lua",
+        repo / "hypr" / "bindings.lua",
+        stored.get("hypr/bindings.lua"),
+    )
     plugins = plugin_groups(files)
     for plugin in plugins:
         manifest = load_json(repo / "plugins" / plugin["id"] / "manifest.json", default=None) or load_json(

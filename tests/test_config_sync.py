@@ -215,6 +215,61 @@ class ShortcutTests(unittest.TestCase):
         rows = cs.parse_shortcuts('hl.unbind("SUPER + SHIFT + B")\n')
         self.assertEqual(rows, [{"keys": "SUPER + SHIFT + B", "label": "Unbound default", "kind": "unbind"}])
 
+    def test_incoming_changed_and_added_are_not_both(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "local.lua"
+            repo = Path(tmp) / "repo.lua"
+            write(
+                local,
+                'o.bind("SUPER + A", "Alpha", "a")\n'
+                'o.bind("SUPER + B", "Beta", "b")\n'
+                'o.bind("SUPER + C", "Gamma", "c")\n',
+            )
+            write(
+                repo,
+                'o.bind("SUPER + A", "Alpha 2", "a2")\n'
+                'o.bind("SUPER + B", "Beta", "b")\n'
+                'o.bind("SUPER + C", "Gamma 2", "c2")\n'
+                'o.bind("SUPER + D", "Delta", "d")\n'
+                'o.bind("SUPER + E", "Epsilon", "e")\n',
+            )
+            stored = cs.file_hash(local, "hypr/bindings.lua")
+            rows = {r["keys"]: r for r in cs.shortcut_diff(local, repo, stored)}
+            self.assertEqual(rows["SUPER + A"]["status"], "repo")
+            self.assertEqual(rows["SUPER + A"]["change"], "changed")
+            self.assertNotIn("SUPER + B", rows)
+            self.assertEqual(rows["SUPER + C"]["status"], "repo")
+            self.assertEqual(rows["SUPER + D"]["status"], "added-repo")
+            self.assertEqual(rows["SUPER + E"]["status"], "added-repo")
+            self.assertEqual(rows["SUPER + D"]["change"], "added")
+
+    def test_apply_cherry_picks_incoming_shortcuts(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(
+                env.ctx.config_hypr / "bindings.lua",
+                'o.bind("SUPER + A", "Alpha", "a")\n'
+                'o.bind("SUPER + C", "Gamma", "c")\n',
+            )
+            write(
+                repo / "hypr" / "bindings.lua",
+                'o.bind("SUPER + A", "Alpha 2", "a2")\n'
+                'o.bind("SUPER + C", "Gamma", "c")\n'
+                'o.bind("SUPER + D", "Delta", "d")\n'
+                'o.bind("SUPER + E", "Epsilon", "e")\n',
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            applied = cs.cmd_apply(
+                env.ctx,
+                argparse_ns(explicit=True, files="", shortcut=["SUPER + A", "SUPER + D"]),
+            )
+            self.assertTrue(applied["ok"], applied)
+            text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
+            self.assertIn("Alpha 2", text)
+            self.assertIn("Delta", text)
+            self.assertNotIn("Epsilon", text)
+            self.assertIn("Gamma", text)
+
     def test_upsert_keeps_other_binds(self) -> None:
         dest = (
             'o.bind("SUPER + A", "Alpha", "a")\n'

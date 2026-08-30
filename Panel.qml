@@ -77,7 +77,11 @@ Panel {
     return out
   }
   readonly property var incomingShortcuts: Model.filesByStatus(shortcutDiffs, ["repo", "added-repo"])
+  readonly property var incomingAddedShortcuts: Model.filesByStatus(shortcutDiffs, ["added-repo"])
+  readonly property var incomingChangedShortcuts: Model.filesByStatus(shortcutDiffs, ["repo"])
   readonly property var localShortcuts: Model.filesByStatus(shortcutDiffs, ["local", "added-local"])
+  readonly property var localAddedShortcuts: Model.filesByStatus(shortcutDiffs, ["added-local"])
+  readonly property var localChangedShortcuts: Model.filesByStatus(shortcutDiffs, ["local"])
   readonly property var bothShortcuts: Model.filesByStatus(shortcutDiffs, ["both"])
   readonly property var incomingPlugins: Model.filesByStatus(pluginDiffs, ["repo", "added-repo"])
   readonly property var localPlugins: Model.filesByStatus(pluginDiffs, ["local", "added-local"])
@@ -260,7 +264,7 @@ Panel {
         if (bothPicks["s:" + s.keys] === "repo") out.push(s.keys)
         continue
       }
-      if (s.status === "added-repo" || s.status === "repo") out.push(s.keys)
+      if (s.status === "added-repo" || s.status === "repo" || s.status === "differs") out.push(s.keys)
     }
     return out
   }
@@ -1108,8 +1112,10 @@ Panel {
           both: !!(root.themeDiff && root.themeDiff.status === "both")
         }
 
-        ChangeSection { title: "INCOMING SHORTCUTS"; kind: "s"; idField: "keys"; files: root.incomingShortcuts; labelField: "keys"; summaryField: "label" }
-        ChangeSection { title: "LOCAL SHORTCUTS"; kind: "s"; idField: "keys"; files: root.localShortcuts; labelField: "keys"; summaryField: "label" }
+        ChangeSection { title: "INCOMING SHORTCUTS — ADDED"; kind: "s"; idField: "keys"; files: root.incomingAddedShortcuts; labelField: "keys"; summaryField: "label" }
+        ChangeSection { title: "INCOMING SHORTCUTS — CHANGED"; kind: "s"; idField: "keys"; files: root.incomingChangedShortcuts; labelField: "keys"; summaryField: "detail" }
+        ChangeSection { title: "LOCAL SHORTCUTS — ADDED"; kind: "s"; idField: "keys"; files: root.localAddedShortcuts; labelField: "keys"; summaryField: "label" }
+        ChangeSection { title: "LOCAL SHORTCUTS — CHANGED"; kind: "s"; idField: "keys"; files: root.localChangedShortcuts; labelField: "keys"; summaryField: "detail" }
         ChangeSection { title: "INCOMING PLUGINS"; kind: "p"; idField: "id"; files: root.incomingPlugins.concat(root.differsPlugins); labelField: "name"; summaryField: "id" }
         ChangeSection { title: "LOCAL PLUGINS"; kind: "p"; idField: "id"; files: root.localPlugins; labelField: "name"; summaryField: "id" }
         ChangeSection { title: "INCOMING FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
@@ -1258,20 +1264,36 @@ Panel {
       }
 
       ChangeSection {
-        title: "INCOMING SHORTCUTS"
+        title: "INCOMING SHORTCUTS — ADDED"
         kind: "s"
         idField: "keys"
-        files: root.incomingShortcuts
+        files: root.incomingAddedShortcuts
         labelField: "keys"
         summaryField: "label"
       }
       ChangeSection {
-        title: "LOCAL SHORTCUTS"
+        title: "INCOMING SHORTCUTS — CHANGED"
         kind: "s"
         idField: "keys"
-        files: root.localShortcuts
+        files: root.incomingChangedShortcuts
+        labelField: "keys"
+        summaryField: "detail"
+      }
+      ChangeSection {
+        title: "LOCAL SHORTCUTS — ADDED"
+        kind: "s"
+        idField: "keys"
+        files: root.localAddedShortcuts
         labelField: "keys"
         summaryField: "label"
+      }
+      ChangeSection {
+        title: "LOCAL SHORTCUTS — CHANGED"
+        kind: "s"
+        idField: "keys"
+        files: root.localChangedShortcuts
+        labelField: "keys"
+        summaryField: "detail"
       }
       ChangeSection {
         title: "SHORTCUTS CHANGED ON BOTH SIDES"
@@ -1338,21 +1360,36 @@ Panel {
         fontFamily: root.fontFamily
       }
       ChangeSection {
-        title: "INCOMING"
+        title: "INCOMING — ADDED"
         kind: "s"
         idField: "keys"
-        files: root.incomingShortcuts.concat(root.bothShortcuts)
+        files: root.incomingAddedShortcuts
         labelField: "keys"
         summaryField: "label"
-        both: root.bothShortcuts.length > 0
       }
       ChangeSection {
-        title: "LOCAL"
+        title: "INCOMING — CHANGED"
         kind: "s"
         idField: "keys"
-        files: root.localShortcuts
+        files: root.incomingChangedShortcuts
+        labelField: "keys"
+        summaryField: "detail"
+      }
+      ChangeSection {
+        title: "LOCAL — ADDED"
+        kind: "s"
+        idField: "keys"
+        files: root.localAddedShortcuts
         labelField: "keys"
         summaryField: "label"
+      }
+      ChangeSection {
+        title: "LOCAL — CHANGED"
+        kind: "s"
+        idField: "keys"
+        files: root.localChangedShortcuts
+        labelField: "keys"
+        summaryField: "detail"
       }
 
       PanelSectionHeader { text: "BINDINGS IN THE REPO"; foreground: root.foreground; fontFamily: root.fontFamily }
