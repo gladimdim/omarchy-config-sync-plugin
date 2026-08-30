@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "gladimdim.config-sync",
-  "name": "Config Sync",
+  "name": "Omarchy Config Sync",
   "version": "1.2.4",
   "author": "Dmytro Gladkyi",
   "license": "MIT",
-  "description": "Link a git repo of Omarchy configs, preview shortcuts/plugins/files, apply them to this laptop, and publish local changes back for your other machines.",
+  "description": "Link a git repo of Omarchy configs, preview shortcuts/plugins/files, apply them to this machine, and publish local changes back for your other machines.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,8 +13,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Config Sync",
-    "description": "Sync Omarchy configs across laptops from a git repo",
+    "displayName": "Omarchy Config Sync",
+    "description": "Sync Omarchy configs across machines from a git repo",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -22,9 +22,11 @@
       "config-sync",
       "omarchy-config",
       "sync",
+      "settings-sync",
       "dotfiles",
       "backup",
-      "git-sync"
+      "git-sync",
+      "cloud-sync"
     ]
   }
 }

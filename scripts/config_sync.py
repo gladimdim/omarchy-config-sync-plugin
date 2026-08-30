@@ -964,10 +964,10 @@ def shortcut_diff(local_path: Path, repo_path: Path, stored_hash: str | None = N
             detail = f"was: {local_label}" if change == "changed" and local_label else "new in repo"
         elif status in {"added-local", "local"}:
             label = local_label or repo_label or keys
-            detail = f"repo has: {repo_label}" if change == "changed" and repo_label else "new on this laptop"
+            detail = f"repo has: {repo_label}" if change == "changed" and repo_label else "new on this machine"
         else:
             label = local_label or repo_label or keys
-            detail = f"this laptop: {local_label} · repo: {repo_label}"
+            detail = f"this machine: {local_label} · repo: {repo_label}"
         rows.append(
             {
                 "keys": keys,
@@ -1143,7 +1143,7 @@ def file_bundles(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if status == "added-repo":
                 summary = f"New plugin · {n} file{'s' if n != 1 else ''}"
             elif status == "added-local":
-                summary = f"New on this laptop · {n} file{'s' if n != 1 else ''}"
+                summary = f"New on this machine · {n} file{'s' if n != 1 else ''}"
             else:
                 summary = f"Plugin updates · {n} file{'s' if n != 1 else ''}"
         elif b["kind"] == "hooks":
@@ -1679,7 +1679,7 @@ def finish_connect(ctx: Context, repo: Path, repo_url: str, using_existing: bool
     if not validation["valid"] and not empty:
         raise SyncError(
             "That git repo is not an Omarchy config repo, and it is not empty either. "
-            "Use a private repo that is empty (to seed from this laptop) or one that already "
+            "Use a private repo that is empty (to seed from this machine) or one that already "
             "has hypr/ configs plus shell.json, plugins/, or apply.sh.",
             extra={"validation": validation},
         )
@@ -1699,8 +1699,8 @@ def finish_connect(ctx: Context, repo: Path, repo_url: str, using_existing: bool
     snap["empty"] = empty
     if empty:
         snap["message"] = (
-            "Linked an empty private repo. Review the Shortcuts, Plugins, and Configs tabs "
-            "(this laptop), then Publish to seed the repo. Keep it private."
+            "Linked an empty private repo. Review the Configs tab "
+            "(this machine), then Publish to seed the repo. Keep it private."
         )
     return snap
 
@@ -1981,7 +1981,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         )
     if git_fields["behind"]:
         raise SyncError(
-            "Remote has commits this clone does not. Pull/merge first so you do not overwrite another laptop.",
+            "Remote has commits this clone does not. Pull/merge first so you do not overwrite another machine.",
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
     diff = annotate_diff(ctx, repo, state)
@@ -2103,7 +2103,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
-    """Make this laptop match the repo, or publish this laptop over the repo."""
+    """Make this machine match the repo, or publish this machine over the repo."""
     side = (args.side or "repo").strip().lower()
     if side in {"local", "ours", "this"}:
         side = "local"
@@ -2172,10 +2172,10 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     if side == "repo":
         if not files and not shortcuts and not plugins and not theme:
             snap = build_snapshot(ctx, fetch=False)
-            snap["message"] = "Nothing from the repo to apply. This laptop may already match."
+            snap["message"] = "Nothing from the repo to apply. This machine may already match."
             return snap
         result = cmd_apply(ctx, nested)
-        result["message"] = "Resynced this laptop from the repo. " + str(result.get("message") or "")
+        result["message"] = "Resynced this machine from the repo. " + str(result.get("message") or "")
         result["resync"] = "repo"
         return result
 
@@ -2185,7 +2185,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = "Nothing local to publish."
         return snap
     result = cmd_publish(ctx, nested)
-    result["message"] = "Published this laptop as the source of truth. " + str(result.get("message") or "")
+    result["message"] = "Published this machine as the source of truth. " + str(result.get("message") or "")
     result["resync"] = "local"
     return result
 

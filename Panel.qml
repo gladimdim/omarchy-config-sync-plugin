@@ -958,7 +958,7 @@ Panel {
             GuideStep {
               step: "2"
               title: "Paste the repo URL"
-              body: "HTTPS (https://github.com/you/omarchy-config.git), SSH, or owner/repo. An empty private repo is what you want on the first laptop. On the next laptop, paste this same URL and Apply."
+              body: "HTTPS (https://github.com/you/omarchy-config.git), SSH, or owner/repo. An empty private repo is what you want on the first machine. On the next machine, paste this same URL and Apply."
             }
 
             TextField {
@@ -991,7 +991,7 @@ Panel {
                 onClicked: root.connectRepo()
               }
               Button {
-                text: "Use this laptop's clone"
+                text: "Use this machine's clone"
                 tooltipText: "If you already keep configs in ~/Github/omarchy-config"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
@@ -1005,8 +1005,8 @@ Panel {
 
             GuideStep {
               step: "3"
-              title: "Review, then Publish this laptop"
-              body: "Empty repo: the tabs show this machine. Publish seeds GitHub (still private). Next laptop: Connect the same URL and press Apply. Display layout is skipped unless you opt in."
+              title: "Review, then Publish this machine"
+              body: "Empty repo: the tabs show this machine. Publish seeds GitHub (still private). Next machine: Connect the same URL and press Apply. Display layout is skipped unless you opt in."
             }
           }
         }
@@ -1100,18 +1100,18 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               text: root.confirmKind === "apply"
-                ? "Apply the checked incoming shortcuts, plugins, and files onto this laptop? A timestamped backup is written first."
+                ? "Apply the checked incoming shortcuts, plugins, and files onto this machine? A timestamped backup is written first."
                 : root.confirmKind === "publish"
                   ? (root.syncState === "empty"
-                    ? "Seed this private GitHub repo with the checked items from this laptop, then push? Keep the repo private so shortcuts, hooks, and scripts are not public."
+                    ? "Seed this private GitHub repo with the checked items from this machine, then push? Keep the repo private so shortcuts, hooks, and scripts are not public."
                     : "Copy the checked local shortcuts, plugins, and files into the repo, commit, and push?")
                   : root.confirmKind === "switch-repo"
-                    ? "Point this laptop at a different git repo? Local files are not deleted. The new repo is cloned and checked before anything is applied."
+                    ? "Point this machine at a different git repo? Local files are not deleted. The new repo is cloned and checked before anything is applied."
                     : root.confirmKind === "resync-repo"
-                      ? "Make this laptop match the git repo? Incoming plugins, shortcuts, theme, and configs overwrite local copies. A timestamped backup is written first. Extra files that exist only on this laptop are left in place."
+                      ? "Make this machine match the git repo? Incoming plugins, shortcuts, theme, and configs overwrite local copies. A timestamped backup is written first. Extra files that exist only on this machine are left in place."
                       : root.confirmKind === "resync-local"
-                        ? "Overwrite the git repo with this laptop's config, then push?"
-                        : "Unlink the config repo on this laptop? Local files are left as they are."
+                        ? "Overwrite the git repo with this machine's config, then push?"
+                        : "Unlink the config repo on this machine? Local files are left as they are."
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -1124,7 +1124,7 @@ Panel {
               width: parent.width
 
               Button {
-                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "switch-repo" ? "Switch repo" : (root.confirmKind === "resync-repo" ? "Take repo" : (root.confirmKind === "resync-local" ? "Take this laptop" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply"))))
+                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "switch-repo" ? "Switch repo" : (root.confirmKind === "resync-repo" ? "Take repo" : (root.confirmKind === "resync-local" ? "Take this machine" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply"))))
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
@@ -1199,7 +1199,7 @@ Panel {
           visible: root.syncState === "diverged" || root.syncState === "conflicts" || (root.incomingFiles.length + root.incomingBundles.length + root.incomingAddedShortcuts.length + root.incomingChangedShortcuts.length > 0 && root.localFiles.length + root.localBundles.length + root.localAddedShortcuts.length + root.localChangedShortcuts.length > 0)
           text: "Resync from repo"
           iconText: "󰁨"
-          tooltipText: "Make this laptop match the git repo. A backup is written first."
+          tooltipText: "Make this machine match the git repo. A backup is written first."
           foreground: root.foreground
           fontFamily: root.fontFamily
           bordered: true
@@ -1228,7 +1228,7 @@ Panel {
           onClicked: root.requestApply()
         }
         Button {
-          text: root.syncState === "empty" ? "Publish this laptop" : "Publish"
+          text: root.syncState === "empty" ? "Publish this machine" : "Publish"
           iconText: "󰓂"
           tooltipText: root.syncState === "empty"
             ? "Seed the empty private repo from this machine, then push"
@@ -1327,7 +1327,7 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "HTTPS, SSH, owner/repo, or a local path. Empty private repos can be seeded from this laptop."
+              text: "HTTPS, SSH, owner/repo, or a local path. Empty private repos can be seeded from this machine."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1397,7 +1397,7 @@ Panel {
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: "Incoming is from git (Apply). Outgoing is this laptop (Publish). Press a group to expand and tick each item."
+          text: "Incoming is from git (Apply). Outgoing is this machine (Publish). Press a group to expand and tick each item."
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -1412,7 +1412,7 @@ Panel {
         }
         ChangeSection {
           title: "Outgoing"
-          subtitle: "This laptop — Publish"
+          subtitle: "This machine — Publish"
           mixed: true
           files: root.outgoingItems
         }
@@ -1437,7 +1437,7 @@ Panel {
         textFormat: Text.PlainText
         text: root.showingHidden
           ? "Hidden changes are ignored during sync and do not trigger notifications. Press Unhide on any item to restore it."
-          : "Incoming is from git (Apply). Outgoing is this laptop (Publish). Groups start collapsed — press one to tick each item. On = sync that row, Off = leave it alone."
+          : "Incoming is from git (Apply). Outgoing is this machine (Publish). Groups start collapsed — press one to tick each item. On = sync that row, Off = leave it alone."
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -1579,7 +1579,7 @@ Panel {
       ChangeSection {
         visible: !root.showingHidden && root.outgoingItems.length > 0
         title: "Outgoing"
-        subtitle: "This laptop — Publish"
+        subtitle: "This machine — Publish"
         mixed: true
         files: root.outgoingItems
       }
@@ -1600,7 +1600,7 @@ Panel {
           textFormat: Text.PlainText
           text: root.hiddenCount > 0
             ? ("No active config differences (" + root.hiddenCount + " ignored).")
-            : "No portable config differences. This laptop matches the repo."
+            : "No portable config differences. This machine matches the repo."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -2712,7 +2712,7 @@ Panel {
     readonly property string direction: {
       var s = String(statusLabel || "").toLowerCase()
       if (s.indexOf("incoming") !== -1 || s === "new in repo") return "in"
-      if (s.indexOf("local") !== -1 || s.indexOf("this laptop") !== -1) return "out"
+      if (s.indexOf("local") !== -1 || s.indexOf("this machine") !== -1) return "out"
       if (s.indexOf("both") !== -1) return "both"
       return ""
     }

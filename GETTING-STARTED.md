@@ -1,6 +1,6 @@
 # First-time setup
 
-This walkthrough takes you from a fresh Omarchy laptop to a **private** GitHub repo that holds your desktop config — shortcuts, bar layout, plugins, hooks, and terminal files — so the next machine can apply the same setup in one click.
+This walkthrough takes you from a fresh Omarchy machine to a **private** GitHub repo that holds your desktop config — shortcuts, bar layout, plugins, hooks, and terminal files — so the next machine can apply the same setup in one click.
 
 You do this **once**. After that, the tray icon is Apply / Publish.
 
@@ -15,7 +15,7 @@ The files this plugin syncs are yours, not a theme pack. They can include:
 - automation hooks that run on boot or after updates
 - hostnames, display names, and paths that identify you
 
-A **public** GitHub repo is crawled, forked, and searchable. Keep the config repo **Private**. You can still clone it on every laptop you own. Starting private is the safe default; you can open it later if you really want to.
+A **public** GitHub repo is crawled, forked, and searchable. Keep the config repo **Private**. You can still clone it on every machine you own. Starting private is the safe default; you can open it later if you really want to.
 
 This plugin’s own source (`omarchy-config-sync-plugin`) can stay public. That is not the same repo as your configs.
 
@@ -28,7 +28,7 @@ This plugin’s own source (`omarchy-config-sync-plugin`) can stay public. That 
 | `omarchy-config` (your name is fine) | **Private** | Your Hyprland + Omarchy files |
 | This plugin | Public is fine | The tray app that talks to that private repo |
 
-An empty private repo is enough. You do **not** need to copy files by hand. The plugin seeds it from this laptop.
+An empty private repo is enough. You do **not** need to copy files by hand. The plugin seeds it from this machine.
 
 ---
 
@@ -47,7 +47,7 @@ Keep that URL. You will paste it into the plugin.
 
 ---
 
-## Step 2 — Let this laptop talk to GitHub (no password prompts)
+## Step 2 — Let this machine talk to GitHub (no password prompts)
 
 The plugin never pops a username/password box. A prompt would freeze the status bar, so Git is told not to ask. Set up credentials **in a terminal first**.
 
@@ -94,7 +94,7 @@ omarchy-shell shell rescanPlugins
 4. Paste the URL from Step 1 into the field.
 5. Click **Connect repo**.
 
-The plugin clones the repo, notices it is empty, and **does not apply anything yet**. The Shortcuts, Plugins, and Configs tabs show **this laptop** — that is what will be uploaded.
+The plugin clones the repo, notices it is empty, and **does not apply anything yet**. The Shortcuts, Plugins, and Configs tabs show **this machine** — that is what will be uploaded.
 
 If clone fails with an authentication message, go back to Step 2.
 
@@ -108,15 +108,15 @@ This is the last “are you sure?” before your desktop layout lives on GitHub.
 - **Plugins** — everything under `~/.config/omarchy/plugins/` except this plugin itself
 - **Configs** — Hyprland files, `shell.json`, hooks, terminals
 
-**Display layout** (`hypr/monitors.lua`) stays on this machine. A second laptop usually has different screens. Turn on **Include display layout** on the Changes tab only if you mean it.
+**Display layout** (`hypr/monitors.lua`) stays on this machine. A second machine usually has different screens. Turn on **Include display layout** on the Changes tab only if you mean it.
 
-When it looks right, click **Publish this laptop**. Confirm. The plugin copies those files into the private repo, commits, and pushes.
+When it looks right, click **Publish this machine**. Confirm. The plugin copies those files into the private repo, commits, and pushes.
 
 Your GitHub repo should now contain `hypr/`, `omarchy/`, `plugins/`, and so on — still **private**.
 
 ---
 
-## Step 6 — The next laptop
+## Step 6 — The next machine
 
 On the new Omarchy machine:
 
@@ -129,14 +129,14 @@ After that, daily life is:
 
 When the badge lights up, **Review Changes** (or press `c`) opens a checklist. You can apply or publish only some shortcuts, only certain plugins, the selected **theme**, or only some config files. Unchecked items stay as they are on that machine.
 
-The selected Omarchy theme (`omarchy theme current`) is part of that list. Stock themes only need the name. If you customized a theme under `~/.config/omarchy/themes/<slug>/`, those overlay files sync too (wallpapers and preview images are skipped so the repo stays small). Apply runs `omarchy theme set` on the other laptop.
+The selected Omarchy theme (`omarchy theme current`) is part of that list. Stock themes only need the name. If you customized a theme under `~/.config/omarchy/themes/<slug>/`, those overlay files sync too (wallpapers and preview images are skipped so the repo stays small). Apply runs `omarchy theme set` on the other machine.
 
-Both laptops need the **same Config Sync plugin version** (Overview shows `Plugin: config-sync 1.2.4`). Incoming/outgoing groups, Include checkboxes, and Resync live in that version. Update with `omarchy plugin update gladimdim.config-sync --yes`, or copy `~/.config/omarchy/plugins/gladimdim.config-sync/` from the laptop that already has 1.2.4, then `omarchy restart shell`. Removing the plugin also forgets the linked repo, so a reinstall starts at Connect.
+Both machines need the **same Config Sync plugin version** (Overview shows `Plugin: config-sync 1.2.4`). Incoming/outgoing groups, Include checkboxes, and Resync live in that version. Update with `omarchy plugin update gladimdim.config-sync --yes`, or copy `~/.config/omarchy/plugins/gladimdim.config-sync/` from the machine that already has 1.2.4, then `omarchy restart shell`. Removing the plugin also forgets the linked repo, so a reinstall starts at Connect.
 
 | You did this | Open the icon | Press |
 | --- | --- | --- |
-| Added a shortcut / plugin on this laptop | Badge: local changes | **Publish** |
-| Published from the other laptop | Badge: incoming updates | **Apply** |
+| Added a shortcut / plugin on this machine | Badge: local changes | **Publish** |
+| Published from the other machine | Badge: incoming updates | **Apply** |
 | Both machines edited the same file | Changes → Both | Keep local or Take repo, then Apply/Publish |
 
 ---
@@ -153,7 +153,7 @@ GitHub → the repo → Settings → Danger Zone → Change repository visibilit
 You pointed at the wrong git URL (this plugin repo, a random project, a non-empty unrelated tree). Create a **new empty private** repo and paste that URL instead.
 
 **I already have `~/Github/omarchy-config`**  
-Use **Use this laptop’s clone** on the setup screen instead of creating a second GitHub repo. The folder must already be a git checkout of your config.
+Use **Use this machine’s clone** on the setup screen instead of creating a second GitHub repo. The folder must already be a git checkout of your config.
 
 **Secrets**  
 Do not put API tokens, `.env` files, or private keys in the synced tree. If a hook needs a secret, read it from a file that lives only on the machine, outside the repo.
@@ -167,5 +167,5 @@ Do not put API tokens, `.env` files, or private keys in the synced tree. If a ho
 | Enter in the URL field | Connect |
 | `r` | Refresh |
 | `p` | Publish (seed or later updates) |
-| `a` | Apply (second laptop) |
+| `a` | Apply (second machine) |
 | `Esc` | Close the panel |

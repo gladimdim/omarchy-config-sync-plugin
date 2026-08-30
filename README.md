@@ -1,21 +1,21 @@
 # Omarchy Config Sync (`gladimdim.config-sync`)
 
-A status-bar plugin that keeps [Omarchy](https://omarchy.org/) configs in a **private** git repo — the same layout as [`omarchy-config`](https://github.com/gladimdim/omarchy-config) — in sync across laptops.
+A status-bar plugin that keeps [Omarchy](https://omarchy.org/) configs in a **private** git repo — the same layout as [`omarchy-config`](https://github.com/gladimdim/omarchy-config) — in sync across machines.
 
-**New here?** Follow the [first-time setup guide](GETTING-STARTED.md): create an empty **private** GitHub repo, paste its URL into the tray icon, review this laptop, then **Publish this laptop**. Keep that repo private so shortcuts, hooks, and scripts are not public.
+**New here?** Follow the [first-time setup guide](GETTING-STARTED.md): create an empty **private** GitHub repo, paste its URL into the tray icon, review this machine, then **Publish this machine**. Keep that repo private so shortcuts, hooks, and scripts are not public.
 
-Click the cloud-sync tray icon, paste the git URL of your config repo, preview what would land on this machine, then **Apply**. When you add a shortcut or plugin locally, open the panel again and **Publish** to send it to the next laptop.
+Click the cloud-sync tray icon, paste the git URL of your config repo, preview what would land on this machine, then **Apply**. When you add a shortcut or plugin locally, open the panel again and **Publish** to send it to the next machine.
 
-When there is drift, **Review Changes** opens a checklist: incoming vs local **shortcuts** (individual keybindings), **plugins** (whole plugin), the **selected theme**, and other config files. Uncheck anything you do not want. Apply and Publish only touch the checked items. Applying a theme runs `omarchy theme set` on this laptop.
+When there is drift, **Review Changes** opens a checklist: incoming vs local **shortcuts** (individual keybindings), **plugins** (whole plugin), the **selected theme**, and other config files. Uncheck anything you do not want. Apply and Publish only touch the checked items. Applying a theme runs `omarchy theme set` on this machine.
 
 ## Features
 
-- **Tray icon** in the Omarchy bar, with a badge when this laptop and the repo have drifted.
+- **Tray icon** in the Omarchy bar, with a badge when this machine and the repo have drifted.
 - **Link a repo** by HTTPS, SSH, `owner/repo` shorthand, or a local git path (for example `~/Github/omarchy-config`).
 - **Validates** that the clone is really an Omarchy config tree (`hypr/` plus `omarchy/shell.json`, `plugins/`, or `apply.sh`).
 - **Preview before apply**: shortcuts from `hypr/bindings.lua`, plugins with versions, bar layout, hooks, helper scripts, and terminal configs.
-- **Apply** copies repo → this laptop (timestamped backup under `~/.config/omarchy-backup.<timestamp>/`), reloads Hyprland, and rescans the shell. The Config Sync widget itself is preserved in the bar even if the incoming `shell.json` does not list it.
-- **Publish** copies this laptop → repo, commits, and pushes so the next machine can Apply.
+- **Apply** copies repo → this machine (timestamped backup under `~/.config/omarchy-backup.<timestamp>/`), reloads Hyprland, and rescans the shell. The Config Sync widget itself is preserved in the bar even if the incoming `shell.json` does not list it.
+- **Publish** copies this machine → repo, commits, and pushes so the next machine can Apply.
 - **Drift detection** on open (and every 10 minutes): local-only edits, incoming remote files, both-changed files, and git merge conflicts.
 - **Conflict handling**: per-file Keep local / Take repo for overlapping edits; Keep local / Take incoming for git merge conflicts. Display layout (`hypr/monitors.lua`) stays on this machine unless you opt in.
 
@@ -37,27 +37,27 @@ Place it next to the tray:
 omarchy plugin enable gladimdim.config-sync --section right
 ```
 
-## First laptop vs next laptop
+## First machine vs next machine
 
-| | First laptop | Next laptop |
+| | First machine | Next machine |
 | --- | --- | --- |
 | GitHub repo | Create **empty + Private** (see [GETTING-STARTED.md](GETTING-STARTED.md)) | Same URL |
 | After Connect | Tabs show **this machine** | Tabs show **the repo** |
-| Primary button | **Publish this laptop** (seed + push) | **Apply** (backup, then copy onto the machine) |
+| Primary button | **Publish this machine** (seed + push) | **Apply** (backup, then copy onto the machine) |
 
 ## Daily flow
 
-1. **New laptop** — click the icon, paste `https://github.com/<you>/omarchy-config.git` (or the local clone). Review Shortcuts / Plugins / Configs. Press **Apply**.
+1. **New machine** — click the icon, paste `https://github.com/<you>/omarchy-config.git` (or the local clone). Review Shortcuts / Plugins / Configs. Press **Apply**.
 2. **You changed this machine** — open the panel. A badge and the Changes tab list local edits (new keybinding, plugin, …). Press **Publish** to commit and push.
-3. **The other laptop published** — a badge appears. Open the panel, review incoming files, press **Apply**.
+3. **The other machine published** — a badge appears. Open the panel, review incoming files, press **Apply**.
 4. **Both changed the same file** — Changes → Both changed → **Keep local** or **Take repo** per file, then Apply and/or Publish.
-5. **Git diverged** (two laptops pushed without pulling) — **Pull**, resolve any unmerged paths, then continue.
+5. **Git diverged** (two machines pushed without pulling) — **Pull**, resolve any unmerged paths, then continue.
 
 State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` does not unlink the repo. Removing the plugin (`omarchy plugin remove gladimdim.config-sync`) forgets that state: a reinstall starts unlinked. **Unlink** in the panel does the same without deleting the plugin. A clone you pointed at in-place (for example `~/Github/omarchy-config`) is never deleted.
 
 ## What is synced
 
-| Repo path | On this laptop |
+| Repo path | On this machine |
 | --- | --- |
 | `hypr/*.lua`, `hypr/*.conf` | `~/.config/hypr/` |
 | `omarchy/shell.json` | `~/.config/omarchy/shell.json` |

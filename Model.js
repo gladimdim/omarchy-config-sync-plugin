@@ -15,14 +15,14 @@ function stateTitle(state) {
   switch (String(state || "")) {
     case "in-sync": return "In sync"
     case "ready": return "Ready to apply"
-    case "empty": return "Empty repo — seed from this laptop"
+    case "empty": return "Empty repo — seed from this machine"
     case "local-ahead": return "Local changes"
     case "remote-ahead": return "Incoming updates"
     case "diverged": return "Both sides changed"
     case "conflicts": return "Merge conflicts"
     case "invalid": return "Not an Omarchy config"
     case "not-configured": return "Not linked"
-    default: return "Config Sync"
+    default: return "Omarchy Config Sync"
   }
 }
 
@@ -33,19 +33,19 @@ function stateHint(state, status) {
   var differs = status && status.unknown_differs ? Number(status.unknown_differs) : 0
   switch (String(state || "")) {
     case "in-sync":
-      return "This laptop matches the linked config repo."
+      return "This machine matches the linked config repo."
     case "empty":
-      return "This GitHub repo is empty (or only has a README). The tabs show this laptop. Press Publish this laptop to seed the private repo, then use Apply on your other machines."
+      return "This GitHub repo is empty (or only has a README). The tabs show this machine. Press Publish this machine to seed the private repo, then use Apply on your other machines."
     case "ready":
-      return "The repo looks like Omarchy config. Review shortcuts, plugins, and files, then Apply to this machine — or Publish if this laptop is the source of truth."
+      return "The repo looks like Omarchy config. Review shortcuts, plugins, and files, then Apply to this machine — or Publish if this machine is the source of truth."
     case "local-ahead":
       return localN === 1
-        ? "1 local change is not in the repo yet. Publish to share it with your other laptops."
-        : localN + " local changes are not in the repo yet. Publish to share them with your other laptops."
+        ? "1 local change is not in the repo yet. Publish to share it with your other machines."
+        : localN + " local changes are not in the repo yet. Publish to share them with your other machines."
     case "remote-ahead":
-      return "The repo has config this laptop has not applied. Review the incoming files, then Apply."
+      return "The repo has config this machine has not applied. Review the incoming files, then Apply."
     case "diverged":
-      return "This laptop and the repo both moved. Resync from repo to make this machine match git (usual on a second laptop). Or Review Changes and pick item by item."
+      return "This machine and the repo both moved. Resync from repo to make this machine match git (usual on a second machine). Or Review Changes and pick item by item."
     case "conflicts":
       return "Git could not merge automatically. Keep the local copy or take the incoming copy for each conflicted file."
     case "invalid":
@@ -58,7 +58,7 @@ function stateHint(state, status) {
 function fileStatusLabel(status) {
   switch (String(status || "")) {
     case "local": return "Local only"
-    case "added-local": return "New on this laptop"
+    case "added-local": return "New on this machine"
     case "repo": return "Incoming"
     case "added-repo": return "New in repo"
     case "both": return "Both changed"
