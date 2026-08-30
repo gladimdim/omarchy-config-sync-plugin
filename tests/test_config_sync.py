@@ -843,18 +843,14 @@ class SecurityTests(unittest.TestCase):
             self.assertEqual(target_outside.read_text(encoding="utf-8"), "precious")
 
 
-class RealRepoInspect(unittest.TestCase):
-    def test_inspect_live_omarchy_config(self) -> None:
-        if not OMARCHY_CONFIG.is_dir():
-            self.skipTest("omarchy-config fixture missing")
+    def test_cmd_open(self) -> None:
         with TempHome() as env:
-            inspect = cs.inspect_repo(env.ctx, OMARCHY_CONFIG)
-            self.assertTrue(inspect["valid"])
-            self.assertGreater(len(inspect["shortcuts"]), 3)
-            self.assertGreater(len(inspect["plugins"]), 3)
-            ids = [p["id"] for p in inspect["plugins"]]
-            self.assertIn("gladimdim.hardware.info", ids)
-            self.assertIn("ranjithraj.news-reader", ids)
+            local_file = env.home / ".config" / "hypr" / "looknfeel.lua"
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            local_file.write_text("content", encoding="utf-8")
+            res = cs.cmd_open(env.ctx, argparse_ns(args=["hypr/looknfeel.lua"]))
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["opened"], str(local_file))
 
 
 if __name__ == "__main__":

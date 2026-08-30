@@ -2268,6 +2268,84 @@ def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return snap
 
 
+def open_in_file_manager(target_path: str | Path) -> bool:
+    target = Path(target_path).expanduser().resolve()
+    if not target.exists() and target.parent.exists():
+        target = target.parent
+    if not target.exists():
+        return False
+
+    uri = target.as_uri()
+    dbus = shutil.which("dbus-send")
+    if dbus:
+        try:
+            res = subprocess.run(
+                [
+                    dbus,
+                    "--session",
+                    "--type=method_call",
+                    "--dest=org.freedesktop.FileManager1",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                    f"array:string:{uri}",
+                    "string:",
+                ],
+                capture_output=True,
+                timeout=3,
+            )
+            if res.returncode == 0:
+                return True
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    for fm, flag in [("nautilus", "--select"), ("dolphin", "--select"), ("nemo", "--no-desktop")]:
+        binary = shutil.which(fm)
+        if binary:
+            try:
+                subprocess.Popen([binary, flag, str(target)])
+                return True
+            except OSError:
+                pass
+
+    xdg_open = shutil.which("xdg-open")
+    if xdg_open:
+        open_target = target if target.is_dir() else target.parent
+        try:
+            subprocess.Popen([xdg_open, str(open_target)])
+            return True
+        except OSError:
+            pass
+
+    return False
+
+
+def cmd_open(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    raw_path = args.args[0] if args.args else getattr(args, "files", None) or ""
+    if not raw_path:
+        raise SyncError("No path provided to open.")
+    target = Path(raw_path).expanduser()
+    if not target.is_absolute():
+        try:
+            repo = configured_repo(ctx)
+        except Exception:
+            repo = ctx.default_clone
+        inv = collect_inventory(ctx, repo)
+        mapped = next((i for i in inv if i["path"] == raw_path), None)
+        if mapped and Path(mapped["local_path"]).exists():
+            target = Path(mapped["local_path"])
+        elif mapped and Path(mapped["repo_path"]).exists():
+            target = Path(mapped["repo_path"])
+        elif (ctx.home / ".config" / raw_path).exists():
+            target = ctx.home / ".config" / raw_path
+        elif (ctx.local_bin / raw_path.removeprefix("bin/")).exists():
+            target = ctx.local_bin / raw_path.removeprefix("bin/")
+        elif (repo / raw_path).exists():
+            target = repo / raw_path
+
+    success = open_in_file_manager(target)
+    return ok({"opened": str(target), "success": success})
+
+
 def cmd_hide(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     state = load_state(ctx)
     hidden = list(state.get("hidden") or [])
@@ -2344,6 +2422,7 @@ def build_parser() -> argparse.ArgumentParser:
             "resync",
             "hide",
             "unhide",
+            "open",
         ],
     )
     parser.add_argument("args", nargs="*")
@@ -2388,6 +2467,8 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_hide(ctx, args)
     if command == "unhide":
         return cmd_unhide(ctx, args)
+    if command == "open":
+        return cmd_open(ctx, args)
     raise SyncError(f"Unknown command: {command}")
 
 

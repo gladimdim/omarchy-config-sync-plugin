@@ -588,6 +588,18 @@ Panel {
     run(["resolve", path, "--side", side])
   }
 
+  function openFile(path, localPath, repoPath) {
+    var target = String(localPath || "").trim()
+    if (!target) {
+      target = String(repoPath || "").trim()
+    }
+    if (!target) {
+      target = String(path || "").trim()
+    }
+    if (!target) return
+    Quickshell.execDetached(["python3", root.scriptPath, "open", target])
+  }
+
   function applySnapshot(data) {
     status = data.status || {}
     inspect = data.inspect || null
@@ -1773,6 +1785,8 @@ Panel {
         model: root.inspect && root.inspect.shortcuts ? root.inspect.shortcuts : []
         CardBox {
           required property var modelData
+          clickable: true
+          targetPath: "hypr/bindings.lua"
           Row {
             width: parent.width
             spacing: Style.space(10)
@@ -1783,7 +1797,7 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               font.bold: true
-              width: parent.width * 0.46
+              width: parent.width * 0.44
               wrapMode: Text.WordWrap
             }
             Text {
@@ -1792,8 +1806,16 @@ Panel {
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
-              width: parent.width * 0.5
+              width: parent.width * 0.44
               wrapMode: Text.WordWrap
+            }
+            Text {
+              textFormat: Text.PlainText
+              text: "󰉋"
+              color: Qt.darker(root.foreground, 1.8)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              anchors.verticalCenter: parent.verticalCenter
             }
           }
         }
@@ -1819,6 +1841,8 @@ Panel {
         model: root.inspect && root.inspect.plugins ? root.inspect.plugins : []
         CardBox {
           required property var modelData
+          clickable: true
+          targetPath: "plugins/" + modelData.id
           Column {
             width: parent.width
             spacing: Style.space(4)
@@ -1833,7 +1857,7 @@ Panel {
                 font.pixelSize: Style.font.body
                 font.bold: true
                 elide: Text.ElideRight
-                width: parent.width - ver.implicitWidth - Style.space(12)
+                width: parent.width - ver.implicitWidth - Style.space(36)
               }
               Text {
                 id: ver
@@ -1842,6 +1866,15 @@ Panel {
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: "󰉋"
+                color: Qt.darker(root.foreground, 1.8)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                anchors.verticalCenter: parent.verticalCenter
               }
             }
             Text {
@@ -1919,8 +1952,9 @@ Panel {
         FileRow {
           required property var modelData
           width: parent.width
-          pathLabel: modelData.event
-          summary: modelData.name
+          pathLabel: modelData.event + "/" + modelData.name
+          localPath: "~/.config/omarchy/hooks/" + modelData.event + ".d/" + modelData.name
+          summary: modelData.sample ? "Sample hook script" : "Active hook script"
           statusLabel: modelData.sample ? "Sample" : "Hook"
         }
       }
@@ -1941,15 +1975,16 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
       }
-      Text {
-        visible: root.inspect && root.inspect.bins && root.inspect.bins.length > 0
-        width: parent.width
-        textFormat: Text.PlainText
-        text: (root.inspect.bins || []).join("  ·  ")
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        wrapMode: Text.WordWrap
+      Repeater {
+        model: root.inspect && root.inspect.bins ? root.inspect.bins : []
+        FileRow {
+          required property var modelData
+          width: parent.width
+          pathLabel: "bin/" + String(modelData)
+          localPath: "~/.local/bin/" + String(modelData)
+          summary: "Custom script in ~/.local/bin/"
+          statusLabel: "Script"
+        }
       }
     }
   }
@@ -2422,6 +2457,8 @@ Panel {
             required property var modelData
             width: parent.width
             pathLabel: modelData.path
+            localPath: modelData.local_path || ""
+            repoPath: modelData.repo_path || ""
             summary: modelData.summary
             statusLabel: Model.fileStatusLabel(modelData.status) + (modelData.portable ? "" : " · Machine-specific")
           }
@@ -2858,52 +2895,79 @@ Panel {
   }
 
   component FileRow: Rectangle {
+    id: fileRowRoot
     property string pathLabel: ""
+    property string localPath: ""
+    property string repoPath: ""
     property string summary: ""
     property string statusLabel: ""
     property Component extra: Item { width: 0; height: 1 }
+    property bool clickable: true
     width: parent ? parent.width : 100
     implicitHeight: Math.max(fileCol.implicitHeight, extraLoader.implicitHeight) + Style.space(12)
     radius: Style.cornerRadius
-    color: root.cardBg
-    border.width: 1
-    border.color: root.cardBorder
+    color: clickable && fileRowMa.containsMouse
+      ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+      : root.cardBg
+    border.width: clickable && fileRowMa.containsMouse ? 2 : 1
+    border.color: clickable && fileRowMa.containsMouse ? root.accent : root.cardBorder
 
-    Column {
-      id: fileCol
-      anchors.left: parent.left
-      anchors.right: extraLoader.left
-      anchors.verticalCenter: parent.verticalCenter
+    Row {
+      anchors.fill: parent
       anchors.leftMargin: Style.space(8)
       anchors.rightMargin: Style.space(8)
-      spacing: 2
+      spacing: Style.space(6)
+
+      Column {
+        id: fileCol
+        width: parent.width - (extraLoader.item ? extraLoader.width + parent.spacing : 0) - (fileRowRoot.clickable ? Style.space(24) : 0)
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: 2
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: fileRowRoot.pathLabel
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          elide: Text.ElideMiddle
+        }
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: fileRowRoot.summary + (fileRowRoot.statusLabel ? " · " + fileRowRoot.statusLabel : "")
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      Loader {
+        id: extraLoader
+        anchors.verticalCenter: parent.verticalCenter
+        sourceComponent: fileRowRoot.extra
+      }
+
       Text {
-        width: parent.width
+        visible: fileRowRoot.clickable
         textFormat: Text.PlainText
-        text: pathLabel
-        color: root.foreground
+        text: "󰉋"
+        color: fileRowMa.containsMouse ? root.accent : Qt.darker(root.foreground, 1.8)
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
-        font.bold: true
-        elide: Text.ElideMiddle
-      }
-      Text {
-        width: parent.width
-        textFormat: Text.PlainText
-        text: summary + (statusLabel ? " · " + statusLabel : "")
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
+        anchors.verticalCenter: parent.verticalCenter
       }
     }
 
-    Loader {
-      id: extraLoader
-      anchors.right: parent.right
-      anchors.rightMargin: Style.space(8)
-      anchors.verticalCenter: parent.verticalCenter
-      sourceComponent: extra
+    MouseArea {
+      id: fileRowMa
+      anchors.fill: parent
+      enabled: fileRowRoot.clickable
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.openFile(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
     }
   }
 
@@ -2951,13 +3015,20 @@ Panel {
   }
 
   component CardBox: Rectangle {
+    id: cardBoxRoot
+    property bool clickable: false
+    property string targetPath: ""
+    signal clicked()
     default property alias content: innerCol.children
     width: parent.width
     implicitHeight: innerCol.implicitHeight + Style.space(16)
     radius: Style.cornerRadius
-    color: root.cardBg
-    border.width: 1
-    border.color: root.cardBorder
+    color: (clickable || targetPath !== "") && cardMa.containsMouse
+      ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+      : root.cardBg
+    border.width: (clickable || targetPath !== "") && cardMa.containsMouse ? 2 : 1
+    border.color: (clickable || targetPath !== "") && cardMa.containsMouse ? root.accent : root.cardBorder
+
     Column {
       id: innerCol
       anchors.left: parent.left
@@ -2965,6 +3036,20 @@ Panel {
       anchors.top: parent.top
       anchors.margins: Style.space(8)
       spacing: Style.space(6)
+    }
+
+    MouseArea {
+      id: cardMa
+      anchors.fill: parent
+      enabled: cardBoxRoot.clickable || cardBoxRoot.targetPath !== ""
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: {
+        cardBoxRoot.clicked()
+        if (cardBoxRoot.targetPath !== "") {
+          root.openFile(cardBoxRoot.targetPath, "", "")
+        }
+      }
     }
   }
 
