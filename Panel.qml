@@ -56,10 +56,9 @@ Panel {
   readonly property var tabs: [
     { name: "Overview", icon: "󰘿" },
     { name: "Changes", icon: "󰦓" },
-    { name: "Shortcuts", icon: "󰌌" },
-    { name: "Plugins", icon: "󰐱" },
     { name: "Configs", icon: "󰒓" }
   ]
+  readonly property var allReviewItems: incomingItems.concat(outgoingItems).concat(bothItems)
 
   readonly property var hiddenMap: {
     var map = {}
@@ -783,7 +782,7 @@ Panel {
         else if (t === "a" || t === "A") root.requestApply()
         else if (t === "p" || t === "P") root.requestPublish()
         else if (t === "c" || t === "C") root.reviewChanges()
-        else if (t >= "1" && t <= "5") root.activeTab = parseInt(t) - 1
+        else if (t >= "1" && t <= String(root.tabs.length)) root.activeTab = parseInt(t) - 1
       }
 
       Column {
@@ -1062,9 +1061,7 @@ Panel {
             width: parent.width
             sourceComponent: {
               if (root.activeTab === 1) return tabChangesComp
-              if (root.activeTab === 2) return tabShortcutsComp
-              if (root.activeTab === 3) return tabPluginsComp
-              if (root.activeTab === 4) return tabConfigsComp
+              if (root.activeTab === 2) return tabConfigsComp
               return tabOverviewComp
             }
           }
@@ -1754,30 +1751,11 @@ Panel {
   }
 
   Component {
-    id: tabShortcutsComp
+    id: shortcutsExtraComp
     Column {
       width: parent.width
-      spacing: Style.space(8)
-      ChangeSection {
-        title: "Incoming"
-        subtitle: "From the repo — Apply"
-        mixed: true
-        files: Model.itemsOfKind(root.incomingItems, "s")
-      }
-      ChangeSection {
-        title: "Outgoing"
-        subtitle: "This laptop — Publish"
-        mixed: true
-        files: Model.itemsOfKind(root.outgoingItems, "s")
-      }
-      ChangeSection {
-        title: "Both sides"
-        subtitle: "Pick Keep local or Take repo on each row"
-        mixed: true
-        files: Model.itemsOfKind(root.bothItems, "s")
-      }
-
-      PanelSectionHeader { text: "BINDINGS IN THE REPO"; foreground: root.foreground; fontFamily: root.fontFamily }
+      spacing: Style.space(6)
+      PanelSectionHeader { text: "KEYBOARD BINDINGS (" + (root.inspect && root.inspect.shortcuts ? root.inspect.shortcuts.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
       Text {
         visible: !root.inspect || !root.inspect.shortcuts || root.inspect.shortcuts.length === 0
         text: "No o.bind() shortcuts found in hypr/bindings.lua."
@@ -1818,33 +1796,14 @@ Panel {
   }
 
   Component {
-    id: tabPluginsComp
+    id: pluginsExtraComp
     Column {
       width: parent.width
-      spacing: Style.space(8)
-      ChangeSection {
-        title: "Incoming"
-        subtitle: "From the repo — Apply"
-        mixed: true
-        files: Model.itemsOfKind(root.incomingItems, "g")
-      }
-      ChangeSection {
-        title: "Outgoing"
-        subtitle: "This laptop — Publish"
-        mixed: true
-        files: Model.itemsOfKind(root.outgoingItems, "g")
-      }
-      ChangeSection {
-        title: "Both sides"
-        subtitle: "Pick Keep local or Take repo on each row"
-        mixed: true
-        files: Model.itemsOfKind(root.bothItems, "g")
-      }
-
-      PanelSectionHeader { text: "PLUGINS THAT WILL LOAD"; foreground: root.foreground; fontFamily: root.fontFamily }
+      spacing: Style.space(6)
+      PanelSectionHeader { text: "INSTALLED PLUGINS (" + (root.inspect && root.inspect.plugins ? root.inspect.plugins.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
       Text {
         visible: !root.inspect || !root.inspect.plugins || root.inspect.plugins.length === 0
-        text: "No plugins/ directory in the repo."
+        text: "No extra plugins in plugins/."
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -1934,45 +1893,17 @@ Panel {
   }
 
   Component {
-    id: tabConfigsComp
+    id: hooksExtraComp
     Column {
       width: parent.width
-      spacing: Style.space(8)
-      ChangeSection {
-        title: "Incoming"
-        subtitle: "From the repo — Apply"
-        mixed: true
-        files: Model.itemsOfKind(root.incomingItems, "f")
-      }
-      ChangeSection {
-        title: "Outgoing"
-        subtitle: "This laptop — Publish"
-        mixed: true
-        files: Model.itemsOfKind(root.outgoingItems, "f")
-      }
-      ChangeSection {
-        title: "Both sides"
-        subtitle: "Pick Keep local or Take repo on each row"
-        mixed: true
-        files: Model.itemsOfKind(root.bothItems, "f")
-      }
-
-      PanelSectionHeader { text: "FILES IN THE REPO"; foreground: root.foreground; fontFamily: root.fontFamily }
-      Repeater {
-        model: root.inspect && root.inspect.configs ? Model.unbundledFiles(root.inspect.configs) : []
-        FileRow {
-          required property var modelData
-          width: parent.width
-          pathLabel: modelData.path
-          summary: modelData.summary
-          statusLabel: modelData.portable ? "Portable" : "This machine"
-        }
-      }
-      PanelSectionHeader {
-        visible: root.inspect && root.inspect.hooks && root.inspect.hooks.length > 0
-        text: "HOOKS"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
+      spacing: Style.space(6)
+      PanelSectionHeader { text: "HOOKS (" + (root.inspect && root.inspect.hooks ? root.inspect.hooks.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
+      Text {
+        visible: !root.inspect || !root.inspect.hooks || root.inspect.hooks.length === 0
+        text: "No event hooks in omarchy/hooks/."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
       }
       Repeater {
         model: root.inspect && root.inspect.hooks ? root.inspect.hooks : []
@@ -1984,11 +1915,21 @@ Panel {
           statusLabel: modelData.sample ? "Sample" : "Hook"
         }
       }
-      PanelSectionHeader {
-        visible: root.inspect && root.inspect.bins && root.inspect.bins.length > 0
-        text: "HELPER SCRIPTS"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
+    }
+  }
+
+  Component {
+    id: binsExtraComp
+    Column {
+      width: parent.width
+      spacing: Style.space(6)
+      PanelSectionHeader { text: "HELPER SCRIPTS (" + (root.inspect && root.inspect.bins ? root.inspect.bins.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
+      Text {
+        visible: !root.inspect || !root.inspect.bins || root.inspect.bins.length === 0
+        text: "No scripts in bin/."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
       }
       Text {
         visible: root.inspect && root.inspect.bins && root.inspect.bins.length > 0
@@ -1999,6 +1940,122 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         wrapMode: Text.WordWrap
+      }
+    }
+  }
+
+  Component {
+    id: tabConfigsComp
+    Column {
+      width: parent.width
+      spacing: Style.space(12)
+
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "All configuration areas tracked by the repo and this machine, grouped by category. Press any category to review changes and inspect settings."
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+
+      CategorySection {
+        categoryId: "shortcuts"
+        iconText: "󰌌"
+        title: "Shortcuts"
+        subtitle: "Keyboard shortcuts (hypr/bindings.lua)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "shortcuts")
+        files: Model.filesForCategory(root.diffFiles, "shortcuts")
+        inspectItems: root.inspect ? root.inspect.shortcuts : []
+        extraContent: shortcutsExtraComp
+      }
+
+      CategorySection {
+        categoryId: "theme"
+        iconText: "󰏘"
+        title: "Theme"
+        subtitle: "Selected theme & custom theme styles (omarchy/theme.name)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "theme")
+        files: Model.filesForCategory(root.diffFiles, "theme")
+      }
+
+      CategorySection {
+        categoryId: "plugins"
+        iconText: "󰐱"
+        title: "Plugins & Bar"
+        subtitle: "Shell plugins, widgets & bar layout (plugins/)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "plugins")
+        files: Model.filesForCategory(root.diffFiles, "plugins")
+        inspectItems: root.inspect ? root.inspect.plugins : []
+        extraContent: pluginsExtraComp
+      }
+
+      CategorySection {
+        categoryId: "displays"
+        iconText: "󰍹"
+        title: "Displays & Monitors"
+        subtitle: "Display layout & monitor rules (hypr/monitors.lua)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "displays")
+        files: Model.filesForCategory(root.diffFiles, "displays")
+      }
+
+      CategorySection {
+        categoryId: "hyprland"
+        iconText: "󰒓"
+        title: "Hyprland Configs"
+        subtitle: "Gaps, animations, window rules, input, autostart (hypr/)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "hyprland")
+        files: Model.filesForCategory(root.diffFiles, "hyprland")
+      }
+
+      CategorySection {
+        categoryId: "shell"
+        iconText: "󰘿"
+        title: "Shell & Bar"
+        subtitle: "Bar layout, widgets, and idle settings (omarchy/shell.json)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "shell")
+        files: Model.filesForCategory(root.diffFiles, "shell")
+      }
+
+      CategorySection {
+        categoryId: "terminals"
+        iconText: "󰞷"
+        title: "Terminals"
+        subtitle: "Alacritty, Foot, Ghostty, and Kitty configs (terminals/)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "terminals")
+        files: Model.filesForCategory(root.diffFiles, "terminals")
+      }
+
+      CategorySection {
+        categoryId: "hooks"
+        iconText: "󰓢"
+        title: "Hooks"
+        subtitle: "Event automation scripts (omarchy/hooks/)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "hooks")
+        files: Model.filesForCategory(root.diffFiles, "hooks")
+        inspectItems: root.inspect ? root.inspect.hooks : []
+        extraContent: hooksExtraComp
+      }
+
+      CategorySection {
+        categoryId: "scripts"
+        iconText: "󰲋"
+        title: "Helper Scripts"
+        subtitle: "Custom scripts in ~/.local/bin/ (bin/)"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "scripts")
+        files: Model.filesForCategory(root.diffFiles, "scripts")
+        inspectItems: root.inspect ? root.inspect.bins : []
+        extraContent: binsExtraComp
+      }
+
+      CategorySection {
+        categoryId: "other"
+        iconText: "󰉋"
+        title: "Other Configs"
+        subtitle: "Additional tracked configuration files"
+        changeItems: Model.itemsForCategory(root.allReviewItems, "other")
+        files: Model.filesForCategory(root.diffFiles, "other")
       }
     }
   }
@@ -2047,6 +2104,312 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
+      }
+    }
+  }
+
+  component CategorySection: Column {
+    id: catRoot
+    property string categoryId: ""
+    property string iconText: "󰒓"
+    property string title: ""
+    property string subtitle: ""
+    property var changeItems: []
+    property var files: []
+    property var inspectItems: []
+    property bool expanded: false
+    property Component extraContent: null
+
+    readonly property int totalCount: changeItems.length + files.length + (inspectItems ? inspectItems.length : 0)
+    width: parent ? parent.width : 100
+    spacing: Style.space(8)
+    visible: totalCount > 0
+
+    Rectangle {
+      width: parent.width
+      implicitHeight: catHeaderInner.implicitHeight + Style.space(14)
+      radius: Style.cornerRadius
+      color: catHeaderMa.containsMouse || catRoot.expanded
+        ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+        : root.cardBg
+      border.width: catRoot.expanded ? 2 : 1
+      border.color: catRoot.expanded ? root.accent : root.cardBorder
+
+      Row {
+        id: catHeaderInner
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.leftMargin: Style.space(12)
+        anchors.rightMargin: Style.space(12)
+        spacing: Style.space(10)
+
+        Text {
+          text: catRoot.expanded ? "▼" : "▶"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(16)
+        }
+
+        Text {
+          text: catRoot.iconText
+          color: root.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodyLarge
+          anchors.verticalCenter: parent.verticalCenter
+        }
+
+        Column {
+          width: parent.width - Style.space(16) - Style.space(24) - catCountCol.width - parent.spacing * 3
+          spacing: 2
+          anchors.verticalCenter: parent.verticalCenter
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: catRoot.title
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            elide: Text.ElideRight
+          }
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: {
+              var bits = []
+              if (catRoot.subtitle) bits.push(catRoot.subtitle)
+              if (catRoot.changeItems.length > 0)
+                bits.push(catRoot.changeItems.length + (catRoot.changeItems.length === 1 ? " change" : " changes"))
+              else
+                bits.push("In sync")
+              bits.push(catRoot.expanded ? "press to hide" : "press to expand")
+              return bits.join(" · ")
+            }
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+
+        Column {
+          id: catCountCol
+          spacing: 0
+          anchors.verticalCenter: parent.verticalCenter
+          Text {
+            text: catRoot.changeItems.length > 0 ? (String(catRoot.changeItems.length) + " 󰦓") : String(catRoot.totalCount)
+            color: catRoot.changeItems.length > 0 ? root.accent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            horizontalAlignment: Text.AlignRight
+            anchors.right: parent.right
+          }
+          Text {
+            text: catRoot.changeItems.length > 0 ? (catRoot.changeItems.length === 1 ? "change" : "changes") : (catRoot.totalCount === 1 ? "item" : "items")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            horizontalAlignment: Text.AlignRight
+            anchors.right: parent.right
+          }
+        }
+      }
+
+      MouseArea {
+        id: catHeaderMa
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        hoverEnabled: true
+        onClicked: catRoot.expanded = !catRoot.expanded
+      }
+    }
+
+    Column {
+      visible: catRoot.expanded
+      width: parent.width
+      spacing: Style.space(8)
+
+      // Pending changes section if any
+      Column {
+        visible: catRoot.changeItems.length > 0
+        width: parent.width
+        spacing: Style.space(6)
+        PanelSectionHeader { text: "PENDING CHANGES (" + catRoot.changeItems.length + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
+        Repeater {
+          model: catRoot.changeItems
+          Rectangle {
+            id: catRowBox
+            required property var modelData
+            required property int index
+
+            readonly property string rowKind: String(modelData.kind || "f")
+            readonly property string rowId: String(modelData.itemId || "")
+            readonly property string rowLabel: String(modelData.label || "")
+            readonly property string rowSummary: String(modelData.summary || "")
+            readonly property bool rowBoth: !!modelData.both
+            readonly property bool included: !!(root.picks[root.pickId(rowKind, rowId)])
+            readonly property string bothKey: rowKind === "f" ? rowId : (rowKind + ":" + rowId)
+            readonly property string typeLabel: String(modelData.typeLabel || "")
+
+            width: catRoot.width
+            implicitHeight: catRowInner.implicitHeight + Style.space(16)
+            radius: Style.cornerRadius
+            color: included ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : root.cardBg
+            border.width: 2
+            border.color: included ? root.accent : root.foreground
+
+            Row {
+              id: catRowInner
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(10)
+
+              Rectangle {
+                width: 28
+                height: 28
+                radius: 4
+                anchors.verticalCenter: parent.verticalCenter
+                color: catRowBox.included ? root.accent : Color.background
+                border.width: 2
+                border.color: root.foreground
+
+                Text {
+                  anchors.centerIn: parent
+                  text: catRowBox.included ? "✓" : ""
+                  color: Color.background
+                  font.family: root.fontFamily
+                  font.pixelSize: 18
+                  font.bold: true
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.togglePick(catRowBox.rowKind, catRowBox.rowId)
+                }
+              }
+
+              Column {
+                width: parent.width - 28 - catIncludeBtn.width - catHideBtn.width - (catRowBox.rowBoth ? 168 : 0) - parent.spacing * (catRowBox.rowBoth ? 4 : 3)
+                spacing: 2
+                anchors.verticalCenter: parent.verticalCenter
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: (catRowBox.typeLabel ? catRowBox.typeLabel + "  ·  " : "") + catRowBox.rowLabel
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  wrapMode: Text.WordWrap
+                }
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: {
+                    var st = Model.fileStatusLabel(catRowBox.modelData.status)
+                    var sum = catRowBox.rowSummary
+                    return (st ? st + " · " : "") + sum + (catRowBox.included ? " · will sync" : " · skipped")
+                  }
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+
+              Row {
+                visible: catRowBox.rowBoth
+                spacing: Style.space(4)
+                anchors.verticalCenter: parent.verticalCenter
+                Button {
+                  text: "Keep local"
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  selected: root.bothPicks[catRowBox.bothKey] === "local"
+                  bordered: true
+                  onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "local")
+                }
+                Button {
+                  text: "Take repo"
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  selected: root.bothPicks[catRowBox.bothKey] === "repo"
+                  bordered: true
+                  onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "repo")
+                }
+              }
+
+              Button {
+                id: catIncludeBtn
+                text: catRowBox.included ? "Included" : "Skip"
+                selected: catRowBox.included
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.togglePick(catRowBox.rowKind, catRowBox.rowId)
+              }
+
+              Button {
+                id: catHideBtn
+                text: "Hide"
+                iconText: "󰈉"
+                tooltipText: "Hide this change so it doesn't bother you"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+                enabled: !root.busy
+                onClicked: root.hideItem(catRowBox.rowKind, catRowBox.rowId)
+              }
+            }
+
+            MouseArea {
+              z: -1
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.togglePick(catRowBox.rowKind, catRowBox.rowId)
+            }
+          }
+        }
+      }
+
+      // Tracked files & settings
+      Loader {
+        visible: catRoot.extraContent !== null
+        width: parent.width
+        sourceComponent: catRoot.extraContent
+      }
+
+      Column {
+        visible: catRoot.extraContent === null && catRoot.files.length > 0
+        width: parent.width
+        spacing: Style.space(6)
+        PanelSectionHeader { text: "TRACKED FILES (" + catRoot.files.length + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
+        Repeater {
+          model: catRoot.files
+          FileRow {
+            required property var modelData
+            width: parent.width
+            pathLabel: modelData.path
+            summary: modelData.summary
+            statusLabel: Model.fileStatusLabel(modelData.status) + (modelData.portable ? "" : " · Machine-specific")
+          }
+        }
       }
     }
   }

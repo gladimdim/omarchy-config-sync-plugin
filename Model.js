@@ -122,6 +122,53 @@ function itemsOfKind(items, kind) {
   return out
 }
 
+function categorizePath(path) {
+  var p = String(path || "")
+  if (p === "hypr/bindings.lua") return "shortcuts"
+  if (p === "hypr/monitors.lua") return "displays"
+  if (p.indexOf("hypr/") === 0) return "hyprland"
+  if (p === "omarchy/theme.name" || p.indexOf("omarchy/themes/") === 0) return "theme"
+  if (p.indexOf("plugins/") === 0) return "plugins"
+  if (p === "omarchy/shell.json") return "shell"
+  if (p.indexOf("terminals/") === 0) return "terminals"
+  if (p.indexOf("omarchy/hooks/") === 0) return "hooks"
+  if (p.indexOf("bin/") === 0) return "scripts"
+  return "other"
+}
+
+function itemCategory(item) {
+  if (!item) return "other"
+  if (item.kind === "s") return "shortcuts"
+  if (item.kind === "t") return "theme"
+  if (item.kind === "p") return "plugins"
+  if (item.kind === "g") {
+    var id = String(item.itemId || "")
+    if (id.indexOf("plugin:") === 0) return "plugins"
+    if (id.indexOf("hooks:") === 0) return "hooks"
+    if (id === "bin") return "scripts"
+    return "other"
+  }
+  return categorizePath(item.itemId || item.path)
+}
+
+function itemsForCategory(items, cat) {
+  var out = []
+  var list = items || []
+  for (var i = 0; i < list.length; i++) {
+    if (itemCategory(list[i]) === cat) out.push(list[i])
+  }
+  return out
+}
+
+function filesForCategory(files, cat) {
+  var out = []
+  var list = files || []
+  for (var i = 0; i < list.length; i++) {
+    if (categorizePath(list[i].path) === cat) out.push(list[i])
+  }
+  return out
+}
+
 function pickedInItems(items, picks) {
   var n = 0
   var list = items || []
