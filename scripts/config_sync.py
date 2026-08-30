@@ -44,7 +44,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = set()  # this plugin is synced so UI updates travel with config
-PLUGIN_VERSION = "1.2.3"
+PLUGIN_VERSION = "1.2.4"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -559,6 +559,47 @@ def summary_for(rel: str) -> str:
 
 def is_machine_local(rel: str) -> bool:
     return rel in MACHINE_LOCAL_PATHS
+
+
+def is_hidden_item(kind: str, item_id: str, hidden_keys: set[str]) -> bool:
+    if not hidden_keys:
+        return False
+    if f"{kind}:{item_id}" in hidden_keys or item_id in hidden_keys:
+        return True
+    if kind == "f":
+        parts = item_id.split("/")
+        if item_id.startswith("plugins/") and len(parts) >= 2:
+            pid = parts[1]
+            if f"g:plugin:{pid}" in hidden_keys or f"p:{pid}" in hidden_keys or f"plugin:{pid}" in hidden_keys:
+                return True
+        elif item_id.startswith("omarchy/hooks/") and len(parts) >= 3:
+            event = parts[2].replace(".d", "")
+            if f"g:hooks:{event}" in hidden_keys or f"hooks:{event}" in hidden_keys:
+                return True
+        elif item_id.startswith("omarchy/agents/"):
+            if "g:agents" in hidden_keys or "agents" in hidden_keys:
+                return True
+        elif item_id.startswith("omarchy/branding/"):
+            if "g:branding" in hidden_keys or "branding" in hidden_keys:
+                return True
+        elif item_id.startswith("omarchy/extensions/"):
+            if "g:extensions" in hidden_keys or "extensions" in hidden_keys:
+                return True
+        elif item_id.startswith("bin/"):
+            if "g:bin" in hidden_keys or "bin" in hidden_keys:
+                return True
+        elif item_id == THEME_REL or item_id.startswith("omarchy/themes/"):
+            if "t:selected" in hidden_keys or "t:theme" in hidden_keys or "theme" in hidden_keys:
+                return True
+    elif kind == "g":
+        if item_id.startswith("plugin:"):
+            pid = item_id[7:]
+            if f"p:{pid}" in hidden_keys:
+                return True
+    elif kind == "p":
+        if f"g:plugin:{item_id}" in hidden_keys or f"plugin:{item_id}" in hidden_keys:
+            return True
+    return False
 
 
 def iter_files(root: Path) -> list[Path]:
@@ -1343,6 +1384,7 @@ def default_publish_status(status: str) -> bool:
 
 def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, Any]:
     stored = state.get("file_hashes") or {}
+    hidden_keys = set(state.get("hidden") or [])
     files = []
     counts = {
         "identical": 0,
@@ -1354,30 +1396,39 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         "differs": 0,
         "machine": 0,
         "changed": 0,
+        "hidden": 0,
     }
     for item in collect_inventory(ctx, repo):
         status = classify_file(item, stored.get(item["path"]))
         item["status"] = status
+        item["hidden"] = is_hidden_item("f", item["path"], hidden_keys)
         plugin_id = plugin_id_from_path(item["path"])
         item["default_apply"] = (
             default_apply_status(status)
             and item["portable"]
             and item["repo_exists"]
             and (not item.get("git_managed") or plugin_id == PLUGIN_ID)
+            and not item["hidden"]
         )
-        item["default_publish"] = default_publish_status(status) and item["local_exists"]
+        item["default_publish"] = default_publish_status(status) and item["local_exists"] and not item["hidden"]
         if status not in {"identical", "machine"}:
             item["preview"] = unified_preview(Path(item["local_path"]), Path(item["repo_path"]))
-            counts["changed"] += 1
+            if not item["hidden"]:
+                counts["changed"] += 1
         else:
             item["preview"] = ""
-        counts[status] = counts.get(status, 0) + 1
+        if not item["hidden"]:
+            counts[status] = counts.get(status, 0) + 1
+        elif status not in {"identical", "machine"}:
+            counts["hidden"] = counts.get("hidden", 0) + 1
         files.append(item)
     shortcuts = shortcut_diff(
         ctx.config_hypr / "bindings.lua",
         repo / "hypr" / "bindings.lua",
         stored.get("hypr/bindings.lua"),
     )
+    for s in shortcuts:
+        s["hidden"] = is_hidden_item("s", s["keys"], hidden_keys)
     plugins = plugin_groups(files)
     for plugin in plugins:
         manifest = load_json(repo / "plugins" / plugin["id"] / "manifest.json", default=None) or load_json(
@@ -1385,11 +1436,13 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         )
         if isinstance(manifest, dict) and manifest.get("name"):
             plugin["name"] = str(manifest.get("name"))
+        plugin["hidden"] = is_hidden_item("p", plugin["id"], hidden_keys)
     bundles = file_bundles(files)
     names = {p["id"]: p["name"] for p in plugins}
     for bundle in bundles:
         if bundle["kind"] == "plugin" and bundle["plugin_id"] in names:
             bundle["name"] = names[bundle["plugin_id"]]
+        bundle["hidden"] = is_hidden_item("g", bundle["id"], hidden_keys)
     theme_files = [f for f in files if f.get("group") == "theme"]
     theme_diff = None
     if any(f.get("status") not in {"identical", "machine"} for f in theme_files):
@@ -1416,8 +1469,9 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             "status": status,
             "files": [f["path"] for f in theme_files],
             "custom": any(f["path"].startswith("omarchy/themes/") for f in theme_files),
-            "default_apply": status in {"repo", "added-repo", "differs"} or (name_item or {}).get("default_apply"),
-            "default_publish": status in {"local", "added-local", "differs"} or (name_item or {}).get("default_publish"),
+            "default_apply": (status in {"repo", "added-repo", "differs"} or (name_item or {}).get("default_apply")) and not is_hidden_item("t", "selected", hidden_keys),
+            "default_publish": (status in {"local", "added-local", "differs"} or (name_item or {}).get("default_publish")) and not is_hidden_item("t", "selected", hidden_keys),
+            "hidden": is_hidden_item("t", "selected", hidden_keys),
         }
     return {
         "files": files,
@@ -1426,6 +1480,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         "plugins": plugins,
         "bundles": bundles,
         "theme": theme_diff,
+        "hidden": list(hidden_keys),
     }
 
 
@@ -1471,7 +1526,8 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
                     "clone_path": "",
                 },
                 "inspect": None,
-                "diff": {"files": [], "counts": {}},
+                "diff": {"files": [], "counts": {}, "hidden": []},
+                "hidden": [],
             }
         )
     repo = configured_repo(ctx, state)
@@ -1509,8 +1565,10 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "repo_changes": diff["counts"].get("repo", 0) + diff["counts"].get("added-repo", 0),
         "both_changed": diff["counts"].get("both", 0),
         "unknown_differs": diff["counts"].get("differs", 0),
-        "shortcut_changes": len(diff.get("shortcuts") or []),
-        "plugin_changes": len(diff.get("plugins") or []),
+        "shortcut_changes": len([s for s in (diff.get("shortcuts") or []) if not s.get("hidden")]),
+        "plugin_changes": len([p for p in (diff.get("plugins") or []) if not p.get("hidden")]),
+        "hidden": state.get("hidden") or [],
+        "hidden_count": len(state.get("hidden") or []),
         "plugin_version": PLUGIN_VERSION,
     }
     return ok(
@@ -1520,6 +1578,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
             "status": status,
             "inspect": inspect,
             "diff": diff,
+            "hidden": state.get("hidden") or [],
         }
     )
 
@@ -1674,6 +1733,8 @@ def selected_items(diff_files: list[dict[str, Any]], wanted: set[str] | None, in
             if rel not in wanted:
                 continue
         else:
+            if item.get("hidden"):
+                continue
             if direction == "apply" and not item.get("default_apply"):
                 continue
             if direction == "publish" and not item.get("default_publish"):
@@ -1784,7 +1845,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     unresolved_both = [
         i
         for i in diff["files"]
-        if i["status"] == "both" and (i["portable"] or args.include_machine) and (wanted is None or i["path"] in wanted)
+        if not i.get("hidden") and i["status"] == "both" and (i["portable"] or args.include_machine) and (wanted is None or i["path"] in wanted)
     ]
     if unresolved_both and wanted is None:
         raise SyncError(
@@ -1911,7 +1972,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     unresolved_both = [
         i
         for i in diff["files"]
-        if i["status"] == "both" and (i["portable"] or args.include_machine) and (wanted is None or i["path"] in wanted)
+        if not i.get("hidden") and i["status"] == "both" and (i["portable"] or args.include_machine) and (wanted is None or i["path"] in wanted)
     ]
     if unresolved_both and wanted is None:
         raise SyncError(
@@ -2043,21 +2104,22 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     files = [
         item["path"]
         for item in diff["files"]
-        if item.get("status") in wanted_status
+        if not item.get("hidden")
+        and item.get("status") in wanted_status
         and (item.get("portable") or args.include_machine)
         and (item.get("repo_exists") if side == "repo" else item.get("local_exists"))
     ]
     shortcuts = [
         item["keys"]
         for item in (diff.get("shortcuts") or [])
-        if item.get("status") in wanted_status
+        if not item.get("hidden") and item.get("status") in wanted_status
     ]
     plugins = [
         item["plugin_id"]
         for item in (diff.get("bundles") or [])
-        if item.get("kind") == "plugin" and item.get("status") in wanted_status and item.get("plugin_id")
+        if not item.get("hidden") and item.get("kind") == "plugin" and item.get("status") in wanted_status and item.get("plugin_id")
     ]
-    theme = any(item["path"] == THEME_REL and item.get("status") in wanted_status for item in diff["files"])
+    theme = any(item["path"] == THEME_REL and not item.get("hidden") and item.get("status") in wanted_status for item in diff["files"])
 
     nested = argparse.Namespace(
         explicit=True,
@@ -2176,11 +2238,83 @@ def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return snap
 
 
+def cmd_hide(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    state = load_state(ctx)
+    hidden = list(state.get("hidden") or [])
+    keys = list(args.args)
+    if args.files:
+        keys.extend(p.strip() for p in args.files.split(",") if p.strip())
+    if not keys:
+        raise SyncError("Provide at least one item to hide.")
+    for k in keys:
+        if k not in hidden:
+            hidden.append(k)
+    state["hidden"] = hidden
+    save_state(ctx, state)
+    snap = build_snapshot(ctx, fetch=False)
+    snap["hidden"] = hidden
+    snap["message"] = f"Hidden {len(keys)} item{'s' if len(keys) != 1 else ''}."
+    return snap
+
+
+def cmd_unhide(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    state = load_state(ctx)
+    hidden = list(state.get("hidden") or [])
+    if getattr(args, "all", False) or "all" in args.args:
+        count = len(hidden)
+        state["hidden"] = []
+        save_state(ctx, state)
+        snap = build_snapshot(ctx, fetch=False)
+        snap["hidden"] = []
+        snap["message"] = f"Unhid all {count} item{'s' if count != 1 else ''}."
+        return snap
+    keys = list(args.args)
+    if args.files:
+        keys.extend(p.strip() for p in args.files.split(",") if p.strip())
+    if not keys:
+        raise SyncError("Provide at least one item to unhide, or use --all.")
+    remove_set = set(keys)
+    state["hidden"] = [
+        k
+        for k in hidden
+        if k not in remove_set
+        and f"f:{k}" not in remove_set
+        and k.removeprefix("f:") not in remove_set
+        and f"s:{k}" not in remove_set
+        and k.removeprefix("s:") not in remove_set
+        and f"g:{k}" not in remove_set
+        and k.removeprefix("g:") not in remove_set
+        and f"p:{k}" not in remove_set
+        and k.removeprefix("p:") not in remove_set
+        and f"t:{k}" not in remove_set
+        and k.removeprefix("t:") not in remove_set
+    ]
+    save_state(ctx, state)
+    snap = build_snapshot(ctx, fetch=False)
+    snap["hidden"] = state["hidden"]
+    snap["message"] = f"Unhid {len(keys)} item{'s' if len(keys) != 1 else ''}."
+    return snap
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Omarchy config-sync backend")
     parser.add_argument(
         "command",
-        choices=["snapshot", "connect", "disconnect", "apply", "publish", "pull", "resolve", "set-url", "inspect", "status", "resync"],
+        choices=[
+            "snapshot",
+            "connect",
+            "disconnect",
+            "apply",
+            "publish",
+            "pull",
+            "resolve",
+            "set-url",
+            "inspect",
+            "status",
+            "resync",
+            "hide",
+            "unhide",
+        ],
     )
     parser.add_argument("args", nargs="*")
     parser.add_argument("--fetch", action="store_true")
@@ -2195,6 +2329,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delete-clone", action="store_true")
     parser.add_argument("--side", default=None)
     parser.add_argument("--url", default=None)
+    parser.add_argument("--all", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -2219,6 +2354,10 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_resolve(ctx, args)
     if command == "set-url":
         return cmd_set_url(ctx, args)
+    if command == "hide":
+        return cmd_hide(ctx, args)
+    if command == "unhide":
+        return cmd_unhide(ctx, args)
     raise SyncError(f"Unknown command: {command}")
 
 

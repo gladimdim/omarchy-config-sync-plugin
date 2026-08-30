@@ -91,7 +91,7 @@ def make_config_repo(root: Path, *, with_monitor: bool = True) -> Path:
                 "schemaVersion": 1,
                 "id": "demo.widget",
                 "name": "Demo Widget",
-                "version": "1.2.3",
+                "version": "1.2.4",
                 "description": "A demo bar widget",
                 "kinds": ["bar-widget"],
                 "entryPoints": {"barWidget": "Main.qml"},
@@ -689,6 +689,7 @@ def argparse_ns(**kwargs):
         delete_clone = False
         side = None
         url = None
+        all = False
         dry_run = True
         args = []
 
@@ -696,6 +697,78 @@ def argparse_ns(**kwargs):
     for k, v in kwargs.items():
         setattr(n, k, v)
     return n
+
+
+class HideTests(unittest.TestCase):
+    def test_hide_and_unhide_file(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            snap = cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            self.assertTrue(snap["configured"])
+            initial_repo_changes = snap["status"]["repo_changes"]
+            self.assertGreater(initial_repo_changes, 0)
+
+            # Hide looknfeel
+            hide_snap = cs.cmd_hide(env.ctx, argparse_ns(args=["f:hypr/looknfeel.lua"]))
+            self.assertIn("f:hypr/looknfeel.lua", hide_snap["hidden"])
+            self.assertEqual(hide_snap["status"]["repo_changes"], initial_repo_changes - 1)
+
+            # Check that item is marked hidden
+            looknfeel_item = next(f for f in hide_snap["diff"]["files"] if f["path"] == "hypr/looknfeel.lua")
+            self.assertTrue(looknfeel_item["hidden"])
+
+            # Unhide looknfeel
+            unhide_snap = cs.cmd_unhide(env.ctx, argparse_ns(args=["f:hypr/looknfeel.lua"]))
+            self.assertNotIn("f:hypr/looknfeel.lua", unhide_snap["hidden"])
+            self.assertEqual(unhide_snap["status"]["repo_changes"], initial_repo_changes)
+
+    def test_hide_bundle(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            snap = cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            hide_snap = cs.cmd_hide(env.ctx, argparse_ns(args=["g:plugin:demo.widget"]))
+            self.assertIn("g:plugin:demo.widget", hide_snap["hidden"])
+
+            # Files inside plugin should be considered hidden
+            qml_item = next(f for f in hide_snap["diff"]["files"] if f["path"] == "plugins/demo.widget/Main.qml")
+            self.assertTrue(qml_item["hidden"])
+
+            bundle_item = next(b for b in hide_snap["diff"]["bundles"] if b["id"] == "plugin:demo.widget")
+            self.assertTrue(bundle_item["hidden"])
+
+    def test_hide_shortcut(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            snap = cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            shortcuts = snap["diff"]["shortcuts"]
+            if shortcuts:
+                key = shortcuts[0]["keys"]
+                hide_snap = cs.cmd_hide(env.ctx, argparse_ns(args=[f"s:{key}"]))
+                self.assertIn(f"s:{key}", hide_snap["hidden"])
+                s_item = next(s for s in hide_snap["diff"]["shortcuts"] if s["keys"] == key)
+                self.assertTrue(s_item["hidden"])
+
+    def test_unhide_all(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_hide(env.ctx, argparse_ns(args=["f:hypr/looknfeel.lua", "g:bin"]))
+            state = cs.load_state(env.ctx)
+            self.assertEqual(len(state.get("hidden", [])), 2)
+
+            unhide_snap = cs.cmd_unhide(env.ctx, argparse_ns(all=True, args=[]))
+            self.assertEqual(len(unhide_snap["hidden"]), 0)
+            self.assertEqual(len(cs.load_state(env.ctx).get("hidden", [])), 0)
+
+    def test_apply_skips_hidden_items(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_hide(env.ctx, argparse_ns(args=["f:hypr/looknfeel.lua"]))
+            # Apply all non-explicit
+            apply_snap = cs.cmd_apply(env.ctx, argparse_ns(dry_run=False))
+            self.assertNotIn("hypr/looknfeel.lua", apply_snap.get("applied", []))
+            self.assertFalse((env.home / ".config" / "hypr" / "looknfeel.lua").is_file())
 
 
 class RealRepoInspect(unittest.TestCase):

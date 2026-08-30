@@ -46,6 +46,7 @@ Panel {
   property var themeDiff: null
   property string lastNotifiedKey: ""
   property bool openOnChanges: false
+  property bool showingHidden: false
 
   readonly property bool configured: !!(status && status.configured)
   readonly property string syncState: String((status && status.sync_state) || (configured ? "in-sync" : "not-configured"))
@@ -59,6 +60,15 @@ Panel {
     { name: "Plugins", icon: "󰐱" },
     { name: "Configs", icon: "󰒓" }
   ]
+
+  readonly property var hiddenMap: {
+    var map = {}
+    var list = (status && status.hidden) ? status.hidden : []
+    for (var i = 0; i < list.length; i++) {
+      map[list[i]] = true
+    }
+    return map
+  }
 
   readonly property var incomingFiles: Model.filesByStatus(otherFiles, ["repo", "added-repo"])
   readonly property var localFiles: Model.filesByStatus(otherFiles, ["local", "added-local"])
@@ -109,12 +119,14 @@ Panel {
     if (String(themeDiff.status) === "both") return [themeDiff]
     return []
   }
-  readonly property var incomingItems: Model.buildIncomingItems(incomingTheme, incomingAddedShortcuts, incomingChangedShortcuts, incomingBundles, incomingFiles.concat(differsFiles), diffFiles)
-  readonly property var outgoingItems: Model.buildOutgoingItems(outgoingTheme, localAddedShortcuts, localChangedShortcuts, localBundles, localFiles, diffFiles)
-  readonly property var bothItems: Model.buildBothItems(bothTheme, bothShortcuts, bothBundles, bothFiles, diffFiles)
+  readonly property var incomingItems: Model.buildIncomingItems(incomingTheme, incomingAddedShortcuts, incomingChangedShortcuts, incomingBundles, incomingFiles.concat(differsFiles), diffFiles, hiddenMap)
+  readonly property var outgoingItems: Model.buildOutgoingItems(outgoingTheme, localAddedShortcuts, localChangedShortcuts, localBundles, localFiles, diffFiles, hiddenMap)
+  readonly property var bothItems: Model.buildBothItems(bothTheme, bothShortcuts, bothBundles, bothFiles, diffFiles, hiddenMap)
+  readonly property var hiddenItems: Model.buildHiddenItems((themeDiff ? [themeDiff] : []), shortcutDiffs, bundleDiffs, diffFiles, diffFiles, hiddenMap)
   readonly property int incomingCount: incomingItems.length
   readonly property int outgoingCount: outgoingItems.length
   readonly property int bothCount: bothItems.length
+  readonly property int hiddenCount: hiddenItems.length
   readonly property int incomingPicked: {
     var _ = picks
     return Model.pickedInItems(incomingItems, picks)
@@ -127,7 +139,7 @@ Panel {
     var _ = picks
     return Model.pickedInItems(bothItems, picks)
   }
-  readonly property bool hasReviewable: otherFiles.length + shortcutDiffs.length + bundleDiffs.length + pluginDiffs.length + conflictFiles.length + (themeDiff ? 1 : 0) > 0
+  readonly property bool hasReviewable: incomingCount + outgoingCount + bothCount + conflictFiles.length > 0
   readonly property int unresolvedBoth: {
     var n = 0
     var i
@@ -145,6 +157,20 @@ Panel {
     }
     if (themeDiff && themeDiff.status === "both" && isPicked("t", "selected") && !bothPicks["t:selected"]) n++
     return n
+  }
+
+  function hideItem(kind, id) {
+    var key = pickId(kind, id)
+    run(["hide", key])
+  }
+
+  function unhideItem(kind, id) {
+    var key = pickId(kind, id)
+    run(["unhide", key])
+  }
+
+  function unhideAll() {
+    run(["unhide", "--all"])
   }
 
   function refresh(fetch) {
@@ -1334,7 +1360,7 @@ Panel {
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }
         TablePair { label: "Last publish"; value: Model.relativeAgo(root.status.last_publish_at) }
-        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.3") }
+        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.4") }
         TablePair {
           label: "Theme"
           value: {
@@ -1412,7 +1438,9 @@ Panel {
       Text {
         width: parent.width
         textFormat: Text.PlainText
-        text: "Incoming is from git (Apply). Outgoing is this laptop (Publish). Groups start collapsed — press one to tick each item. On = sync that row, Off = leave it alone."
+        text: root.showingHidden
+          ? "Hidden changes are ignored during sync and do not trigger notifications. Press Unhide on any item to restore it."
+          : "Incoming is from git (Apply). Outgoing is this laptop (Publish). Groups start collapsed — press one to tick each item. On = sync that row, Off = leave it alone."
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -1420,7 +1448,7 @@ Panel {
       }
 
       Text {
-        visible: root.unresolvedBoth > 0
+        visible: !root.showingHidden && root.unresolvedBoth > 0
         width: parent.width
         textFormat: Text.PlainText
         text: "Checked items that changed on both sides still need Keep local or Take repo."
@@ -1460,9 +1488,20 @@ Panel {
           fontFamily: root.fontFamily
           onClicked: root.bulkPick("none")
         }
+        Button {
+          text: root.showingHidden ? "Active changes" : ("Hidden (" + root.hiddenCount + ")")
+          iconText: root.showingHidden ? "󰦓" : "󰈉"
+          fontSize: Style.font.caption
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          selected: root.showingHidden
+          bordered: true
+          onClicked: root.showingHidden = !root.showingHidden
+        }
       }
 
       Row {
+        visible: !root.showingHidden
         spacing: Style.space(8)
         Button {
           visible: root.syncState !== "empty"
@@ -1486,6 +1525,7 @@ Panel {
       }
 
       Toggle {
+        visible: !root.showingHidden
         label: "Include display layout"
         description: "hypr/monitors.lua is machine-specific and skipped by default."
         checked: root.includeMachine
@@ -1498,7 +1538,7 @@ Panel {
       }
 
       Column {
-        visible: root.conflictFiles.length > 0
+        visible: !root.showingHidden && root.conflictFiles.length > 0
         width: parent.width
         spacing: Style.space(6)
         PanelSectionHeader { text: "GIT CONFLICTS"; foreground: root.foreground; fontFamily: root.fontFamily }
@@ -1533,33 +1573,182 @@ Panel {
       }
 
       ChangeSection {
+        visible: !root.showingHidden && root.incomingItems.length > 0
         title: "Incoming"
         subtitle: "From the repo — Apply"
         mixed: true
         files: root.incomingItems
       }
       ChangeSection {
+        visible: !root.showingHidden && root.outgoingItems.length > 0
         title: "Outgoing"
         subtitle: "This laptop — Publish"
         mixed: true
         files: root.outgoingItems
       }
       ChangeSection {
+        visible: !root.showingHidden && root.bothItems.length > 0
         title: "Both sides"
         subtitle: "Pick Keep local or Take repo on each row"
         mixed: true
         files: root.bothItems
       }
 
-      Text {
-        visible: !root.hasReviewable
+      Column {
+        visible: !root.showingHidden && !root.hasReviewable
         width: parent.width
-        textFormat: Text.PlainText
-        text: "No portable config differences. This laptop matches the repo."
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        horizontalAlignment: Text.AlignHCenter
+        spacing: Style.space(8)
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.hiddenCount > 0
+            ? ("No active config differences (" + root.hiddenCount + " ignored).")
+            : "No portable config differences. This laptop matches the repo."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          horizontalAlignment: Text.AlignHCenter
+        }
+        Button {
+          visible: root.hiddenCount > 0
+          text: "Check ignored syncs (" + root.hiddenCount + ")"
+          iconText: "󰈉"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          bordered: true
+          anchors.horizontalCenter: parent.horizontalCenter
+          onClicked: root.showingHidden = true
+        }
+      }
+
+      Column {
+        visible: root.showingHidden
+        width: parent.width
+        spacing: Style.space(8)
+
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Item {
+            width: parent.width - unhideAllBtn.width - parent.spacing
+            implicitHeight: hiddenDescCol.implicitHeight
+            anchors.verticalCenter: parent.verticalCenter
+            Column {
+              id: hiddenDescCol
+              width: parent.width
+              spacing: 2
+              Text {
+                text: "HIDDEN SYNCS (" + root.hiddenCount + ")"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: "These changes are ignored and will not sync or trigger notifications."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+          }
+
+          Button {
+            id: unhideAllBtn
+            text: "Unhide all"
+            iconText: "󰈈"
+            fontSize: Style.font.caption
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            enabled: !root.busy && root.hiddenCount > 0
+            bordered: true
+            anchors.verticalCenter: parent.verticalCenter
+            onClicked: root.unhideAll()
+          }
+        }
+
+        Text {
+          visible: root.hiddenCount === 0
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "No hidden changes. Click 'Hide' on any incoming or outgoing change to ignore it."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          horizontalAlignment: Text.AlignHCenter
+        }
+
+        Repeater {
+          model: root.hiddenItems
+          Rectangle {
+            id: hiddenRowBox
+            required property var modelData
+            width: parent.width
+            implicitHeight: hiddenRowInner.implicitHeight + Style.space(16)
+            radius: Style.cornerRadius
+            color: root.cardBg
+            border.width: 1
+            border.color: root.cardBorder
+
+            Row {
+              id: hiddenRowInner
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(10)
+
+              Column {
+                width: parent.width - unhideRowBtn.width - parent.spacing
+                spacing: 2
+                anchors.verticalCenter: parent.verticalCenter
+
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: (hiddenRowBox.modelData.typeLabel ? hiddenRowBox.modelData.typeLabel + "  ·  " : "") + hiddenRowBox.modelData.label
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  wrapMode: Text.WordWrap
+                }
+                Text {
+                  width: parent.width
+                  textFormat: Text.PlainText
+                  text: {
+                    var st = Model.fileStatusLabel(hiddenRowBox.modelData.status)
+                    var sum = String(hiddenRowBox.modelData.summary || "")
+                    return (st ? st + " · " : "") + sum + " · Ignored"
+                  }
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+
+              Button {
+                id: unhideRowBtn
+                text: "Unhide"
+                iconText: "󰈈"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+                enabled: !root.busy
+                onClicked: root.unhideItem(hiddenRowBox.modelData.kind, hiddenRowBox.modelData.itemId)
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -2041,7 +2230,7 @@ Panel {
           }
 
           Column {
-            width: parent.width - 28 - includeBtn.width - (rowBox.rowBoth ? 168 : 0) - parent.spacing * (rowBox.rowBoth ? 3 : 2)
+            width: parent.width - 28 - includeBtn.width - hideBtn.width - (rowBox.rowBoth ? 168 : 0) - parent.spacing * (rowBox.rowBoth ? 4 : 3)
             spacing: 2
             anchors.verticalCenter: parent.verticalCenter
 
@@ -2104,6 +2293,20 @@ Panel {
             fontSize: Style.font.caption
             anchors.verticalCenter: parent.verticalCenter
             onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+          }
+
+          Button {
+            id: hideBtn
+            text: "Hide"
+            iconText: "󰈉"
+            tooltipText: "Hide this change so it doesn't bother you"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            anchors.verticalCenter: parent.verticalCenter
+            enabled: !root.busy
+            onClicked: root.hideItem(rowBox.rowKind, rowBox.rowId)
           }
         }
 

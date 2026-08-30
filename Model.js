@@ -90,7 +90,7 @@ function isBundledPath(path) {
     || p.indexOf("bin/") === 0
 }
 
-function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCount) {
+function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCount, hidden) {
   return {
     kind: kind,
     itemId: String(id || ""),
@@ -99,7 +99,8 @@ function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCo
     status: status,
     typeLabel: typeLabel || "",
     both: !!both || String(status) === "both",
-    changed_count: changedCount || 0
+    changed_count: changedCount || 0,
+    hidden: !!hidden
   }
 }
 
@@ -131,45 +132,85 @@ function pickedInItems(items, picks) {
   return n
 }
 
-function appendThemes(out, list) {
+function isItemHidden(kind, id, hiddenMap, item) {
+  if (item && item.hidden) return true
+  if (!hiddenMap) return false
+  var key = kind + ":" + id
+  if (hiddenMap[key] || hiddenMap[id]) return true
+  if (kind === "f") {
+    var p = String(id || "")
+    if (p.indexOf("plugins/") === 0) {
+      var pid = p.split("/")[1] || ""
+      if (pid && (hiddenMap["g:plugin:" + pid] || hiddenMap["p:" + pid] || hiddenMap["plugin:" + pid])) return true
+    }
+    if (p.indexOf("omarchy/hooks/") === 0) {
+      var parts = p.split("/")
+      if (parts.length >= 3) {
+        var ev = parts[2].replace(".d", "")
+        if (hiddenMap["g:hooks:" + ev] || hiddenMap["hooks:" + ev]) return true
+      }
+    }
+    if (p.indexOf("omarchy/agents/") === 0 && (hiddenMap["g:agents"] || hiddenMap["agents"])) return true
+    if (p.indexOf("omarchy/branding/") === 0 && (hiddenMap["g:branding"] || hiddenMap["branding"])) return true
+    if (p.indexOf("omarchy/extensions/") === 0 && (hiddenMap["g:extensions"] || hiddenMap["extensions"])) return true
+    if (p.indexOf("bin/") === 0 && (hiddenMap["g:bin"] || hiddenMap["bin"])) return true
+    if ((p === "omarchy/theme.name" || p.indexOf("omarchy/themes/") === 0) && (hiddenMap["t:selected"] || hiddenMap["t:theme"] || hiddenMap["theme"])) return true
+  } else if (kind === "g") {
+    var raw = String(id || "")
+    if (raw.indexOf("plugin:") === 0) {
+      var gpid = raw.substring(7)
+      if (hiddenMap["p:" + gpid] || hiddenMap[gpid]) return true
+    }
+  } else if (kind === "p") {
+    if (hiddenMap["g:plugin:" + id] || hiddenMap["plugin:" + id]) return true
+  }
+  return false
+}
+
+function appendThemes(out, list, hiddenMap) {
   var rows = list || []
   for (var i = 0; i < rows.length; i++) {
     var t = rows[i]
-    out.push(reviewItem("t", t.id || "selected", t.display || t.slug, t.slug, t.status, "Theme", t.status === "both", 0))
+    var id = t.id || "selected"
+    if (isItemHidden("t", id, hiddenMap, t)) continue
+    out.push(reviewItem("t", id, t.display || t.slug, t.slug, t.status, "Theme", t.status === "both", 0, false))
   }
 }
 
-function appendShortcuts(out, list, summaryField, both) {
+function appendShortcuts(out, list, summaryField, both, hiddenMap) {
   var rows = list || []
   for (var i = 0; i < rows.length; i++) {
     var s = rows[i]
+    if (isItemHidden("s", s.keys, hiddenMap, s)) continue
     var sum = summaryField === "detail" ? (s.detail || s.label || "") : (s.label || "")
-    out.push(reviewItem("s", s.keys, s.keys, sum, s.status, "Shortcut", both || s.status === "both", 0))
+    out.push(reviewItem("s", s.keys, s.keys, sum, s.status, "Shortcut", both || s.status === "both", 0, false))
   }
 }
 
-function appendBundles(out, list, both) {
+function appendBundles(out, list, both, hiddenMap) {
   var rows = list || []
   for (var i = 0; i < rows.length; i++) {
     var b = rows[i]
+    if (isItemHidden("g", b.id, hiddenMap, b)) continue
     var typeLabel = b.kind === "plugin" ? "Plugin" : "Folder"
     var n = Number(b.changed_count || (b.files ? b.files.length : 0) || 0)
     var sum = b.summary || (n + (n === 1 ? " file" : " files"))
-    out.push(reviewItem("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, both || b.status === "both", n))
+    out.push(reviewItem("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, both || b.status === "both", n, false))
   }
 }
 
-function appendLooseFiles(out, files, both) {
+function appendLooseFiles(out, files, both, hiddenMap) {
   var rows = files || []
   for (var i = 0; i < rows.length; i++) {
     var f = rows[i]
     var p = String(f.path || "")
     if (!p || isBundledPath(p)) continue
-    out.push(reviewItem("f", p, p, f.summary || "", f.status, "File", both || f.status === "both", 0))
+    if (isItemHidden("f", p, hiddenMap, f)) continue
+    out.push(reviewItem("f", p, p, f.summary || "", f.status, "File", both || f.status === "both", 0, false))
   }
 }
 
-function appendPluginFilesAsFolders(out, files, both, alreadyBundled) {
+function appendPluginFilesAsFolders(out, files, both, alreadyBundled, hiddenMap) {
   var covered = alreadyBundled || {}
   var buckets = {}
   var order = []
@@ -181,6 +222,8 @@ function appendPluginFilesAsFolders(out, files, both, alreadyBundled) {
     if (p.indexOf("plugins/") !== 0) continue
     var pid = p.split("/")[1] || ""
     if (!pid || covered[pid]) continue
+    if (isItemHidden("g", "plugin:" + pid, hiddenMap, f)) continue
+    if (isItemHidden("f", p, hiddenMap, f)) continue
     var bid = "plugin:" + pid
     if (!buckets[bid]) {
       buckets[bid] = { id: bid, name: pid, count: 0, status: f.status }
@@ -191,7 +234,7 @@ function appendPluginFilesAsFolders(out, files, both, alreadyBundled) {
   for (var j = 0; j < order.length; j++) {
     var g = buckets[order[j]]
     var n = g.count
-    out.push(reviewItem("g", g.id, g.name, n + (n === 1 ? " file" : " files"), g.status, "Plugin", both || g.status === "both", n))
+    out.push(reviewItem("g", g.id, g.name, n + (n === 1 ? " file" : " files"), g.status, "Plugin", both || g.status === "both", n, false))
   }
 }
 
@@ -207,35 +250,94 @@ function bundledPluginIds(bundles) {
   return covered
 }
 
-function buildIncomingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles) {
+function buildIncomingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles, hiddenMap) {
   var out = []
-  appendThemes(out, theme)
-  appendShortcuts(out, addedShortcuts, "label", false)
-  appendShortcuts(out, changedShortcuts, "detail", false)
-  appendBundles(out, bundles, false)
-  appendPluginFilesAsFolders(out, allFiles, false, bundledPluginIds(bundles))
-  appendLooseFiles(out, files, false)
+  appendThemes(out, theme, hiddenMap)
+  appendShortcuts(out, addedShortcuts, "label", false, hiddenMap)
+  appendShortcuts(out, changedShortcuts, "detail", false, hiddenMap)
+  appendBundles(out, bundles, false, hiddenMap)
+  appendPluginFilesAsFolders(out, allFiles, false, bundledPluginIds(bundles), hiddenMap)
+  appendLooseFiles(out, files, false, hiddenMap)
   return out
 }
 
-function buildOutgoingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles) {
+function buildOutgoingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles, hiddenMap) {
   var out = []
-  appendThemes(out, theme)
-  appendShortcuts(out, addedShortcuts, "label", false)
-  appendShortcuts(out, changedShortcuts, "detail", false)
-  appendBundles(out, bundles, false)
-  appendPluginFilesAsFolders(out, allFiles, false, bundledPluginIds(bundles))
-  appendLooseFiles(out, files, false)
+  appendThemes(out, theme, hiddenMap)
+  appendShortcuts(out, addedShortcuts, "label", false, hiddenMap)
+  appendShortcuts(out, changedShortcuts, "detail", false, hiddenMap)
+  appendBundles(out, bundles, false, hiddenMap)
+  appendPluginFilesAsFolders(out, allFiles, false, bundledPluginIds(bundles), hiddenMap)
+  appendLooseFiles(out, files, false, hiddenMap)
   return out
 }
 
-function buildBothItems(theme, shortcuts, bundles, files, allFiles) {
+function buildBothItems(theme, shortcuts, bundles, files, allFiles, hiddenMap) {
   var out = []
-  appendThemes(out, theme)
-  appendShortcuts(out, shortcuts, "label", true)
-  appendBundles(out, bundles, true)
-  appendPluginFilesAsFolders(out, allFiles, true, bundledPluginIds(bundles))
-  appendLooseFiles(out, files, true)
+  appendThemes(out, theme, hiddenMap)
+  appendShortcuts(out, shortcuts, "label", true, hiddenMap)
+  appendBundles(out, bundles, true, hiddenMap)
+  appendPluginFilesAsFolders(out, allFiles, true, bundledPluginIds(bundles), hiddenMap)
+  appendLooseFiles(out, files, true, hiddenMap)
+  return out
+}
+
+function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap) {
+  var out = []
+  var seen = {}
+  function addHidden(kind, id, label, summary, status, typeLabel, both, count) {
+    var key = kind + ":" + id
+    if (seen[key]) return
+    seen[key] = true
+    out.push(reviewItem(kind, id, label, summary, status, typeLabel, both, count, true))
+  }
+
+  var tList = theme || []
+  for (var ti = 0; ti < tList.length; ti++) {
+    var t = tList[ti]
+    var tid = t.id || "selected"
+    if (isItemHidden("t", tid, hiddenMap, t)) {
+      addHidden("t", tid, t.display || t.slug, t.slug, t.status, "Theme", t.status === "both", 0)
+    }
+  }
+
+  var sList = shortcuts || []
+  for (var si = 0; si < sList.length; si++) {
+    var s = sList[si]
+    if (isItemHidden("s", s.keys, hiddenMap, s)) {
+      addHidden("s", s.keys, s.keys, s.label || s.detail || "", s.status, "Shortcut", s.status === "both", 0)
+    }
+  }
+
+  var bList = bundles || []
+  for (var bi = 0; bi < bList.length; bi++) {
+    var b = bList[bi]
+    if (isItemHidden("g", b.id, hiddenMap, b)) {
+      var typeLabel = b.kind === "plugin" ? "Plugin" : "Folder"
+      var n = Number(b.changed_count || (b.files ? b.files.length : 0) || 0)
+      var sum = b.summary || (n + (n === 1 ? " file" : " files"))
+      addHidden("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, b.status === "both", n)
+    }
+  }
+
+  var fList = files || []
+  for (var fi = 0; fi < fList.length; fi++) {
+    var f = fList[fi]
+    var p = String(f.path || "")
+    if (!p || f.status === "identical" || f.status === "machine") continue
+    if (isItemHidden("f", p, hiddenMap, f)) {
+      var parentHidden = false
+      if (p.indexOf("plugins/") === 0) {
+        var pid = p.split("/")[1] || ""
+        if (pid && (isItemHidden("g", "plugin:" + pid, hiddenMap, null) || isItemHidden("p", pid, hiddenMap, null)))
+          parentHidden = true
+      }
+      if (!parentHidden) {
+        addHidden("f", p, p, f.summary || "", f.status, "File", f.status === "both", 0)
+      }
+    }
+  }
+
   return out
 }
 
