@@ -381,12 +381,6 @@ Panel {
             font.pixelSize: Style.font.display
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
-            RotationAnimator on rotation {
-              running: root.busy
-              from: 0; to: 360
-              duration: 900
-              loops: Animation.Infinite
-            }
           }
 
           Column {
