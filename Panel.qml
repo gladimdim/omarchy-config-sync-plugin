@@ -33,6 +33,7 @@ Panel {
   property string repoUrlInput: ""
   property int activeTab: 0
   property bool includeMachine: false
+  property bool editingRepo: false
   property string confirmKind: ""
   property var bothPicks: ({})
   property var picks: ({})
@@ -397,8 +398,41 @@ Panel {
     } else if (kind === "disconnect") {
       run(["disconnect"])
       repoUrlInput = ""
+      editingRepo = false
       bothPicks = ({})
+    } else if (kind === "switch-repo") {
+      editingRepo = false
+      lastError = ""
+      run(["connect", String(repoUrlInput || "").trim()])
     }
+  }
+
+  function startEditRepo() {
+    repoUrlInput = String((status && status.repo_url) || repoUrlInput || "")
+    editingRepo = true
+    activeTab = 0
+    lastError = ""
+  }
+
+  function cancelEditRepo() {
+    editingRepo = false
+    repoUrlInput = String((status && status.repo_url) || "")
+  }
+
+  function saveEditRepo() {
+    var url = String(repoUrlInput || "").trim()
+    if (!url) {
+      lastError = "Paste a git URL or a local path to the config repo."
+      return
+    }
+    var current = String((status && status.repo_url) || "").replace(/\/+$/, "").replace(/\.git$/, "")
+    var next = url.replace(/\/+$/, "").replace(/\.git$/, "")
+    if (current && (next === current || next === current + ".git" || current === next + ".git")) {
+      editingRepo = false
+      lastMessage = "Already linked to that repo."
+      return
+    }
+    confirmKind = "switch-repo"
   }
 
   function pullRemote() {
@@ -426,7 +460,7 @@ Panel {
     themeDiff = (data.diff && data.diff.theme) ? data.diff.theme : null
     if (data.sync_state && status)
       status = Object.assign({}, status, { sync_state: data.sync_state })
-    if (!repoUrlInput && status.repo_url)
+    if (!editingRepo && status.repo_url)
       repoUrlInput = String(status.repo_url)
     Qt.callLater(function() {
       root.seedPicks()
@@ -489,6 +523,8 @@ Panel {
       return
     }
     lastMessage = String(data.message || "")
+    if (data.connected)
+      editingRepo = false
     if (data.status || data.configured === false || data.disconnected)
       applySnapshot(data)
     if (data.push_error)
@@ -590,7 +626,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: urlField.activeFocus || root.confirmKind !== ""
+      blocked: urlField.activeFocus || root.editingRepo || root.confirmKind !== ""
 
       onCloseRequested: {
         if (root.confirmKind !== "") root.confirmKind = ""
@@ -678,6 +714,17 @@ Panel {
               fontSize: Style.font.caption
               enabled: !root.busy
               onClicked: root.refresh(true)
+            }
+
+            Button {
+              visible: root.configured
+              text: "Edit"
+              tooltipText: "Use a different git repo"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              enabled: !root.busy
+              onClicked: root.startEditRepo()
             }
 
             Button {
@@ -922,7 +969,9 @@ Panel {
                   ? (root.syncState === "empty"
                     ? "Seed this private GitHub repo with the checked items from this laptop, then push? Keep the repo private so shortcuts, hooks, and scripts are not public."
                     : "Copy the checked local shortcuts, plugins, and files into the repo, commit, and push?")
-                  : "Unlink the config repo on this laptop? Local files are left as they are."
+                  : root.confirmKind === "switch-repo"
+                    ? "Point this laptop at a different git repo? Local files are not deleted. The new repo is cloned and checked before anything is applied."
+                    : "Unlink the config repo on this laptop? Local files are left as they are."
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -935,7 +984,7 @@ Panel {
               width: parent.width
 
               Button {
-                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply")
+                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "switch-repo" ? "Switch repo" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply"))
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
@@ -1051,7 +1100,108 @@ Panel {
       }
 
       CardBox {
-        TablePair { label: "Remote"; value: String(root.status.repo_url || "—") }
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(remoteLabel.implicitHeight, remoteVal.implicitHeight, editRepoBtn.implicitHeight)
+            visible: !root.editingRepo
+
+            Text {
+              id: remoteLabel
+              textFormat: Text.PlainText
+              text: "Remote"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              width: Math.min(Style.space(140), parent.width * 0.28)
+            }
+            Text {
+              id: remoteVal
+              textFormat: Text.PlainText
+              text: String(root.status.repo_url || "—")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideMiddle
+              anchors.left: remoteLabel.right
+              anchors.leftMargin: Style.space(8)
+              anchors.right: editRepoBtn.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+            }
+            Button {
+              id: editRepoBtn
+              text: "Edit"
+              tooltipText: "Use a different git repo"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              enabled: !root.busy
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              onClicked: root.startEditRepo()
+            }
+          }
+
+          Column {
+            visible: root.editingRepo
+            width: parent.width
+            spacing: Style.space(8)
+            onVisibleChanged: if (visible) repoEditField.forceActiveFocus()
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "Git repo"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            TextField {
+              id: repoEditField
+              width: parent.width
+              placeholderText: "https://github.com/you/omarchy-config.git"
+              text: root.repoUrlInput
+              foreground: root.foreground
+              font.family: root.fontFamily
+              enabled: !root.busy
+              onTextChanged: root.repoUrlInput = text
+              onAccepted: root.saveEditRepo()
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "HTTPS, SSH, owner/repo, or a local path. Empty private repos can be seeded from this laptop."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Row {
+              spacing: Style.space(8)
+              Button {
+                text: root.busy ? "Switching…" : "Save"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !root.busy && String(root.repoUrlInput).trim() !== ""
+                onClicked: root.saveEditRepo()
+              }
+              Button {
+                text: "Cancel"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !root.busy
+                onClicked: root.cancelEditRepo()
+              }
+            }
+          }
+        }
         TablePair { label: "Branch"; value: String((root.status.branch || "—") + (root.status.head ? " @ " + root.status.head : "")) }
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }

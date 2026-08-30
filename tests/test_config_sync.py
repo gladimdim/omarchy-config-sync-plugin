@@ -433,6 +433,20 @@ class InspectAndSyncTests(unittest.TestCase):
             cs.cmd_apply(env.ctx, argparse_ns(include_machine=True, files="hypr/monitors.lua"))
             self.assertIn("eDP-1", (env.ctx.config_hypr / "monitors.lua").read_text(encoding="utf-8"))
 
+    def test_switch_git_repo(self) -> None:
+        with TempHome() as env:
+            first = make_config_repo(env.home / "first")
+            second = make_config_repo(env.home / "second")
+            write(second / "hypr" / "bindings.lua", 'o.bind("SUPER + Z", "Other machine", "true")\n')
+            commit_all(second, "other bind")
+            one = cs.cmd_connect(env.ctx, argparse_ns(args=[f"file://{first}"]))
+            self.assertTrue(one["ok"], one)
+            two = cs.cmd_connect(env.ctx, argparse_ns(args=[f"file://{second}"]))
+            self.assertTrue(two["ok"], two)
+            keys = [s["keys"] for s in two["inspect"]["shortcuts"]]
+            self.assertIn("SUPER + Z", keys)
+            self.assertIn(str(second), two["status"]["repo_url"])
+
     def test_disconnect_keeps_existing_clone(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")

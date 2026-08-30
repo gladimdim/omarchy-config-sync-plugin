@@ -1369,20 +1369,29 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
     clone_path = ctx.default_clone
     existing_state = load_state(ctx)
+    previous_clone: Path | None = None
     if clone_path.exists() and (clone_path / ".git").exists():
         current_origin = git_out(clone_path, "remote", "get-url", "origin")
-        if current_origin.rstrip("/") == value.rstrip("/") or current_origin.rstrip("/").removesuffix(".git") == value.rstrip("/").removesuffix(".git"):
+        same = (
+            current_origin.rstrip("/") == value.rstrip("/")
+            or current_origin.rstrip("/").removesuffix(".git") == value.rstrip("/").removesuffix(".git")
+        )
+        if same:
             fetch_error = fetch_repo(clone_path)
             if fetch_error:
                 raise SyncError(fetch_error)
             run_git(clone_path, ["pull", "--ff-only"], timeout=40)
         else:
             # Different remote: move the old clone aside rather than deleting blindly.
-            backup = ctx.state_dir / f"repo.bak.{int(time.time())}"
-            clone_path.rename(backup)
+            previous_clone = ctx.state_dir / f"repo.bak.{int(time.time())}"
+            clone_path.rename(previous_clone)
             clone_path = ctx.default_clone
             result = run_git(None, ["clone", value, str(clone_path)], timeout=CLONE_TIMEOUT, cwd=ctx.state_dir)
             if result.returncode != 0:
+                if clone_path.exists():
+                    shutil.rmtree(clone_path, ignore_errors=True)
+                if previous_clone.exists():
+                    previous_clone.rename(ctx.default_clone)
                 raise SyncError(git_error_message(["clone", value], result))
     else:
         if clone_path.exists():
@@ -1394,10 +1403,14 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             raise SyncError(git_error_message(["clone", value], result))
 
     try:
-        return finish_connect(ctx, clone_path, value, using_existing=False, fetch=False)
+        snap = finish_connect(ctx, clone_path, value, using_existing=False, fetch=False)
+        snap["message"] = snap.get("message") or f"Linked {value}"
+        return snap
     except SyncError:
         if clone_path.exists() and not existing_state.get("using_existing_clone"):
             shutil.rmtree(clone_path, ignore_errors=True)
+        if previous_clone is not None and previous_clone.exists() and not ctx.default_clone.exists():
+            previous_clone.rename(ctx.default_clone)
         raise
 
 
