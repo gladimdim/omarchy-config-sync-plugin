@@ -1091,7 +1091,7 @@ Panel {
     property string pathLabel: ""
     property string summary: ""
     property string statusLabel: ""
-    property Component extra: null
+    property Component extra: Item { width: 0; height: 1 }
     width: parent ? parent.width : 100
     implicitHeight: Math.max(fileCol.implicitHeight, extraLoader.implicitHeight) + Style.space(12)
     radius: Style.cornerRadius
