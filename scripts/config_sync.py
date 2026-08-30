@@ -41,7 +41,8 @@ UNBIND_RE = re.compile(r"""hl\.unbind\(\s*"([^"]+)"\s*\)""")
 SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules"}
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
-PROTECTED_PLUGINS = {PLUGIN_ID}
+PROTECTED_PLUGINS = set()  # this plugin is synced so UI updates travel with config
+PLUGIN_VERSION = "1.2.0"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -598,8 +599,6 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     if ctx.config_plugins.is_dir():
         plugin_ids.update(p.name for p in ctx.config_plugins.iterdir() if p.is_dir() and not p.name.startswith("."))
     for plugin_id in sorted(plugin_ids):
-        if plugin_id in PROTECTED_PLUGINS:
-            continue
         repo_plugin = repo_plugins / plugin_id
         local_plugin = ctx.config_plugins / plugin_id
         rels = set()
@@ -939,7 +938,8 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "file_count": len(g["files"]),
                 "changed_count": len(statuses),
                 "git_managed": g["git_managed"],
-                "default_apply": status in {"repo", "added-repo", "differs", "both"} and not g["git_managed"],
+                "default_apply": status in {"repo", "added-repo", "differs", "both"}
+                and (not g["git_managed"] or pid == PLUGIN_ID),
                 "default_publish": status in {"local", "added-local", "differs", "both"},
             }
         )
@@ -1092,8 +1092,6 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
         for child in sorted(plugins_dir.iterdir()):
             manifest_path = child / "manifest.json"
             if not child.is_dir() or not manifest_path.is_file():
-                continue
-            if child.name in PROTECTED_PLUGINS:
                 continue
             manifest = load_json(manifest_path, default={}) or {}
             plugins.append(
@@ -1279,11 +1277,12 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
     for item in collect_inventory(ctx, repo):
         status = classify_file(item, stored.get(item["path"]))
         item["status"] = status
+        plugin_id = plugin_id_from_path(item["path"])
         item["default_apply"] = (
             default_apply_status(status)
             and item["portable"]
             and item["repo_exists"]
-            and not item.get("git_managed")
+            and (not item.get("git_managed") or plugin_id == PLUGIN_ID)
         )
         item["default_publish"] = default_publish_status(status) and item["local_exists"]
         if status not in {"identical", "machine"}:
@@ -1431,6 +1430,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "unknown_differs": diff["counts"].get("differs", 0),
         "shortcut_changes": len(diff.get("shortcuts") or []),
         "plugin_changes": len(diff.get("plugins") or []),
+        "plugin_version": PLUGIN_VERSION,
     }
     return ok(
         {

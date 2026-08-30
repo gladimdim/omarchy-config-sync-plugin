@@ -384,7 +384,7 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertTrue(os.access(env.ctx.local_bin / "useful-tool", os.X_OK))
             self.assertTrue(Path(applied["backup_dir"]).is_dir())
 
-    def test_publish_local_shortcut_and_skip_protected_plugin(self) -> None:
+    def test_publish_local_shortcut_and_includes_config_sync_plugin(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
             cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
@@ -393,7 +393,7 @@ class InspectAndSyncTests(unittest.TestCase):
             bindings = env.ctx.config_hypr / "bindings.lua"
             text = bindings.read_text(encoding="utf-8")
             bindings.write_text(text + 'o.bind("SUPER + Y", "New shortcut", "true")\n', encoding="utf-8")
-            write(env.ctx.config_plugins / cs.PLUGIN_ID / "manifest.json", json.dumps({"id": cs.PLUGIN_ID}))
+            write(env.ctx.config_plugins / cs.PLUGIN_ID / "manifest.json", json.dumps({"id": cs.PLUGIN_ID, "name": "Config Sync"}))
 
             snap = cs.cmd_snapshot(env.ctx, argparse_ns())
             self.assertEqual(snap["sync_state"], "local-ahead", snap["status"])
@@ -402,7 +402,7 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertIn("hypr/bindings.lua", published["published"])
             repo_bindings = (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8")
             self.assertIn("SUPER + Y", repo_bindings)
-            self.assertFalse((repo / "plugins" / cs.PLUGIN_ID).exists())
+            self.assertTrue((repo / "plugins" / cs.PLUGIN_ID / "manifest.json").is_file())
             self.assertTrue(published["committed"])
             log = git(repo, "log", "-1", "--pretty=%s").stdout
             self.assertIn("Sync config from", log)
