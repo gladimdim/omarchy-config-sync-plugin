@@ -43,6 +43,7 @@ Panel {
   property var pluginDiffs: []
   property var themeDiff: null
   property string lastNotifiedKey: ""
+  property bool openOnChanges: false
 
   readonly property bool configured: !!(status && status.configured)
   readonly property string syncState: String((status && status.sync_state) || (configured ? "in-sync" : "not-configured"))
@@ -163,6 +164,27 @@ Panel {
   }
 
   function reviewChanges() { activeTab = 1 }
+
+  function shortcutDiffFor(keys) {
+    var k = String(keys || "")
+    for (var i = 0; i < shortcutDiffs.length; i++)
+      if (String(shortcutDiffs[i].keys) === k) return shortcutDiffs[i]
+    return null
+  }
+
+  function pluginDiffFor(id) {
+    var k = String(id || "")
+    for (var i = 0; i < pluginDiffs.length; i++)
+      if (String(pluginDiffs[i].id) === k) return pluginDiffs[i]
+    return null
+  }
+
+  function fileDiffFor(path) {
+    var k = String(path || "")
+    for (var i = 0; i < otherFiles.length; i++)
+      if (String(otherFiles[i].path) === k) return otherFiles[i]
+    return null
+  }
 
   function bulkPick(mode) {
     var next = cloneMap(picks)
@@ -402,7 +424,16 @@ Panel {
       status = Object.assign({}, status, { sync_state: data.sync_state })
     if (!repoUrlInput && status.repo_url)
       repoUrlInput = String(status.repo_url)
-    Qt.callLater(function() { root.seedPicks(); root.maybeNotify() })
+    Qt.callLater(function() {
+      root.seedPicks()
+      if (root.openOnChanges && root.hasReviewable) {
+        root.activeTab = 1
+        root.openOnChanges = false
+      } else {
+        root.openOnChanges = false
+      }
+      root.maybeNotify()
+    })
   }
 
   function maybeNotify() {
@@ -471,6 +502,7 @@ Panel {
     if (opened) {
       confirmKind = ""
       lastError = ""
+      openOnChanges = true
       refresh(true)
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
@@ -1048,6 +1080,47 @@ Panel {
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
       }
+
+      Column {
+        visible: root.hasReviewable
+        width: parent.width
+        spacing: Style.space(10)
+
+        PanelSeparator { foreground: root.foreground }
+
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Include in Apply / Publish — flip the switch or tick the box on each row."
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        Column {
+          visible: !!root.themeDiff
+          width: parent.width
+          spacing: Style.space(6)
+          PanelSectionHeader { text: "THEME"; foreground: root.foreground; fontFamily: root.fontFamily }
+          PickRow {
+            width: parent.width
+            kind: "t"
+            itemId: "selected"
+            pathLabel: root.themeDiff ? ("Selected theme: " + String(root.themeDiff.display || root.themeDiff.slug || "")) : ""
+            summary: root.themeDiff && root.themeDiff.custom ? "includes custom overlay" : "stock theme name"
+            statusLabel: root.themeDiff ? Model.fileStatusLabel(root.themeDiff.status) : ""
+            both: !!(root.themeDiff && root.themeDiff.status === "both")
+          }
+        }
+
+        ChangeSection { title: "INCOMING SHORTCUTS"; kind: "s"; idField: "keys"; files: root.incomingShortcuts; labelField: "keys"; summaryField: "label" }
+        ChangeSection { title: "LOCAL SHORTCUTS"; kind: "s"; idField: "keys"; files: root.localShortcuts; labelField: "keys"; summaryField: "label" }
+        ChangeSection { title: "INCOMING PLUGINS"; kind: "p"; idField: "id"; files: root.incomingPlugins.concat(root.differsPlugins); labelField: "name"; summaryField: "id" }
+        ChangeSection { title: "LOCAL PLUGINS"; kind: "p"; idField: "id"; files: root.localPlugins; labelField: "name"; summaryField: "id" }
+        ChangeSection { title: "INCOMING FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
+        ChangeSection { title: "LOCAL FILES"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
+      }
     }
   }
 
@@ -1060,8 +1133,8 @@ Panel {
       Text {
         width: parent.width
         textFormat: Text.PlainText
-        text: "Check only what you want. Incoming items Apply onto this laptop. Local items Publish to the repo. Unchecked shortcuts, plugins, and files stay as they are."
-        color: root.dim
+        text: "Each row has an Include switch. On = Apply (incoming) or Publish (local). Off = leave that item alone."
+        color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         wrapMode: Text.WordWrap
@@ -1277,6 +1350,30 @@ Panel {
     Column {
       width: parent.width
       spacing: Style.space(8)
+      PanelSectionHeader {
+        visible: root.shortcutDiffs.length > 0
+        text: "CHANGED SHORTCUTS — INCLUDE TO SYNC"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
+      ChangeSection {
+        title: "INCOMING"
+        kind: "s"
+        idField: "keys"
+        files: root.incomingShortcuts.concat(root.bothShortcuts)
+        labelField: "keys"
+        summaryField: "label"
+        both: root.bothShortcuts.length > 0
+      }
+      ChangeSection {
+        title: "LOCAL"
+        kind: "s"
+        idField: "keys"
+        files: root.localShortcuts
+        labelField: "keys"
+        summaryField: "label"
+      }
+
       PanelSectionHeader { text: "BINDINGS IN THE REPO"; foreground: root.foreground; fontFamily: root.fontFamily }
       Text {
         visible: !root.inspect || !root.inspect.shortcuts || root.inspect.shortcuts.length === 0
@@ -1322,6 +1419,15 @@ Panel {
     Column {
       width: parent.width
       spacing: Style.space(8)
+      ChangeSection {
+        title: "CHANGED PLUGINS — INCLUDE TO SYNC"
+        kind: "p"
+        idField: "id"
+        files: root.incomingPlugins.concat(root.localPlugins).concat(root.bothPlugins).concat(root.differsPlugins)
+        labelField: "name"
+        summaryField: "id"
+      }
+
       PanelSectionHeader { text: "PLUGINS THAT WILL LOAD"; foreground: root.foreground; fontFamily: root.fontFamily }
       Text {
         visible: !root.inspect || !root.inspect.plugins || root.inspect.plugins.length === 0
@@ -1419,6 +1525,15 @@ Panel {
     Column {
       width: parent.width
       spacing: Style.space(8)
+      ChangeSection {
+        title: "CHANGED FILES — INCLUDE TO SYNC"
+        kind: "f"
+        idField: "path"
+        files: root.incomingFiles.concat(root.localFiles).concat(root.bothFiles).concat(root.differsFiles)
+        labelField: "path"
+        summaryField: "summary"
+      }
+
       PanelSectionHeader { text: "FILES IN THE REPO"; foreground: root.foreground; fontFamily: root.fontFamily }
       Repeater {
         model: root.inspect && root.inspect.configs ? root.inspect.configs : []
@@ -1534,9 +1649,9 @@ Panel {
 
     Repeater {
       model: files
-      PickRow {
+      delegate: PickRow {
         required property var modelData
-        width: parent.width
+        width: sectionRoot.width
         kind: sectionRoot.kind
         itemId: String(modelData[sectionRoot.idField] || "")
         pathLabel: String(modelData[sectionRoot.labelField] || "")
@@ -1553,6 +1668,7 @@ Panel {
   }
 
   component PickRow: Rectangle {
+    id: pickRoot
     property string kind: "f"
     property string itemId: ""
     property string pathLabel: ""
@@ -1561,99 +1677,145 @@ Panel {
     property bool both: false
     readonly property bool checked: root.isPicked(kind, itemId)
     readonly property string bothKey: kind === "f" ? itemId : (kind + ":" + itemId)
+    readonly property string direction: {
+      var s = String(statusLabel || "").toLowerCase()
+      if (s.indexOf("incoming") !== -1 || s === "new in repo") return "in"
+      if (s.indexOf("local") !== -1 || s.indexOf("this laptop") !== -1) return "out"
+      if (s.indexOf("both") !== -1) return "both"
+      return ""
+    }
 
     width: parent ? parent.width : 100
-    implicitHeight: Math.max(checkBox.implicitHeight, pickCol.implicitHeight, bothRow.implicitHeight) + Style.space(12)
+    implicitHeight: innerCol.implicitHeight + Style.space(14)
     radius: Style.cornerRadius
-    color: checked ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.08) : root.cardBg
+    color: checked ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.10) : root.cardBg
     border.width: 1
-    border.color: checked ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.45) : root.cardBorder
-
-    MouseArea {
-      anchors.left: parent.left
-      anchors.top: parent.top
-      anchors.bottom: parent.bottom
-      anchors.right: both ? bothRow.left : parent.right
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onClicked: root.togglePick(kind, itemId)
-    }
-
-    Rectangle {
-      id: checkBox
-      width: Style.space(16)
-      height: Style.space(16)
-      radius: 3
-      anchors.left: parent.left
-      anchors.leftMargin: Style.space(8)
-      anchors.verticalCenter: parent.verticalCenter
-      color: checked ? root.accent : "transparent"
-      border.width: 1
-      border.color: checked ? root.accent : root.cardBorder
-      Text {
-        anchors.centerIn: parent
-        text: checked ? "✓" : ""
-        color: Color.background
-        font.pixelSize: Style.font.caption
-        font.bold: true
-      }
-    }
+    border.color: checked ? root.accent : root.cardBorder
 
     Column {
-      id: pickCol
-      anchors.left: checkBox.right
-      anchors.leftMargin: Style.space(8)
-      anchors.right: bothRow.left
-      anchors.rightMargin: Style.space(8)
-      anchors.verticalCenter: parent.verticalCenter
-      spacing: 2
-      Text {
+      id: innerCol
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      anchors.topMargin: Style.space(8)
+      spacing: Style.space(8)
+
+      Row {
         width: parent.width
-        textFormat: Text.PlainText
-        text: pathLabel
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        font.bold: true
-        elide: Text.ElideMiddle
+        spacing: Style.space(10)
+
+        // Visible checkbox: 22px square, strong border, label beside it.
+        Item {
+          width: Style.space(22)
+          height: Style.space(22)
+          anchors.verticalCenter: parent.verticalCenter
+
+          Rectangle {
+            anchors.fill: parent
+            radius: 4
+            color: pickRoot.checked ? root.accent : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+            border.width: 2
+            border.color: pickRoot.checked ? root.accent : root.foreground
+          }
+          Text {
+            anchors.centerIn: parent
+            text: pickRoot.checked ? "✓" : ""
+            color: Color.background
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.togglePick(pickRoot.kind, pickRoot.itemId)
+          }
+        }
+
+        Column {
+          width: parent.width - Style.space(22) - Style.space(10) - includeSwitch.width - Style.space(10)
+          spacing: 2
+          anchors.verticalCenter: parent.verticalCenter
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: pickRoot.pathLabel
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            wrapMode: Text.WordWrap
+          }
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: {
+              var bits = []
+              if (pickRoot.statusLabel) bits.push(pickRoot.statusLabel)
+              if (pickRoot.summary) bits.push(pickRoot.summary)
+              bits.push(pickRoot.checked ? "will sync" : "skipped")
+              return bits.join(" · ")
+            }
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+
+        Column {
+          id: includeSwitch
+          spacing: 2
+          anchors.verticalCenter: parent.verticalCenter
+          Text {
+            text: pickRoot.checked ? "Include" : "Skip"
+            color: pickRoot.checked ? root.accent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            anchors.horizontalCenter: parent.horizontalCenter
+          }
+          ToggleSwitch {
+            checked: pickRoot.checked
+            foreground: root.foreground
+            accent: root.accent
+            onToggled: root.togglePick(pickRoot.kind, pickRoot.itemId)
+          }
+        }
       }
-      Text {
-        width: parent.width
-        textFormat: Text.PlainText
-        text: summary + (statusLabel ? " · " + statusLabel : "")
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
+
+      Row {
+        visible: pickRoot.both
+        spacing: Style.space(6)
+        Button {
+          text: "Keep local"
+          fontSize: Style.font.caption
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          selected: root.bothPicks[pickRoot.bothKey] === "local"
+          bordered: true
+          onClicked: root.selectSide(pickRoot.kind, pickRoot.itemId, "local")
+        }
+        Button {
+          text: "Take repo"
+          fontSize: Style.font.caption
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          selected: root.bothPicks[pickRoot.bothKey] === "repo"
+          bordered: true
+          onClicked: root.selectSide(pickRoot.kind, pickRoot.itemId, "repo")
+        }
       }
     }
 
-    Row {
-      id: bothRow
-      visible: both
-      spacing: Style.space(4)
-      anchors.right: parent.right
-      anchors.rightMargin: Style.space(8)
-      anchors.verticalCenter: parent.verticalCenter
-      z: 2
-      Button {
-        text: "Keep local"
-        fontSize: Style.font.caption
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        selected: root.bothPicks[bothKey] === "local"
-        bordered: true
-        onClicked: root.selectSide(kind, itemId, "local")
-      }
-      Button {
-        text: "Take repo"
-        fontSize: Style.font.caption
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        selected: root.bothPicks[bothKey] === "repo"
-        bordered: true
-        onClicked: root.selectSide(kind, itemId, "repo")
-      }
+    MouseArea {
+      z: -1
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.togglePick(pickRoot.kind, pickRoot.itemId)
     }
   }
 
