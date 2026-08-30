@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "gladimdim.config-sync",
   "name": "Config Sync",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "author": "Dmytro Gladkyi",
   "license": "MIT",
   "description": "Link a git repo of Omarchy configs, preview shortcuts/plugins/files, apply them to this laptop, and publish local changes back for your other machines.",

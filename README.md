@@ -53,7 +53,7 @@ omarchy plugin enable gladimdim.config-sync --section right
 4. **Both changed the same file** — Changes → Both changed → **Keep local** or **Take repo** per file, then Apply and/or Publish.
 5. **Git diverged** (two laptops pushed without pulling) — **Pull**, resolve any unmerged paths, then continue.
 
-State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` does not unlink the repo.
+State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` does not unlink the repo. Removing the plugin (`omarchy plugin remove gladimdim.config-sync`) forgets that state: a reinstall starts unlinked. **Unlink** in the panel does the same without deleting the plugin. A clone you pointed at in-place (for example `~/Github/omarchy-config`) is never deleted.
 
 ## What is synced
 

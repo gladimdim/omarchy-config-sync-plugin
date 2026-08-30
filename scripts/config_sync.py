@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import Any
 
 PLUGIN_ID = "gladimdim.config-sync"
 STATE_VERSION = 1
+SESSION_FILE = ".sync-session"
 MARKER_NAME = ".omarchy-config.json"
 MARKER_FORMAT = "omarchy-config"
 MAX_DIFF_LINES = 48
@@ -42,7 +44,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = set()  # this plugin is synced so UI updates travel with config
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.2"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -74,13 +76,17 @@ class Context:
     home: Path
     state_dir: Path
     default_clone: Path
+    plugin_root: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Context":
         home = Path(os.environ.get("HOME") or Path.home()).expanduser()
         data = Path(os.environ.get("XDG_DATA_HOME") or (home / ".local/share"))
         state_dir = data / "omarchy-config-sync"
-        return cls(home=home, state_dir=state_dir, default_clone=state_dir / "repo")
+        plugin_root = home / ".config" / "omarchy" / "plugins" / PLUGIN_ID
+        if not plugin_root.is_dir():
+            plugin_root = None
+        return cls(home=home, state_dir=state_dir, default_clone=state_dir / "repo", plugin_root=plugin_root)
 
     @property
     def state_path(self) -> Path:
@@ -286,6 +292,7 @@ def git_out(repo: Path, *args: str, timeout: int = 20) -> str:
 
 
 def load_state(ctx: Context) -> dict[str, Any]:
+    bind_install_session(ctx)
     data = load_json(ctx.state_path, default={})
     if not isinstance(data, dict):
         return {}
@@ -294,8 +301,82 @@ def load_state(ctx: Context) -> dict[str, Any]:
 
 def save_state(ctx: Context, state: dict[str, Any]) -> None:
     state["version"] = STATE_VERSION
+    session = read_or_create_session(ctx.plugin_root) if ctx.plugin_root is not None else None
+    if session:
+        state["plugin_instance"] = session
     ctx.state_dir.mkdir(parents=True, exist_ok=True)
     write_json(ctx.state_path, state)
+
+
+def read_or_create_session(plugin_root: Path | None) -> str | None:
+    if plugin_root is None:
+        return None
+    path = plugin_root / SESSION_FILE
+    if path.is_file():
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    value = uuid.uuid4().hex
+    try:
+        plugin_root.mkdir(parents=True, exist_ok=True)
+        path.write_text(value + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return value
+
+
+def purge_saved_settings(ctx: Context) -> bool:
+    """Forget linked-repo settings. Never deletes a user clone outside state_dir."""
+    deleted_clone = False
+    state: dict[str, Any] = {}
+    if ctx.state_path.is_file():
+        loaded = load_json(ctx.state_path, default={})
+        if isinstance(loaded, dict):
+            state = loaded
+    clone = Path(state.get("clone_path") or "")
+    using_existing = bool(state.get("using_existing_clone"))
+    if clone.is_dir() and not using_existing:
+        try:
+            clone.resolve().relative_to(ctx.state_dir.resolve())
+        except (ValueError, OSError):
+            pass
+        else:
+            shutil.rmtree(clone, ignore_errors=True)
+            deleted_clone = True
+    if ctx.state_dir.is_dir():
+        shutil.rmtree(ctx.state_dir, ignore_errors=True)
+    return deleted_clone
+
+
+def bind_install_session(ctx: Context) -> None:
+    """Drop leftover XDG settings when this plugin folder is a new install.
+
+    Omarchy's plugin remove only deletes ~/.config/omarchy/plugins/<id>/.
+    Linked-repo state lives in XDG, so a reinstall would otherwise reconnect
+    automatically. A session file in the plugin folder dies with the plugin;
+    a new folder gets a new id and leftover settings are purged.
+    """
+    if ctx.plugin_root is None or not ctx.plugin_root.is_dir():
+        return
+    if not ctx.state_path.is_file():
+        return
+    session = read_or_create_session(ctx.plugin_root)
+    if not session:
+        return
+    data = load_json(ctx.state_path, default={})
+    if not isinstance(data, dict) or not data:
+        return
+    stored = str(data.get("plugin_instance") or "")
+    if stored == session:
+        return
+    if stored:
+        purge_saved_settings(ctx)
+        return
+    data["plugin_instance"] = session
+    try:
+        write_json(ctx.state_path, data)
+    except OSError:
+        return
 
 
 def configured_repo(ctx: Context, state: dict[str, Any] | None = None) -> Path:
@@ -1541,15 +1622,7 @@ def finish_connect(ctx: Context, repo: Path, repo_url: str, using_existing: bool
 
 
 def cmd_disconnect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
-    state = load_state(ctx)
-    clone = Path(state.get("clone_path") or "")
-    using_existing = bool(state.get("using_existing_clone"))
-    deleted = False
-    if args.delete_clone and clone.is_dir() and not using_existing and ctx.state_dir in clone.parents:
-        shutil.rmtree(clone, ignore_errors=True)
-        deleted = True
-    if ctx.state_path.exists():
-        ctx.state_path.unlink()
+    deleted = purge_saved_settings(ctx)
     return ok({"disconnected": True, "deleted_clone": deleted})
 
 

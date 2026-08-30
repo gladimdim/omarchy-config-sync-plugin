@@ -91,7 +91,7 @@ def make_config_repo(root: Path, *, with_monitor: bool = True) -> Path:
                 "schemaVersion": 1,
                 "id": "demo.widget",
                 "name": "Demo Widget",
-                "version": "1.2.1",
+                "version": "1.2.2",
                 "description": "A demo bar widget",
                 "kinds": ["bar-widget"],
                 "entryPoints": {"barWidget": "Main.qml"},
@@ -124,6 +124,13 @@ class TempHome:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def attach_plugin(env: TempHome) -> Path:
+    plugin = env.home / ".config" / "omarchy" / "plugins" / cs.PLUGIN_ID
+    plugin.mkdir(parents=True, exist_ok=True)
+    env.ctx.plugin_root = plugin
+    return plugin
 
 
 class NormalizeTests(unittest.TestCase):
@@ -501,6 +508,49 @@ class InspectAndSyncTests(unittest.TestCase):
             cs.cmd_disconnect(env.ctx, argparse_ns(delete_clone=True))
             self.assertTrue(repo.is_dir())
             self.assertFalse(env.ctx.state_path.exists())
+
+    def test_reinstall_forgets_linked_repo(self) -> None:
+        with TempHome() as env:
+            plugin = attach_plugin(env)
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            self.assertTrue(env.ctx.state_path.exists())
+            self.assertTrue((plugin / cs.SESSION_FILE).is_file())
+            shutil.rmtree(plugin)
+            plugin.mkdir(parents=True)
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertFalse(snap["configured"])
+            self.assertFalse(env.ctx.state_path.exists())
+            self.assertTrue(repo.is_dir())
+
+    def test_reinstall_removes_managed_clone(self) -> None:
+        with TempHome() as env:
+            plugin = attach_plugin(env)
+            origin = make_config_repo(env.home / "origin")
+            snap = cs.cmd_connect(env.ctx, argparse_ns(args=[f"file://{origin}"]))
+            clone = Path(snap["status"]["clone_path"])
+            self.assertTrue(clone.is_dir())
+            shutil.rmtree(plugin)
+            plugin.mkdir(parents=True)
+            after = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertFalse(after["configured"])
+            self.assertFalse(clone.exists())
+            self.assertTrue(origin.is_dir())
+
+    def test_upgrade_without_session_keeps_linked_repo(self) -> None:
+        with TempHome() as env:
+            plugin = attach_plugin(env)
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            (plugin / cs.SESSION_FILE).unlink()
+            state = json.loads(env.ctx.state_path.read_text(encoding="utf-8"))
+            state.pop("plugin_instance", None)
+            env.ctx.state_path.write_text(json.dumps(state), encoding="utf-8")
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertTrue(snap["configured"])
+            self.assertTrue(env.ctx.state_path.exists())
+            bound = json.loads(env.ctx.state_path.read_text(encoding="utf-8"))
+            self.assertTrue(bound.get("plugin_instance"))
 
     def test_reject_non_config_repo(self) -> None:
         with TempHome() as env:

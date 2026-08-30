@@ -1,7 +1,3 @@
+.sync-session
 __pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-*.tmp
-.DS_Store
+*.pyc
