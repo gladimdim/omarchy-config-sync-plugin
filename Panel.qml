@@ -728,6 +728,7 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refresh(true); return "ok" }
+    function setTab(tab: int): void { root.activeTab = tab }
   }
 
   BarIconButton {
