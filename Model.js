@@ -80,6 +80,165 @@ function filesByStatus(files, statuses) {
   return out
 }
 
+function isBundledPath(path) {
+  var p = String(path || "")
+  return p.indexOf("plugins/") === 0
+    || p.indexOf("omarchy/hooks/") === 0
+    || p.indexOf("omarchy/agents/") === 0
+    || p.indexOf("omarchy/branding/") === 0
+    || p.indexOf("omarchy/extensions/") === 0
+    || p.indexOf("bin/") === 0
+}
+
+function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCount) {
+  return {
+    kind: kind,
+    itemId: String(id || ""),
+    label: String(label || ""),
+    summary: String(summary || ""),
+    status: status,
+    typeLabel: typeLabel || "",
+    both: !!both || String(status) === "both",
+    changed_count: changedCount || 0
+  }
+}
+
+function unbundledFiles(files) {
+  var out = []
+  var list = files || []
+  for (var i = 0; i < list.length; i++) {
+    if (!isBundledPath(list[i].path)) out.push(list[i])
+  }
+  return out
+}
+
+function itemsOfKind(items, kind) {
+  var out = []
+  var list = items || []
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].kind === kind) out.push(list[i])
+  }
+  return out
+}
+
+function pickedInItems(items, picks) {
+  var n = 0
+  var list = items || []
+  var map = picks || {}
+  for (var i = 0; i < list.length; i++) {
+    if (map[list[i].kind + ":" + list[i].itemId]) n++
+  }
+  return n
+}
+
+function appendThemes(out, list) {
+  var rows = list || []
+  for (var i = 0; i < rows.length; i++) {
+    var t = rows[i]
+    out.push(reviewItem("t", t.id || "selected", t.display || t.slug, t.slug, t.status, "Theme", t.status === "both", 0))
+  }
+}
+
+function appendShortcuts(out, list, summaryField, both) {
+  var rows = list || []
+  for (var i = 0; i < rows.length; i++) {
+    var s = rows[i]
+    var sum = summaryField === "detail" ? (s.detail || s.label || "") : (s.label || "")
+    out.push(reviewItem("s", s.keys, s.keys, sum, s.status, "Shortcut", both || s.status === "both", 0))
+  }
+}
+
+function appendBundles(out, list, both) {
+  var rows = list || []
+  for (var i = 0; i < rows.length; i++) {
+    var b = rows[i]
+    var typeLabel = b.kind === "plugin" ? "Plugin" : "Folder"
+    var n = Number(b.changed_count || (b.files ? b.files.length : 0) || 0)
+    var sum = b.summary || (n + (n === 1 ? " file" : " files"))
+    out.push(reviewItem("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, both || b.status === "both", n))
+  }
+}
+
+function appendLooseFiles(out, files, both) {
+  var rows = files || []
+  for (var i = 0; i < rows.length; i++) {
+    var f = rows[i]
+    var p = String(f.path || "")
+    if (!p || isBundledPath(p)) continue
+    out.push(reviewItem("f", p, p, f.summary || "", f.status, "File", both || f.status === "both", 0))
+  }
+}
+
+function appendPluginFilesAsFolders(out, files, both, alreadyBundled) {
+  var covered = alreadyBundled || {}
+  var buckets = {}
+  var order = []
+  var rows = files || []
+  for (var i = 0; i < rows.length; i++) {
+    var f = rows[i]
+    if (f.status === "identical" || f.status === "machine") continue
+    var p = String(f.path || "")
+    if (p.indexOf("plugins/") !== 0) continue
+    var pid = p.split("/")[1] || ""
+    if (!pid || covered[pid]) continue
+    var bid = "plugin:" + pid
+    if (!buckets[bid]) {
+      buckets[bid] = { id: bid, name: pid, count: 0, status: f.status }
+      order.push(bid)
+    }
+    buckets[bid].count++
+  }
+  for (var j = 0; j < order.length; j++) {
+    var g = buckets[order[j]]
+    var n = g.count
+    out.push(reviewItem("g", g.id, g.name, n + (n === 1 ? " file" : " files"), g.status, "Plugin", both || g.status === "both", n))
+  }
+}
+
+function bundledPluginIds(bundles) {
+  var covered = {}
+  var rows = bundles || []
+  for (var i = 0; i < rows.length; i++) {
+    var b = rows[i]
+    if (b.kind === "plugin" && b.plugin_id) covered[b.plugin_id] = true
+    var id = String(b.id || "")
+    if (id.indexOf("plugin:") === 0) covered[id.substring(7)] = true
+  }
+  return covered
+}
+
+function buildIncomingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles) {
+  var out = []
+  appendThemes(out, theme)
+  appendShortcuts(out, addedShortcuts, "label", false)
+  appendShortcuts(out, changedShortcuts, "detail", false)
+  appendBundles(out, bundles, false)
+  appendPluginFilesAsFolders(out, allFiles, false, bundledPluginIds(bundles))
+  appendLooseFiles(out, files, false)
+  return out
+}
+
+function buildOutgoingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles) {
+  var out = []
+  appendThemes(out, theme)
+  appendShortcuts(out, addedShortcuts, "label", false)
+  appendShortcuts(out, changedShortcuts, "detail", false)
+  appendBundles(out, bundles, false)
+  appendPluginFilesAsFolders(out, allFiles, false, bundledPluginIds(bundles))
+  appendLooseFiles(out, files, false)
+  return out
+}
+
+function buildBothItems(theme, shortcuts, bundles, files, allFiles) {
+  var out = []
+  appendThemes(out, theme)
+  appendShortcuts(out, shortcuts, "label", true)
+  appendBundles(out, bundles, true)
+  appendPluginFilesAsFolders(out, allFiles, true, bundledPluginIds(bundles))
+  appendLooseFiles(out, files, true)
+  return out
+}
+
 function countBy(files, statuses) {
   return filesByStatus(files, statuses).length
 }
