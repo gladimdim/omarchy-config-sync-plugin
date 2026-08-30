@@ -6,7 +6,7 @@ A status-bar plugin that keeps [Omarchy](https://omarchy.org/) configs in a **pr
 
 Click the cloud-sync tray icon, paste the git URL of your config repo, preview what would land on this machine, then **Apply**. When you add a shortcut or plugin locally, open the panel again and **Publish** to send it to the next laptop.
 
-When there is drift, **Review Changes** opens a checklist: incoming vs local **shortcuts** (individual keybindings), **plugins** (whole plugin), and other config files. Uncheck anything you do not want. Apply and Publish only touch the checked items.
+When there is drift, **Review Changes** opens a checklist: incoming vs local **shortcuts** (individual keybindings), **plugins** (whole plugin), the **selected theme**, and other config files. Uncheck anything you do not want. Apply and Publish only touch the checked items. Applying a theme runs `omarchy theme set` on this laptop.
 
 ## Features
 
@@ -61,6 +61,7 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | --- | --- |
 | `hypr/*.lua`, `hypr/*.conf` | `~/.config/hypr/` |
 | `omarchy/shell.json` | `~/.config/omarchy/shell.json` |
+| `omarchy/theme.name` | Selected theme (`omarchy theme set`); custom overlays under `omarchy/themes/<slug>/` (images skipped) |
 | `omarchy/{branding,extensions,hooks,agents}/` | same under `~/.config/omarchy/` |
 | `plugins/*` | `~/.config/omarchy/plugins/` (skips this plugin and other git-managed checkouts’ `.git`) |
 | `bin/*` | `~/.local/bin/` |

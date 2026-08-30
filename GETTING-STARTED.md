@@ -127,7 +127,9 @@ On the new Omarchy machine:
 
 After that, daily life is:
 
-When the badge lights up, **Review Changes** (or press `c`) opens a checklist. You can apply or publish only some shortcuts, only certain plugins, or only some config files. Unchecked items stay as they are on that machine.
+When the badge lights up, **Review Changes** (or press `c`) opens a checklist. You can apply or publish only some shortcuts, only certain plugins, the selected **theme**, or only some config files. Unchecked items stay as they are on that machine.
+
+The selected Omarchy theme (`omarchy theme current`) is part of that list. Stock themes only need the name. If you customized a theme under `~/.config/omarchy/themes/<slug>/`, those overlay files sync too (wallpapers and preview images are skipped so the repo stays small). Apply runs `omarchy theme set` on the other laptop.
 
 | You did this | Open the icon | Press |
 | --- | --- | --- |

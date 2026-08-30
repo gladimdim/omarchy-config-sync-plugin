@@ -396,6 +396,29 @@ class InspectAndSyncTests(unittest.TestCase):
             with self.assertRaises(cs.SyncError):
                 cs.cmd_connect(env.ctx, argparse_ns(args=[str(junk)]))
 
+    def test_sync_selected_theme_and_overlay(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(env.ctx.theme_name_path, "catppuccin\n")
+            write(env.ctx.user_themes / "catppuccin" / "colors.toml", 'background = "#111111"\n')
+            write(env.ctx.user_themes / "catppuccin" / "preview.png", "not-synced")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            published = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", theme=True))
+            self.assertTrue(published["ok"], published)
+            self.assertIn("omarchy/theme.name", published["published"])
+            self.assertEqual((repo / "omarchy" / "theme.name").read_text(encoding="utf-8").strip(), "catppuccin")
+            self.assertTrue((repo / "omarchy" / "themes" / "catppuccin" / "colors.toml").is_file())
+            self.assertFalse((repo / "omarchy" / "themes" / "catppuccin" / "preview.png").exists())
+            # Incoming apply onto a machine still on tokyo-night
+            write(env.ctx.theme_name_path, "tokyo-night\n")
+            applied = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="", theme=True))
+            self.assertTrue(applied["ok"], applied)
+            self.assertEqual(env.ctx.theme_name_path.read_text(encoding="utf-8").strip(), "catppuccin")
+            self.assertIn("background", (env.ctx.user_themes / "catppuccin" / "colors.toml").read_text())
+            inspect = cs.inspect_repo(env.ctx, repo)
+            self.assertEqual(inspect["theme"]["slug"], "catppuccin")
+            self.assertEqual(inspect["theme"]["display"], "Catppuccin")
+
     def test_cherrypick_one_shortcut_and_one_plugin(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
@@ -495,6 +518,7 @@ def argparse_ns(**kwargs):
         explicit = False
         shortcut = None
         plugin = None
+        theme = False
         message = None
         delete_clone = False
         side = None

@@ -54,9 +54,12 @@ FILE_SUMMARIES = {
     "hypr/monitors.lua": "Display layout (machine-specific)",
     "hypr/xdph.conf": "Screen share / XDG portal",
     "omarchy/shell.json": "Bar layout, widgets, and idle lock",
+    "omarchy/theme.name": "Selected Omarchy theme",
 }
 
 MACHINE_LOCAL_PATHS = {"hypr/monitors.lua"}
+THEME_REL = "omarchy/theme.name"
+THEME_SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 
 
 class SyncError(Exception):
@@ -97,6 +100,14 @@ class Context:
     @property
     def local_bin(self) -> Path:
         return self.home / ".local" / "bin"
+
+    @property
+    def theme_name_path(self) -> Path:
+        return self.home / ".local" / "state" / "omarchy" / "current" / "theme.name"
+
+    @property
+    def user_themes(self) -> Path:
+        return self.config_omarchy / "themes"
 
 
 def now_iso() -> str:
@@ -439,6 +450,12 @@ def summary_for(rel: str) -> str:
     if rel.startswith("plugins/"):
         name = rel.split("/")[1] if "/" in rel else rel
         return f"Plugin {name}"
+    if rel == THEME_REL:
+        return "Selected Omarchy theme"
+    if rel.startswith("omarchy/themes/"):
+        parts = rel.split("/")
+        slug = parts[2] if len(parts) > 2 else ""
+        return f"Custom theme files ({theme_display_name(slug)})" if slug else "Custom theme files"
     if rel.startswith("omarchy/hooks/"):
         return "Automation hook"
     if rel.startswith("omarchy/agents/"):
@@ -481,6 +498,35 @@ def iter_files(root: Path) -> list[Path]:
 
 def rel_posix(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def read_theme_slug(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    for line in read_text(path).splitlines():
+        slug = line.strip().lower().replace(" ", "-")
+        if slug and not slug.startswith("#"):
+            return slug
+    return ""
+
+
+def theme_display_name(slug: str) -> str:
+    if not slug:
+        return ""
+    return " ".join(part[:1].upper() + part[1:] for part in slug.replace("_", "-").split("-") if part)
+
+
+def is_theme_asset(path: Path) -> bool:
+    return path.suffix.lower() in THEME_SKIP_SUFFIXES
+
+
+def iter_theme_files(root: Path) -> list[Path]:
+    out = []
+    for path in iter_files(root):
+        if is_theme_asset(path):
+            continue
+        out.append(path)
+    return out
 
 
 def terminal_map(ctx: Context) -> dict[str, Path]:
@@ -582,6 +628,31 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         bin_names.update(p.name for p in repo_bin.iterdir() if p.is_file() and not is_skipped_file(p.name))
     for name in sorted(bin_names):
         add(f"bin/{name}", ctx.local_bin / name, repo_bin / name, "bin")
+
+    local_theme = ctx.theme_name_path
+    repo_theme = repo / THEME_REL
+    if local_theme.is_file() or repo_theme.is_file():
+        add(THEME_REL, local_theme, repo_theme, "theme")
+
+    slugs: set[str] = set()
+    for slug in (read_theme_slug(local_theme), read_theme_slug(repo_theme)):
+        if slug:
+            slugs.add(slug)
+    repo_themes = repo / "omarchy" / "themes"
+    if repo_themes.is_dir():
+        slugs.update(p.name for p in repo_themes.iterdir() if p.is_dir() and not p.name.startswith("."))
+    for slug in sorted(slugs):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug or ""):
+            continue
+        repo_overlay = repo_themes / slug
+        local_overlay = ctx.user_themes / slug
+        rels: set[str] = set()
+        for p in iter_theme_files(repo_overlay):
+            rels.add(rel_posix(p, repo))
+        for p in iter_theme_files(local_overlay):
+            rels.add(f"omarchy/themes/{slug}/" + rel_posix(p, local_overlay))
+        for rel in sorted(rels):
+            add(rel, ctx.home / ".config" / rel, repo / rel, "theme")
 
     return [items[k] for k in sorted(items)]
 
@@ -859,6 +930,40 @@ def expand_plugin_paths(files: list[dict[str, Any]], plugin_ids: list[str], dire
     return out
 
 
+def expand_theme_paths(files: list[dict[str, Any]], direction: str) -> set[str]:
+    out: set[str] = set()
+    for item in files:
+        if item.get("group") != "theme":
+            continue
+        if direction == "apply" and item.get("repo_exists"):
+            out.add(item["path"])
+        elif direction == "publish" and item.get("local_exists"):
+            out.add(item["path"])
+    return out
+
+
+def apply_omarchy_theme(slug: str, dry_run: bool) -> str:
+    slug = (slug or "").strip()
+    if dry_run or not slug:
+        return ""
+    binary = shutil.which("omarchy")
+    if not binary:
+        return "omarchy CLI not found; theme name was copied but not applied"
+    try:
+        result = subprocess.run(
+            [binary, "theme", "set", slug],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return f"omarchy theme set {slug} timed out"
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "failed").strip()
+        return err or f"omarchy theme set {slug} failed"
+    return "ok"
+
+
 def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[str, Any]:
     validation = validate_repo(repo)
     hypr_root = ctx.config_hypr if prefer_local else repo / "hypr"
@@ -960,6 +1065,23 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
         "bins": bins,
         "terminals": terminals,
         "configs": configs,
+        "theme": inspect_theme(ctx, repo, prefer_local=prefer_local),
+    }
+
+
+def inspect_theme(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[str, Any]:
+    local_slug = read_theme_slug(ctx.theme_name_path)
+    repo_slug = read_theme_slug(repo / THEME_REL)
+    slug = local_slug if prefer_local else (repo_slug or local_slug)
+    custom = bool(slug) and (
+        (ctx.user_themes / slug).is_dir() or (repo / "omarchy" / "themes" / slug).is_dir()
+    )
+    return {
+        "slug": slug,
+        "display": theme_display_name(slug) or "—",
+        "local_slug": local_slug,
+        "repo_slug": repo_slug,
+        "custom": custom,
     }
 
 
@@ -1066,7 +1188,36 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         )
         if isinstance(manifest, dict) and manifest.get("name"):
             plugin["name"] = str(manifest.get("name"))
-    return {"files": files, "counts": counts, "shortcuts": shortcuts, "plugins": plugins}
+    theme_files = [f for f in files if f.get("group") == "theme"]
+    theme_diff = None
+    if any(f.get("status") not in {"identical", "machine"} for f in theme_files):
+        name_item = next((f for f in theme_files if f["path"] == THEME_REL), None)
+        statuses = [f.get("status") for f in theme_files if f.get("status") not in {"identical", "machine"}]
+        unique = set(statuses)
+        if "both" in unique or ("local" in unique and "repo" in unique) or ("added-local" in unique and "added-repo" in unique):
+            status = "both"
+        elif unique <= {"local", "added-local"}:
+            status = "added-local" if "added-local" in unique else "local"
+        elif unique <= {"repo", "added-repo"}:
+            status = "added-repo" if "added-repo" in unique else "repo"
+        else:
+            status = "differs"
+        local_slug = read_theme_slug(ctx.theme_name_path)
+        repo_slug = read_theme_slug(repo / THEME_REL)
+        slug = repo_slug or local_slug
+        theme_diff = {
+            "id": "selected",
+            "slug": slug,
+            "display": theme_display_name(slug) or slug,
+            "local_slug": local_slug,
+            "repo_slug": repo_slug,
+            "status": status,
+            "files": [f["path"] for f in theme_files],
+            "custom": any(f["path"].startswith("omarchy/themes/") for f in theme_files),
+            "default_apply": status in {"repo", "added-repo", "differs"} or (name_item or {}).get("default_apply"),
+            "default_publish": status in {"local", "added-local", "differs"} or (name_item or {}).get("default_publish"),
+        }
+    return {"files": files, "counts": counts, "shortcuts": shortcuts, "plugins": plugins, "theme": theme_diff}
 
 
 def rollup_sync_state(git_fields: dict[str, Any], counts: dict[str, int], has_baseline: bool) -> str:
@@ -1409,6 +1560,10 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         extra = expand_plugin_paths(diff["files"], plugin_ids, "apply")
         wanted = set() if wanted is None else set(wanted)
         wanted |= extra
+    if getattr(args, "theme", False) or (wanted is not None and THEME_REL in wanted):
+        extra_theme = expand_theme_paths(diff["files"], "apply")
+        wanted = set() if wanted is None else set(wanted)
+        wanted |= extra_theme
     if shortcut_keys and wanted is not None:
         wanted.discard("hypr/bindings.lua")
     unresolved_both = [
@@ -1476,11 +1631,23 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     notes = {}
     if not args.dry_run:
         notes = reload_desktop()
+        if THEME_REL in applied:
+            slug = read_theme_slug(ctx.theme_name_path)
+            theme_note = apply_omarchy_theme(slug, dry_run=False)
+            if theme_note:
+                notes["theme"] = theme_note
     snap = build_snapshot(ctx, fetch=False)
     snap["applied"] = applied
     snap["backup_dir"] = str(backup_dir)
     snap["reload"] = notes
-    snap["message"] = f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo."
+    theme_msg = ""
+    if THEME_REL in applied:
+        slug = read_theme_slug(ctx.theme_name_path)
+        if slug:
+            theme_msg = f" Theme set to {theme_display_name(slug)}."
+    snap["message"] = (
+        f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo.{theme_msg}"
+    )
     return snap
 
 
@@ -1520,6 +1687,10 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         extra = expand_plugin_paths(diff["files"], plugin_ids, "publish")
         wanted = set() if wanted is None else set(wanted)
         wanted |= extra
+    if getattr(args, "theme", False) or (wanted is not None and THEME_REL in wanted):
+        extra_theme = expand_theme_paths(diff["files"], "publish")
+        wanted = set() if wanted is None else set(wanted)
+        wanted |= extra_theme
     if shortcut_keys and wanted is not None:
         wanted.discard("hypr/bindings.lua")
     unresolved_both = [
@@ -1717,6 +1888,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--explicit", action="store_true")
     parser.add_argument("--shortcut", action="append", default=None)
     parser.add_argument("--plugin", action="append", default=None)
+    parser.add_argument("--theme", action="store_true")
     parser.add_argument("--message", default=None)
     parser.add_argument("--delete-clone", action="store_true")
     parser.add_argument("--side", default=None)

@@ -41,6 +41,7 @@ Panel {
   property var diffFiles: []
   property var shortcutDiffs: []
   property var pluginDiffs: []
+  property var themeDiff: null
   property string lastNotifiedKey: ""
 
   readonly property bool configured: !!(status && status.configured)
@@ -68,6 +69,7 @@ Panel {
       if (f.status === "identical" || f.status === "machine") continue
       if (!includeMachine && !f.portable) continue
       if (f.group === "plugin") continue
+      if (f.group === "theme") continue
       if (f.path === "hypr/bindings.lua") continue
       out.push(f)
     }
@@ -80,7 +82,7 @@ Panel {
   readonly property var localPlugins: Model.filesByStatus(pluginDiffs, ["local", "added-local"])
   readonly property var bothPlugins: Model.filesByStatus(pluginDiffs, ["both"])
   readonly property var differsPlugins: Model.filesByStatus(pluginDiffs, ["differs"])
-  readonly property bool hasReviewable: otherFiles.length + shortcutDiffs.length + pluginDiffs.length + conflictFiles.length > 0
+  readonly property bool hasReviewable: otherFiles.length + shortcutDiffs.length + pluginDiffs.length + conflictFiles.length + (themeDiff ? 1 : 0) > 0
   readonly property int unresolvedBoth: {
     var n = 0
     var i
@@ -93,6 +95,7 @@ Panel {
     for (i = 0; i < bothPlugins.length; i++) {
       if (isPicked("p", bothPlugins[i].id) && !bothPicks["p:" + bothPlugins[i].id]) n++
     }
+    if (themeDiff && themeDiff.status === "both" && isPicked("t", "selected") && !bothPicks["t:selected"]) n++
     return n
   }
 
@@ -152,6 +155,10 @@ Panel {
       key = pickId("p", item.id)
       next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish || item.status === "differs")
     }
+    if (themeDiff) {
+      key = pickId("t", "selected")
+      next[key] = (key in picks) ? picks[key] : !!(themeDiff.default_apply || themeDiff.default_publish || themeDiff.status === "differs")
+    }
     picks = next
   }
 
@@ -174,6 +181,8 @@ Panel {
         for (i = 0; i < otherFiles.length; i++)
           if (pickId("f", otherFiles[i].path) === key)
             return otherFiles[i].status
+      } else if (key === pickId("t", "selected") && themeDiff) {
+        return themeDiff.status
       }
       return ""
     }
@@ -264,6 +273,18 @@ Panel {
     return out
   }
 
+  function selectedApplyTheme() {
+    if (!themeDiff || !isPicked("t", "selected")) return false
+    if (themeDiff.status === "both") return bothPicks["t:selected"] === "repo"
+    return themeDiff.status === "added-repo" || themeDiff.status === "repo" || themeDiff.status === "differs"
+  }
+
+  function selectedPublishTheme() {
+    if (!themeDiff || !isPicked("t", "selected")) return false
+    if (themeDiff.status === "both") return bothPicks["t:selected"] === "local"
+    return themeDiff.status === "added-local" || themeDiff.status === "local" || themeDiff.status === "differs"
+  }
+
   function selectedPublishPlugins() {
     var out = []
     var i, p
@@ -295,7 +316,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length === 0) {
+    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length === 0 && !selectedApplyTheme()) {
       lastError = "Check the incoming shortcuts, plugins, or files you want to apply."
       activeTab = 1
       return
@@ -314,7 +335,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedPublishFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length === 0 && Number(status.ahead || 0) === 0) {
+    if (selectedPublishFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
       lastError = "Check the local shortcuts, plugins, or files you want to publish."
       activeTab = 1
       return
@@ -334,6 +355,7 @@ Panel {
       var ai
       for (ai = 0; ai < ashort.length; ai++) args.push("--shortcut", ashort[ai])
       for (ai = 0; ai < aplugs.length; ai++) args.push("--plugin", aplugs[ai])
+      if (selectedApplyTheme()) args.push("--theme")
       run(args)
     } else if (kind === "publish") {
       var pub = selectedPublishFiles()
@@ -344,6 +366,7 @@ Panel {
       var pi
       for (pi = 0; pi < pshort.length; pi++) pargs.push("--shortcut", pshort[pi])
       for (pi = 0; pi < pplugs.length; pi++) pargs.push("--plugin", pplugs[pi])
+      if (selectedPublishTheme()) pargs.push("--theme")
       run(pargs)
     } else if (kind === "disconnect") {
       run(["disconnect"])
@@ -374,6 +397,7 @@ Panel {
     diffFiles = (data.diff && data.diff.files) ? data.diff.files : []
     shortcutDiffs = (data.diff && data.diff.shortcuts) ? data.diff.shortcuts : []
     pluginDiffs = (data.diff && data.diff.plugins) ? data.diff.plugins : []
+    themeDiff = (data.diff && data.diff.theme) ? data.diff.theme : null
     if (data.sync_state && status)
       status = Object.assign({}, status, { sync_state: data.sync_state })
     if (!repoUrlInput && status.repo_url)
@@ -996,6 +1020,15 @@ Panel {
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }
         TablePair { label: "Last publish"; value: Model.relativeAgo(root.status.last_publish_at) }
+        TablePair {
+          label: "Theme"
+          value: {
+            if (!root.inspect || !root.inspect.theme) return "—"
+            var t = root.inspect.theme
+            var name = t.display || t.slug || "—"
+            return t.custom ? (name + " (custom overlay)") : name
+          }
+        }
         TablePair { label: "Bar position"; value: root.inspect && root.inspect.bar ? String(root.inspect.bar.position || "—") : "—" }
         TablePair {
           label: "Idle lock"
@@ -1144,6 +1177,29 @@ Panel {
               }
             }
           }
+        }
+      }
+
+      Column {
+        visible: !!root.themeDiff
+        width: parent.width
+        spacing: Style.space(6)
+        PanelSectionHeader { text: "THEME"; foreground: root.foreground; fontFamily: root.fontFamily }
+        PickRow {
+          width: parent.width
+          kind: "t"
+          itemId: "selected"
+          pathLabel: root.themeDiff ? ("Selected theme: " + String(root.themeDiff.display || root.themeDiff.slug || "")) : ""
+          summary: {
+            if (!root.themeDiff) return ""
+            var bits = []
+            if (root.themeDiff.local_slug) bits.push("this laptop " + root.themeDiff.local_slug)
+            if (root.themeDiff.repo_slug) bits.push("repo " + root.themeDiff.repo_slug)
+            if (root.themeDiff.custom) bits.push("includes custom overlay")
+            return bits.join(" · ")
+          }
+          statusLabel: root.themeDiff ? Model.fileStatusLabel(root.themeDiff.status) : ""
+          both: !!(root.themeDiff && root.themeDiff.status === "both")
         }
       }
 
