@@ -166,6 +166,15 @@ class ValidateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = cs.validate_repo(Path(tmp))
             self.assertFalse(result["valid"])
+            self.assertTrue(cs.is_seedable_empty(Path(tmp)))
+
+    def test_readme_only_is_seedable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root / "README.md", "# mine\n")
+            write(root / "LICENSE", "MIT\n")
+            self.assertTrue(cs.is_seedable_empty(root))
+            self.assertFalse(cs.validate_repo(root)["valid"])
 
     def test_random_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,9 +372,36 @@ class InspectAndSyncTests(unittest.TestCase):
             junk = env.home / "junk"
             init_repo(junk)
             write(junk / "README.md", "nope")
+            write(junk / "src" / "main.py", "print(1)\n")
             commit_all(junk, "readme")
             with self.assertRaises(cs.SyncError):
                 cs.cmd_connect(env.ctx, argparse_ns(args=[str(junk)]))
+
+    def test_connect_empty_repo_and_publish_seeds(self) -> None:
+        with TempHome() as env:
+            empty = env.home / "empty"
+            init_repo(empty)
+            write(empty / "README.md", "# my private omarchy config\n")
+            commit_all(empty, "Initial commit")
+            write(env.ctx.config_hypr / "bindings.lua", 'o.bind("SUPER + Y", "Seeded shortcut", "true")\n')
+            write(
+                env.ctx.config_omarchy / "shell.json",
+                json.dumps({"version": 1, "bar": {"layout": {"right": [{"id": "omarchy.audio"}]}}}),
+            )
+            snap = cs.cmd_connect(env.ctx, argparse_ns(args=[str(empty)]))
+            self.assertTrue(snap["ok"], snap)
+            self.assertEqual(snap["sync_state"], "empty")
+            self.assertTrue(snap.get("empty") or snap["status"].get("empty"))
+            self.assertEqual(snap["inspect"]["source"], "local")
+            labels = {s["keys"]: s["label"] for s in snap["inspect"]["shortcuts"]}
+            self.assertEqual(labels["SUPER + Y"], "Seeded shortcut")
+            published = cs.cmd_publish(env.ctx, argparse_ns())
+            self.assertTrue(published["ok"], published)
+            self.assertIn("hypr/bindings.lua", published["published"])
+            self.assertIn("SUPER + Y", (empty / "hypr" / "bindings.lua").read_text(encoding="utf-8"))
+            self.assertTrue((empty / cs.MARKER_NAME).is_file())
+            after = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertNotEqual(after["sync_state"], "empty")
 
     def test_clone_from_local_git_url(self) -> None:
         with TempHome() as env:

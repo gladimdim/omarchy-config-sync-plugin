@@ -1,6 +1,8 @@
 # Omarchy Config Sync (`gladimdim.config-sync`)
 
-A status-bar plugin that keeps [Omarchy](https://omarchy.org/) configs in a git repo — the same layout as [`omarchy-config`](https://github.com/gladimdim/omarchy-config) — in sync across laptops.
+A status-bar plugin that keeps [Omarchy](https://omarchy.org/) configs in a **private** git repo — the same layout as [`omarchy-config`](https://github.com/gladimdim/omarchy-config) — in sync across laptops.
+
+**New here?** Follow the [first-time setup guide](GETTING-STARTED.md): create an empty **private** GitHub repo, paste its URL into the tray icon, review this laptop, then **Publish this laptop**. Keep that repo private so shortcuts, hooks, and scripts are not public.
 
 Click the cloud-sync tray icon, paste the git URL of your config repo, preview what would land on this machine, then **Apply**. When you add a shortcut or plugin locally, open the panel again and **Publish** to send it to the next laptop.
 
@@ -32,6 +34,14 @@ Place it next to the tray:
 ```bash
 omarchy plugin enable gladimdim.config-sync --section right
 ```
+
+## First laptop vs next laptop
+
+| | First laptop | Next laptop |
+| --- | --- | --- |
+| GitHub repo | Create **empty + Private** (see [GETTING-STARTED.md](GETTING-STARTED.md)) | Same URL |
+| After Connect | Tabs show **this machine** | Tabs show **the repo** |
+| Primary button | **Publish this laptop** (seed + push) | **Apply** (backup, then copy onto the machine) |
 
 ## Daily flow
 
@@ -78,6 +88,8 @@ Shipped on Omarchy: `python3`, `git`. SSH or a git credential helper is required
 python3 -m unittest tests.test_config_sync -v
 omarchy plugin validate .
 ```
+
+Starter guide for end users: [GETTING-STARTED.md](GETTING-STARTED.md).
 
 ## License
 

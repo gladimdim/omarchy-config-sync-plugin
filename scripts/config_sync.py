@@ -356,7 +356,73 @@ def validate_repo(path: Path) -> dict[str, Any]:
         "hypr_files": hypr_files,
         "plugin_ids": plugin_ids,
         "has_shell": shell.is_file(),
+        "empty": False,
     }
+
+
+STARTER_FILE_NAMES = {
+    "readme",
+    "readme.md",
+    "readme.txt",
+    "license",
+    "license.md",
+    "licence",
+    "licence.md",
+    "copying",
+    "copying.md",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    "code_of_conduct.md",
+    "security.md",
+    "contributing.md",
+    "authors",
+    "changelog.md",
+}
+
+STARTER_TOP_DIRS = {".github", ".git", "docs"}
+PROJECT_MARKERS = {
+    "hypr",
+    "omarchy",
+    "plugins",
+    "apply.sh",
+    "sync.sh",
+    "src",
+    "lib",
+    "app",
+    "package.json",
+    "cargo.toml",
+    "pyproject.toml",
+    "go.mod",
+    "makefile",
+    "cmakelists.txt",
+}
+
+
+def is_seedable_empty(path: Path) -> bool:
+    """True for a brand-new GitHub repo: empty, or only README/LICENSE/.gitignore."""
+    if not path.is_dir():
+        return False
+    if validate_repo(path).get("valid"):
+        return False
+    for child in path.iterdir():
+        name = child.name
+        if name in {".git", ".github"}:
+            continue
+        if name.lower() in PROJECT_MARKERS:
+            return False
+        if child.is_dir() and name.lower() not in STARTER_TOP_DIRS:
+            return False
+        if child.is_file() and name.lower() not in STARTER_FILE_NAMES:
+            return False
+    for file_path in iter_files(path):
+        rel = rel_posix(file_path, path).lower()
+        if rel.startswith(".github/"):
+            continue
+        if Path(rel).name.lower() in STARTER_FILE_NAMES:
+            continue
+        return False
+    return True
 
 
 def write_marker(repo: Path) -> None:
@@ -622,19 +688,23 @@ def parse_shortcuts(text: str) -> list[dict[str, str]]:
     return out
 
 
-def inspect_repo(ctx: Context, repo: Path) -> dict[str, Any]:
+def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[str, Any]:
     validation = validate_repo(repo)
+    hypr_root = ctx.config_hypr if prefer_local else repo / "hypr"
+    omarchy_root = ctx.config_omarchy if prefer_local else repo / "omarchy"
+    plugins_dir = ctx.config_plugins if prefer_local else repo / "plugins"
     shortcuts: list[dict[str, str]] = []
-    bindings = repo / "hypr" / "bindings.lua"
+    bindings = hypr_root / "bindings.lua"
     if bindings.is_file():
         shortcuts = parse_shortcuts(read_text(bindings))
 
     plugins = []
-    plugins_dir = repo / "plugins"
     if plugins_dir.is_dir():
         for child in sorted(plugins_dir.iterdir()):
             manifest_path = child / "manifest.json"
             if not child.is_dir() or not manifest_path.is_file():
+                continue
+            if child.name in PROTECTED_PLUGINS:
                 continue
             manifest = load_json(manifest_path, default={}) or {}
             plugins.append(
@@ -649,7 +719,7 @@ def inspect_repo(ctx: Context, repo: Path) -> dict[str, Any]:
 
     bar = {"position": "", "widgets": {"left": [], "center": [], "right": []}}
     idle = {}
-    shell = load_json(repo / "omarchy" / "shell.json", default={}) or {}
+    shell = load_json(omarchy_root / "shell.json", default={}) or {}
     if isinstance(shell, dict):
         idle = shell.get("idle") or {}
         bar_cfg = shell.get("bar") or {}
@@ -665,7 +735,7 @@ def inspect_repo(ctx: Context, repo: Path) -> dict[str, Any]:
             bar["widgets"][section] = ids
 
     hooks = []
-    hooks_root = repo / "omarchy" / "hooks"
+    hooks_root = omarchy_root / "hooks"
     if hooks_root.is_dir():
         for event_dir in sorted(hooks_root.iterdir()):
             if not event_dir.is_dir():
@@ -687,13 +757,15 @@ def inspect_repo(ctx: Context, repo: Path) -> dict[str, Any]:
         bins = [p.name for p in sorted(repo_bin.iterdir()) if p.is_file()]
 
     terminals = []
-    for rel in terminal_map(ctx):
-        if (repo / rel).is_file():
+    for rel, local in terminal_map(ctx).items():
+        present = local.is_file() if prefer_local else (repo / rel).is_file()
+        if present:
             terminals.append(Path(rel).stem.replace("ghostty.config", "ghostty"))
 
     configs = []
     for item in collect_inventory(ctx, repo):
-        if item["group"] in {"hypr", "omarchy", "terminal"} and item["repo_exists"]:
+        wanted = item["local_exists"] if prefer_local else item["repo_exists"]
+        if item["group"] in {"hypr", "omarchy", "terminal"} and wanted:
             configs.append(
                 {
                     "path": item["path"],
@@ -707,6 +779,8 @@ def inspect_repo(ctx: Context, repo: Path) -> dict[str, Any]:
         "valid": validation["valid"],
         "score": validation["score"],
         "reasons": validation["reasons"],
+        "empty": is_seedable_empty(repo),
+        "source": "local" if prefer_local else "repo",
         "shortcuts": shortcuts,
         "plugins": plugins,
         "bar": bar,
@@ -868,14 +942,18 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
     git_fields = git_status_fields(repo, fetch_error)
     git_fields = maybe_fast_forward(repo, git_fields)
     validation = validate_repo(repo)
-    inspect = inspect_repo(ctx, repo)
+    empty = is_seedable_empty(repo)
+    inspect = inspect_repo(ctx, repo, prefer_local=empty)
     diff = annotate_diff(ctx, repo, state)
     sync_state = rollup_sync_state(git_fields, diff["counts"], has_baseline=bool(state.get("file_hashes")))
-    if not validation["valid"]:
+    if empty:
+        sync_state = "empty"
+    elif not validation["valid"]:
         sync_state = "invalid"
     status = {
         "configured": True,
         "sync_state": sync_state,
+        "empty": empty,
         "repo_url": state.get("repo_url") or git_fields.get("origin_url") or "",
         "clone_path": str(repo),
         "using_existing_clone": bool(state.get("using_existing_clone")),
@@ -920,28 +998,7 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             probe = run_git(repo, ["rev-parse", "--is-inside-work-tree"])
             if probe.returncode != 0:
                 raise SyncError(f"{repo} is not a git repository.")
-        validation = validate_repo(repo)
-        if not validation["valid"]:
-            raise SyncError(
-                "That folder does not look like an Omarchy config repo. "
-                "It needs Hyprland configs plus shell.json, plugins, or apply.sh "
-                "(the layout used by omarchy-config).",
-                extra={"validation": validation},
-            )
-        origin = git_out(repo, "remote", "get-url", "origin")
-        state = {
-            "repo_url": origin or str(repo),
-            "clone_path": str(repo),
-            "using_existing_clone": True,
-            "connected_at": now_iso(),
-            "file_hashes": {},
-            "hostname": socket.gethostname(),
-        }
-        save_state(ctx, state)
-        snap = build_snapshot(ctx, fetch=True)
-        snap["connected"] = True
-        snap["validation"] = validation
-        return snap
+        return finish_connect(ctx, repo, git_out(repo, "remote", "get-url", "origin") or str(repo), using_existing=True, fetch=True)
 
     clone_path = ctx.default_clone
     existing_state = load_state(ctx)
@@ -969,28 +1026,43 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 shutil.rmtree(clone_path, ignore_errors=True)
             raise SyncError(git_error_message(["clone", value], result))
 
-    validation = validate_repo(clone_path)
-    if not validation["valid"]:
-        # Only delete clones we just created in the default location.
-        if not existing_state.get("using_existing_clone"):
+    try:
+        return finish_connect(ctx, clone_path, value, using_existing=False, fetch=False)
+    except SyncError:
+        if clone_path.exists() and not existing_state.get("using_existing_clone"):
             shutil.rmtree(clone_path, ignore_errors=True)
+        raise
+
+
+def finish_connect(ctx: Context, repo: Path, repo_url: str, using_existing: bool, fetch: bool) -> dict[str, Any]:
+    validation = validate_repo(repo)
+    empty = is_seedable_empty(repo)
+    if not validation["valid"] and not empty:
         raise SyncError(
-            "Cloned the repo, but it is not an Omarchy config repo. "
-            "Expected hypr/ configs plus omarchy/shell.json, plugins/, or apply.sh.",
+            "That git repo is not an Omarchy config repo, and it is not empty either. "
+            "Use a private repo that is empty (to seed from this laptop) or one that already "
+            "has hypr/ configs plus shell.json, plugins/, or apply.sh.",
             extra={"validation": validation},
         )
     state = {
-        "repo_url": value,
-        "clone_path": str(clone_path),
-        "using_existing_clone": False,
+        "repo_url": repo_url,
+        "clone_path": str(repo),
+        "using_existing_clone": using_existing,
         "connected_at": now_iso(),
         "file_hashes": {},
         "hostname": socket.gethostname(),
+        "empty_seed": empty,
     }
     save_state(ctx, state)
-    snap = build_snapshot(ctx, fetch=False)
+    snap = build_snapshot(ctx, fetch=fetch)
     snap["connected"] = True
     snap["validation"] = validation
+    snap["empty"] = empty
+    if empty:
+        snap["message"] = (
+            "Linked an empty private repo. Review the Shortcuts, Plugins, and Configs tabs "
+            "(this laptop), then Publish to seed the repo. Keep it private."
+        )
     return snap
 
 
@@ -1249,7 +1321,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "publish")
     if not chosen:
         if args.push and git_fields["ahead"] and not git_fields["behind"]:
-            result = run_git(repo, ["push", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
+            result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
             snap = build_snapshot(ctx, fetch=False)
             if result.returncode != 0:
                 snap["push_error"] = git_error_message(["push"], result)
@@ -1298,7 +1370,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     pushed = False
     push_error = None
     if args.push:
-        result = run_git(repo, ["push", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
+        result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
         if result.returncode != 0:
             push_error = git_error_message(["push"], result)
         else:

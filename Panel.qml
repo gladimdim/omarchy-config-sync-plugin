@@ -43,7 +43,7 @@ Panel {
   readonly property bool configured: !!(status && status.configured)
   readonly property string syncState: String((status && status.sync_state) || (configured ? "in-sync" : "not-configured"))
   readonly property bool alarming: syncState === "conflicts" || syncState === "diverged" || syncState === "invalid"
-  readonly property bool pending: syncState === "ready" || syncState === "remote-ahead" || syncState === "local-ahead" || alarming
+  readonly property bool pending: syncState === "ready" || syncState === "empty" || syncState === "remote-ahead" || syncState === "local-ahead" || alarming
   readonly property color stateColor: alarming ? urgent : (pending ? accent : foreground)
   readonly property var tabs: [
     { name: "Overview", icon: "󰘿" },
@@ -200,6 +200,7 @@ Panel {
     var key = syncState + ":" + String(status.head || "") + ":" + String(status.local_changes || 0) + ":" + String(status.repo_changes || 0)
     if (key === lastNotifiedKey) return
     if (syncState === "in-sync" || syncState === "not-configured") return
+    if (syncState === "empty" && !root.opened) return
     lastNotifiedKey = key
     var title = Model.stateTitle(syncState)
     var body = Model.stateHint(syncState, status)
@@ -468,66 +469,113 @@ Panel {
         }
 
         // ---------------- SETUP ----------------
-        Column {
+        Flickable {
           visible: !root.configured
           width: parent.width
-          spacing: Style.space(12)
+          height: Math.max(80, panel.contentHeight - mainCol.spacing * 4 - heroInfo.implicitHeight - Style.space(36))
+          contentWidth: width
+          contentHeight: setupCol.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          flickableDirection: Flickable.VerticalFlick
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-          Text {
+          Column {
+            id: setupCol
             width: parent.width
-            textFormat: Text.PlainText
-            text: "Link the git repo that stores your Omarchy configs. The plugin clones it, checks that it really is an omarchy-config tree, then shows shortcuts, plugins, and files before anything is applied."
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
+            spacing: Style.space(12)
 
-          TextField {
-            id: urlField
-            width: parent.width
-            placeholderText: "https://github.com/you/omarchy-config.git"
-            text: root.repoUrlInput
-            foreground: root.foreground
-            font.family: root.fontFamily
-            enabled: !root.busy
-            onTextChanged: root.repoUrlInput = text
-            onAccepted: root.connectRepo()
-            Keys.onPressed: function(event) {
-              if (event.key === Qt.Key_Escape) {
-                keyCatcher.forceActiveFocus()
-                event.accepted = true
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "First time: create a private GitHub repo for your Omarchy configs, then paste its URL here. The plugin will not make that repo public."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            GuideStep {
+              step: "1"
+              title: "Create a private GitHub repo"
+              body: "github.com/new → name it omarchy-config → visibility Private → leave README / .gitignore / license unchecked → Create repository. Private keeps shortcuts, hooks, and scripts off the public internet."
+            }
+
+            Row {
+              spacing: Style.space(8)
+              Button {
+                text: "Open GitHub"
+                iconText: "󰊤"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                onClicked: Quickshell.execDetached(["xdg-open", "https://github.com/new"])
+              }
+              Button {
+                text: "Copy gh auth login"
+                tooltipText: "The plugin cannot ask for a GitHub password (that would freeze the bar). Paste this in a terminal, finish the browser login, then Connect."
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: {
+                  Quickshell.execDetached(["wl-copy", "gh auth login"])
+                  root.lastMessage = "Copied gh auth login — run it in a terminal, finish the browser login, then come back and Connect."
+                }
               }
             }
-          }
 
-          Row {
-            spacing: Style.space(8)
-            Button {
-              text: root.busy ? "Connecting…" : "Connect repo"
-              iconText: "󰓦"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              enabled: !root.busy && String(root.repoUrlInput).trim() !== ""
-              bordered: true
-              onClicked: root.connectRepo()
+            GuideStep {
+              step: "2"
+              title: "Paste the repo URL"
+              body: "HTTPS (https://github.com/you/omarchy-config.git), SSH, or owner/repo. An empty private repo is what you want on the first laptop. On the next laptop, paste this same URL and Apply."
             }
-            Button {
-              text: "Use this laptop's clone"
+
+            TextField {
+              id: urlField
+              width: parent.width
+              placeholderText: "https://github.com/you/omarchy-config.git"
+              text: root.repoUrlInput
               foreground: root.foreground
-              fontFamily: root.fontFamily
+              font.family: root.fontFamily
               enabled: !root.busy
-              onClicked: {
-                root.repoUrlInput = Quickshell.env("HOME") + "/Github/omarchy-config"
-                urlField.text = root.repoUrlInput
+              onTextChanged: root.repoUrlInput = text
+              onAccepted: root.connectRepo()
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
               }
             }
-          }
 
-          CardBox {
-            TablePair { label: "Accepted"; value: "GitHub URL, SSH, owner/repo, or a local git path" }
-            TablePair { label: "Required layout"; value: "hypr/ + shell.json, plugins/, or apply.sh" }
-            TablePair { label: "Then"; value: "Preview features → Apply, or publish local edits back" }
+            Row {
+              spacing: Style.space(8)
+              Button {
+                text: root.busy ? "Connecting…" : "Connect repo"
+                iconText: "󰓦"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !root.busy && String(root.repoUrlInput).trim() !== ""
+                bordered: true
+                onClicked: root.connectRepo()
+              }
+              Button {
+                text: "Use this laptop's clone"
+                tooltipText: "If you already keep configs in ~/Github/omarchy-config"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !root.busy
+                onClicked: {
+                  root.repoUrlInput = Quickshell.env("HOME") + "/Github/omarchy-config"
+                  urlField.text = root.repoUrlInput
+                }
+              }
+            }
+
+            GuideStep {
+              step: "3"
+              title: "Review, then Publish this laptop"
+              body: "Empty repo: the tabs show this machine. Publish seeds GitHub (still private). Next laptop: Connect the same URL and press Apply. Display layout is skipped unless you opt in."
+            }
           }
         }
 
@@ -624,7 +672,9 @@ Panel {
               text: root.confirmKind === "apply"
                 ? "Apply repo configs to this laptop? A timestamped backup is written first. Display layout stays local unless you opted in."
                 : root.confirmKind === "publish"
-                  ? "Copy this laptop's changes into the repo, commit, and push so your other machines can pull them?"
+                  ? (root.syncState === "empty"
+                    ? "Seed this private GitHub repo with this laptop's Omarchy config, then push? Keep the repo private so shortcuts, hooks, and scripts are not public."
+                    : "Copy this laptop's changes into the repo, commit, and push so your other machines can pull them?")
                   : "Unlink the config repo on this laptop? Local files are left as they are."
               color: root.foreground
               font.family: root.fontFamily
@@ -638,7 +688,7 @@ Panel {
               width: parent.width
 
               Button {
-                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "publish" ? "Publish" : "Apply")
+                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply")
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
@@ -710,6 +760,7 @@ Panel {
         spacing: Style.space(8)
 
         Button {
+          visible: root.syncState !== "empty"
           text: "Apply"
           iconText: "󰁨"
           tooltipText: "Copy repo → this laptop (a)"
@@ -720,9 +771,11 @@ Panel {
           onClicked: root.requestApply()
         }
         Button {
-          text: "Publish"
+          text: root.syncState === "empty" ? "Publish this laptop" : "Publish"
           iconText: "󰓂"
-          tooltipText: "Copy this laptop → repo and push (p)"
+          tooltipText: root.syncState === "empty"
+            ? "Seed the empty private repo from this machine, then push"
+            : "Copy this laptop → repo and push (p)"
           foreground: root.foreground
           fontFamily: root.fontFamily
           bordered: true
@@ -1034,6 +1087,54 @@ Panel {
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+    }
+  }
+
+  component GuideStep: Row {
+    property string step: ""
+    property string title: ""
+    property string body: ""
+    width: parent ? parent.width : 100
+    spacing: Style.space(10)
+
+    Rectangle {
+      width: Style.space(22)
+      height: Style.space(22)
+      radius: width / 2
+      color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
+      anchors.top: parent.top
+      Text {
+        anchors.centerIn: parent
+        text: step
+        color: root.accent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+    }
+
+    Column {
+      width: parent.width - Style.space(32)
+      spacing: Style.space(3)
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: title
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        wrapMode: Text.WordWrap
+      }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: body
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
       }
     }
