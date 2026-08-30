@@ -58,8 +58,7 @@ def make_config_repo(root: Path, *, with_monitor: bool = True) -> Path:
         '-- header\n'
         'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n'
         'o.bind("CTRL + 9", "English layout", "hyprctl switchxkblayout all 0")\n'
-        'hl.unbind("SUPER + 6")\n'
-        'o.bind("SUPER + SHIFT + R", "Region screen recording", "dup")\n',
+        'hl.unbind("SUPER + 6")\n',
     )
     write(root / "hypr" / "looknfeel.lua", "hl.decoration({ rounding = 8 })\n")
     if with_monitor:
@@ -204,7 +203,7 @@ class ValidateTests(unittest.TestCase):
 
 class ShortcutTests(unittest.TestCase):
     def test_parse_dedupes_and_labels(self) -> None:
-        text = (OMARCHY_CONFIG / "hypr" / "bindings.lua").read_text(encoding="utf-8") if OMARCHY_CONFIG.is_dir() else (
+        text = (
             'o.bind("SUPER + SHIFT + R", "Region screen recording", "x")\n'
             'o.bind("SUPER + SHIFT + R", "dup", "x")\n'
             'hl.unbind("SUPER + 6")\n'
@@ -213,14 +212,50 @@ class ShortcutTests(unittest.TestCase):
         rows = cs.parse_shortcuts(text)
         keys = [r["keys"] for r in rows]
         self.assertEqual(len(keys), len(set(keys)))
-        if OMARCHY_CONFIG.is_dir():
-            labels = {r["keys"]: r["label"] for r in rows}
-            self.assertEqual(labels["SUPER + SHIFT + R"], "Region screen recording")
-            self.assertEqual(labels["CTRL + 9"], "English layout")
+        labels = {r["keys"]: r["label"] for r in rows}
+        self.assertEqual(labels["SUPER + SHIFT + R"], "dup")
+        self.assertEqual(labels["CTRL + 9"], "Custom binding")
+
+    def test_unbind_then_bind_keeps_the_bind(self) -> None:
+        rows = cs.extract_bind_statements(
+            'hl.unbind("XF86MonBrightnessUp")\n'
+            'o.bind("XF86MonBrightnessUp", "Brightness up", "up")\n'
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "bind")
+        self.assertEqual(rows[0]["label"], "Brightness up")
+        self.assertIn("o.bind", rows[0]["raw"])
 
     def test_unbind_without_bind(self) -> None:
         rows = cs.parse_shortcuts('hl.unbind("SUPER + SHIFT + B")\n')
         self.assertEqual(rows, [{"keys": "SUPER + SHIFT + B", "label": "Unbound default", "kind": "unbind"}])
+
+    def test_rebind_vs_unbind_only_is_a_shortcut_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "local.lua"
+            repo = Path(tmp) / "repo.lua"
+            write(
+                local,
+                'hl.unbind("XF86MonBrightnessUp")\n'
+                'o.bind("XF86MonBrightnessUp", "Brightness up", "up")\n',
+            )
+            write(repo, 'hl.unbind("XF86MonBrightnessUp")\n')
+            stored = cs.file_hash(local, "hypr/bindings.lua")
+            rows = {r["keys"]: r for r in cs.shortcut_diff(local, repo, stored)}
+            self.assertIn("XF86MonBrightnessUp", rows)
+            self.assertEqual(rows["XF86MonBrightnessUp"]["status"], "repo")
+            self.assertEqual(rows["XF86MonBrightnessUp"]["repo_label"], "Unbound default")
+            self.assertEqual(rows["XF86MonBrightnessUp"]["local_label"], "Brightness up")
+
+    def test_comment_only_bindings_file_has_no_shortcut_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "local.lua"
+            repo = Path(tmp) / "repo.lua"
+            write(local, '-- local note\no.bind("SUPER + A", "Alpha", "a")\n')
+            write(repo, '-- repo note\no.bind("SUPER + A", "Alpha", "a")\n')
+            stored = cs.file_hash(local, "hypr/bindings.lua")
+            self.assertEqual(cs.shortcut_diff(local, repo, stored), [])
+            self.assertNotEqual(cs.file_hash(local, "hypr/bindings.lua"), cs.file_hash(repo, "hypr/bindings.lua"))
 
     def test_incoming_changed_and_added_are_not_both(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,6 +326,17 @@ class ShortcutTests(unittest.TestCase):
         self.assertIn('o.bind("SUPER + B", "Beta 2", "b2")', merged)
         self.assertIn('o.bind("SUPER + C", "Gamma", "c")', merged)
         self.assertNotIn('o.bind("SUPER + B", "Beta", "b")', merged)
+
+    def test_upsert_keeps_unbind_when_replacing_bind(self) -> None:
+        dest = (
+            'hl.unbind("SUPER + SHIFT + C")\n'
+            'o.bind("SUPER + SHIFT + C", "Screenshot", "old")\n'
+        )
+        src = extract_map('o.bind("SUPER + SHIFT + C", "Screenshot", "new")\n')
+        merged = cs.upsert_shortcut_lines(dest, src, ["SUPER + SHIFT + C"])
+        self.assertIn('hl.unbind("SUPER + SHIFT + C")', merged)
+        self.assertIn('o.bind("SUPER + SHIFT + C", "Screenshot", "new")', merged)
+        self.assertNotIn('"old"', merged)
 
 
 def extract_map(text: str) -> dict:

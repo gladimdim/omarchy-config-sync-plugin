@@ -214,6 +214,15 @@ function isItemHidden(kind, id, hiddenMap, item) {
   return false
 }
 
+function hasVisibleShortcutDiffs(shortcuts, hiddenMap) {
+  var list = shortcuts || []
+  for (var i = 0; i < list.length; i++) {
+    if (isItemHidden("s", list[i].keys, hiddenMap, list[i])) continue
+    return true
+  }
+  return false
+}
+
 function appendThemes(out, list, hiddenMap) {
   var rows = list || []
   for (var i = 0; i < rows.length; i++) {

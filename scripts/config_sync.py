@@ -44,7 +44,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.4"
+PLUGIN_VERSION = "1.2.5"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -886,9 +886,13 @@ def parse_shortcuts(text: str) -> list[dict[str, str]]:
 
 
 def extract_bind_statements(text: str) -> list[dict[str, Any]]:
-    """One-line o.bind / hl.unbind entries, first occurrence of each key wins."""
-    seen: set[str] = set()
-    out: list[dict[str, Any]] = []
+    """One-line o.bind / hl.unbind entries. Last occurrence of each key wins.
+
+    Omarchy rebinds a default with `hl.unbind` then `o.bind` for the same key.
+    Hyprland executes in order, so the later statement is the effective shortcut.
+    """
+    by_key: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for index, line in enumerate(text.splitlines()):
         stripped = line.strip()
         if stripped.startswith("--"):
@@ -905,19 +909,16 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
             kind = "unbind"
         else:
             continue
-        if keys in seen:
-            continue
-        seen.add(keys)
-        out.append(
-            {
-                "keys": keys,
-                "label": label,
-                "kind": kind,
-                "line": index,
-                "raw": line.rstrip("\n"),
-            }
-        )
-    return out
+        if keys not in by_key:
+            order.append(keys)
+        by_key[keys] = {
+            "keys": keys,
+            "label": label,
+            "kind": kind,
+            "line": index,
+            "raw": line.rstrip("\n"),
+        }
+    return [by_key[key] for key in order]
 
 
 def shortcut_diff(local_path: Path, repo_path: Path, stored_hash: str | None = None) -> list[dict[str, Any]]:

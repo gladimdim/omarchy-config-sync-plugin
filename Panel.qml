@@ -81,7 +81,10 @@ Panel {
       if (!includeMachine && !f.portable) continue
       if (Model.isBundledPath(f.path)) continue
       if (f.group === "theme" && f.path !== "omarchy/theme.name") continue
-      if (f.path === "hypr/bindings.lua") continue
+      // Per-shortcut rows replace the whole bindings.lua file. If the parser
+      // found no bind-level drift (comments, or unbind-then-bind that used to
+      // collapse), keep the file so Incoming/Outgoing is not an empty header.
+      if (f.path === "hypr/bindings.lua" && Model.hasVisibleShortcutDiffs(shortcutDiffs, hiddenMap)) continue
       out.push(f)
     }
     return out
@@ -1365,7 +1368,7 @@ Panel {
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }
         TablePair { label: "Last publish"; value: Model.relativeAgo(root.status.last_publish_at) }
-        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.4") }
+        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.5") }
         TablePair {
           label: "Theme"
           value: {
