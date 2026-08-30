@@ -5,7 +5,7 @@
   "version": "1.2.4",
   "author": "Dmytro Gladkyi",
   "license": "MIT",
-  "description": "Link a git repo of Omarchy configs, preview shortcuts/plugins/files, apply them to this machine, and publish local changes back for your other machines.",
+  "description": "Seamlessly sync all your Omarchy configurations, shortcuts, themes, and plugins between your machines.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Omarchy Config Sync",
-    "description": "Sync Omarchy configs across machines from a git repo",
+    "description": "Sync all Omarchy configurations between your machines",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",

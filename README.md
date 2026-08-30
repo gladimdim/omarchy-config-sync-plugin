@@ -1,6 +1,6 @@
 # Omarchy Config Sync (`gladimdim.config-sync`)
 
-A status-bar plugin that keeps [Omarchy](https://omarchy.org/) configs in a **private** git repo — the same layout as [`omarchy-config`](https://github.com/gladimdim/omarchy-config) — in sync across machines.
+A status-bar plugin to seamlessly sync all your Omarchy configurations, shortcuts, themes, and plugins between your machines using a private Git repository.
 
 **New here?** Follow the [first-time setup guide](GETTING-STARTED.md): create an empty **private** GitHub repo, paste its URL into the tray icon, review this machine, then **Publish this machine**. Keep that repo private so shortcuts, hooks, and scripts are not public.
 
