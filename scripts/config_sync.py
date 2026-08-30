@@ -43,7 +43,7 @@ UNBIND_RE = re.compile(r"""hl\.unbind\(\s*"([^"]+)"\s*\)""")
 SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules"}
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
-PROTECTED_PLUGINS = set()  # this plugin is synced so UI updates travel with config
+PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
 PLUGIN_VERSION = "1.2.4"
 
 FILE_SUMMARIES = {
@@ -717,10 +717,18 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     plugin_ids: set[str] = set()
     repo_plugins = repo / "plugins"
     if repo_plugins.is_dir():
-        plugin_ids.update(p.name for p in repo_plugins.iterdir() if p.is_dir() and not p.name.startswith("."))
+        plugin_ids.update(
+            p.name for p in repo_plugins.iterdir() if p.is_dir() and not p.name.startswith(".") and p.name != PLUGIN_ID
+        )
     if ctx.config_plugins.is_dir():
-        plugin_ids.update(p.name for p in ctx.config_plugins.iterdir() if p.is_dir() and not p.name.startswith("."))
+        plugin_ids.update(
+            p.name
+            for p in ctx.config_plugins.iterdir()
+            if p.is_dir() and not p.name.startswith(".") and p.name != PLUGIN_ID
+        )
     for plugin_id in sorted(plugin_ids):
+        if plugin_id == PLUGIN_ID:
+            continue
         repo_plugin = repo_plugins / plugin_id
         local_plugin = ctx.config_plugins / plugin_id
         rels = set()
@@ -1047,6 +1055,8 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
             g["git_managed"] = True
     out = []
     for pid, g in sorted(groups.items()):
+        if pid == PLUGIN_ID:
+            continue
         statuses = [s for s in g["statuses"] if s not in {"identical", "machine"}]
         status = _rollup_statuses(g["statuses"])
         if not status:
@@ -1060,8 +1070,7 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "file_count": len(g["files"]),
                 "changed_count": len(statuses),
                 "git_managed": g["git_managed"],
-                "default_apply": status in {"repo", "added-repo", "differs", "both"}
-                and (not g["git_managed"] or pid == PLUGIN_ID),
+                "default_apply": status in {"repo", "added-repo", "differs", "both"} and not g["git_managed"],
                 "default_publish": status in {"local", "added-local", "differs", "both"},
             }
         )
@@ -1076,6 +1085,8 @@ def file_bundles(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         parts = path.split("/")
         if path.startswith("plugins/") and len(parts) >= 2 and parts[1]:
             pid = parts[1]
+            if pid == PLUGIN_ID:
+                return None
             return "plugin:" + pid, "plugin", pid
         if path.startswith("omarchy/hooks/") and len(parts) >= 3:
             event = parts[2]
@@ -1407,7 +1418,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             default_apply_status(status)
             and item["portable"]
             and item["repo_exists"]
-            and (not item.get("git_managed") or plugin_id == PLUGIN_ID)
+            and not item.get("git_managed")
             and not item["hidden"]
         )
         item["default_publish"] = default_publish_status(status) and item["local_exists"] and not item["hidden"]

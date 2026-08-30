@@ -391,7 +391,7 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertTrue(os.access(env.ctx.local_bin / "useful-tool", os.X_OK))
             self.assertTrue(Path(applied["backup_dir"]).is_dir())
 
-    def test_publish_local_shortcut_and_includes_config_sync_plugin(self) -> None:
+    def test_publish_local_shortcut_and_ignores_config_sync_plugin(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
             cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
@@ -409,10 +409,27 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertIn("hypr/bindings.lua", published["published"])
             repo_bindings = (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8")
             self.assertIn("SUPER + Y", repo_bindings)
-            self.assertTrue((repo / "plugins" / cs.PLUGIN_ID / "manifest.json").is_file())
+            # config-sync plugin must NOT be published to repo
+            self.assertFalse((repo / "plugins" / cs.PLUGIN_ID / "manifest.json").is_file())
             self.assertTrue(published["committed"])
             log = git(repo, "log", "-1", "--pretty=%s").stdout
             self.assertIn("Sync config from", log)
+
+    def test_self_plugin_is_ignored_from_diffs_and_bundles(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_apply(env.ctx, argparse_ns())
+
+            # Put different content locally and on repo in config-sync plugin directory
+            write(env.ctx.config_plugins / cs.PLUGIN_ID / "Panel.qml", "// local version")
+            write(repo / "plugins" / cs.PLUGIN_ID / "Panel.qml", "// repo version")
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            paths = [f["path"] for f in snap["diff"]["files"] if cs.PLUGIN_ID in f["path"]]
+            self.assertEqual(paths, [])
+            bundles = [b["id"] for b in snap["diff"]["bundles"] if cs.PLUGIN_ID in b["id"]]
+            self.assertEqual(bundles, [])
 
     def test_resync_from_repo_takes_both_and_incoming(self) -> None:
         with TempHome() as env:

@@ -204,7 +204,7 @@ function appendLooseFiles(out, files, both, hiddenMap) {
   for (var i = 0; i < rows.length; i++) {
     var f = rows[i]
     var p = String(f.path || "")
-    if (!p || isBundledPath(p)) continue
+    if (!p || isBundledPath(p) || p.indexOf("plugins/gladimdim.config-sync") === 0) continue
     if (isItemHidden("f", p, hiddenMap, f)) continue
     out.push(reviewItem("f", p, p, f.summary || "", f.status, "File", both || f.status === "both", 0, false))
   }
@@ -221,7 +221,7 @@ function appendPluginFilesAsFolders(out, files, both, alreadyBundled, hiddenMap)
     var p = String(f.path || "")
     if (p.indexOf("plugins/") !== 0) continue
     var pid = p.split("/")[1] || ""
-    if (!pid || covered[pid]) continue
+    if (!pid || pid === "gladimdim.config-sync" || covered[pid]) continue
     if (isItemHidden("g", "plugin:" + pid, hiddenMap, f)) continue
     if (isItemHidden("f", p, hiddenMap, f)) continue
     var bid = "plugin:" + pid
@@ -239,7 +239,7 @@ function appendPluginFilesAsFolders(out, files, both, alreadyBundled, hiddenMap)
 }
 
 function bundledPluginIds(bundles) {
-  var covered = {}
+  var covered = { "gladimdim.config-sync": true }
   var rows = bundles || []
   for (var i = 0; i < rows.length; i++) {
     var b = rows[i]
@@ -325,6 +325,7 @@ function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap)
     var f = fList[fi]
     var p = String(f.path || "")
     if (!p || f.status === "identical" || f.status === "machine") continue
+    if (p.indexOf("plugins/gladimdim.config-sync") === 0) continue
     if (isItemHidden("f", p, hiddenMap, f)) {
       var parentHidden = false
       if (p.indexOf("plugins/") === 0) {
