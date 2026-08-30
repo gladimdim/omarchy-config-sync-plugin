@@ -407,6 +407,20 @@ class InspectAndSyncTests(unittest.TestCase):
             log = git(repo, "log", "-1", "--pretty=%s").stdout
             self.assertIn("Sync config from", log)
 
+    def test_resync_from_repo_takes_both_and_incoming(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_apply(env.ctx, argparse_ns())
+            write(env.ctx.config_hypr / "bindings.lua", 'o.bind("SUPER + L", "Local", "true")\n')
+            write(repo / "hypr" / "bindings.lua", 'o.bind("SUPER + R", "Repo", "true")\n')
+            write(repo / "plugins" / "news.reader" / "manifest.json", '{"id":"news.reader","name":"News"}')
+            result = cs.cmd_resync(env.ctx, argparse_ns(side="repo"))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result.get("resync"), "repo")
+            self.assertIn("SUPER + R", (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8"))
+            self.assertTrue((env.ctx.config_plugins / "news.reader" / "manifest.json").is_file())
+
     def test_both_changed_requires_explicit_files(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")

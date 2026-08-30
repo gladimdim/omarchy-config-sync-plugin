@@ -45,7 +45,7 @@ function stateHint(state, status) {
     case "remote-ahead":
       return "The repo has config this laptop has not applied. Review the incoming files, then Apply."
     case "diverged":
-      return "This laptop and the repo both moved. Resolve files marked Both, then Apply and/or Publish."
+      return "This laptop and the repo both moved. Resync from repo to make this machine match git (usual on a second laptop). Or Review Changes and pick item by item."
     case "conflicts":
       return "Git could not merge automatically. Keep the local copy or take the incoming copy for each conflicted file."
     case "invalid":

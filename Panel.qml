@@ -450,6 +450,10 @@ Panel {
       editingRepo = false
       lastError = ""
       run(["connect", String(repoUrlInput || "").trim()])
+    } else if (kind === "resync-repo") {
+      run(["resync", "--side", "repo"])
+    } else if (kind === "resync-local") {
+      run(["resync", "--side", "local"])
     }
   }
 
@@ -1018,7 +1022,11 @@ Panel {
                     : "Copy the checked local shortcuts, plugins, and files into the repo, commit, and push?")
                   : root.confirmKind === "switch-repo"
                     ? "Point this laptop at a different git repo? Local files are not deleted. The new repo is cloned and checked before anything is applied."
-                    : "Unlink the config repo on this laptop? Local files are left as they are."
+                    : root.confirmKind === "resync-repo"
+                      ? "Make this laptop match the git repo? Incoming plugins, shortcuts, theme, and configs overwrite local copies. A timestamped backup is written first. Extra files that exist only on this laptop are left in place."
+                      : root.confirmKind === "resync-local"
+                        ? "Overwrite the git repo with this laptop's config, then push?"
+                        : "Unlink the config repo on this laptop? Local files are left as they are."
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -1031,7 +1039,7 @@ Panel {
               width: parent.width
 
               Button {
-                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "switch-repo" ? "Switch repo" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply"))
+                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "switch-repo" ? "Switch repo" : (root.confirmKind === "resync-repo" ? "Take repo" : (root.confirmKind === "resync-local" ? "Take this laptop" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply"))))
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
@@ -1102,6 +1110,17 @@ Panel {
       Row {
         spacing: Style.space(8)
 
+        Button {
+          visible: root.syncState === "diverged" || root.syncState === "conflicts" || (root.incomingFiles.length + root.incomingBundles.length + root.incomingAddedShortcuts.length + root.incomingChangedShortcuts.length > 0 && root.localFiles.length + root.localBundles.length + root.localAddedShortcuts.length + root.localChangedShortcuts.length > 0)
+          text: "Resync from repo"
+          iconText: "󰁨"
+          tooltipText: "Make this laptop match the git repo. A backup is written first."
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          enabled: !root.busy
+          onClicked: root.confirmKind = "resync-repo"
+        }
         Button {
           visible: root.hasReviewable
           text: "Review Changes"

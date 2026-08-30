@@ -1938,6 +1938,93 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return snap
 
 
+def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Make this laptop match the repo, or publish this laptop over the repo."""
+    side = (args.side or "repo").strip().lower()
+    if side in {"local", "ours", "this"}:
+        side = "local"
+    else:
+        side = "repo"
+
+    repo = configured_repo(ctx)
+    fetch_error = fetch_repo(repo)
+    git_fields = git_status_fields(repo, fetch_error)
+    git_fields = maybe_fast_forward(repo, git_fields)
+    if git_fields["behind"] and side == "repo":
+        merge = run_git(repo, ["merge", git_fields["upstream"] or "origin/" + (git_fields["branch"] or "main")], timeout=40)
+        if merge.returncode != 0:
+            conflicts = git_status_fields(repo).get("conflicts") or []
+            if conflicts:
+                raise SyncError(
+                    "Git merge conflicts. Resolve them, then Resync from repo again.",
+                    extra={"conflicts": conflicts},
+                )
+            raise SyncError(git_error_message(["merge"], merge))
+
+    state = load_state(ctx)
+    diff = annotate_diff(ctx, repo, state)
+    incoming = {"repo", "added-repo", "differs", "both"}
+    outgoing = {"local", "added-local", "differs", "both"}
+    wanted_status = incoming if side == "repo" else outgoing
+
+    files = [
+        item["path"]
+        for item in diff["files"]
+        if item.get("status") in wanted_status
+        and (item.get("portable") or args.include_machine)
+        and (item.get("repo_exists") if side == "repo" else item.get("local_exists"))
+    ]
+    shortcuts = [
+        item["keys"]
+        for item in (diff.get("shortcuts") or [])
+        if item.get("status") in wanted_status
+    ]
+    plugins = [
+        item["plugin_id"]
+        for item in (diff.get("bundles") or [])
+        if item.get("kind") == "plugin" and item.get("status") in wanted_status and item.get("plugin_id")
+    ]
+    theme = any(item["path"] == THEME_REL and item.get("status") in wanted_status for item in diff["files"])
+
+    nested = argparse.Namespace(
+        explicit=True,
+        files=",".join(files),
+        shortcut=shortcuts,
+        plugin=plugins,
+        theme=theme,
+        fetch=False,
+        push=side == "local" or bool(getattr(args, "push", False)),
+        include_machine=bool(getattr(args, "include_machine", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        message=getattr(args, "message", None),
+        delete_clone=False,
+        side=side,
+        args=[],
+        command="apply",
+        url=None,
+    )
+
+    if side == "repo":
+        if not files and not shortcuts and not plugins and not theme:
+            snap = build_snapshot(ctx, fetch=False)
+            snap["message"] = "Nothing from the repo to apply. This laptop may already match."
+            return snap
+        result = cmd_apply(ctx, nested)
+        result["message"] = "Resynced this laptop from the repo. " + str(result.get("message") or "")
+        result["resync"] = "repo"
+        return result
+
+    nested.push = True
+    if not files and not shortcuts and not plugins and not theme and not git_fields.get("ahead"):
+        snap = build_snapshot(ctx, fetch=False)
+        snap["message"] = "Nothing local to publish."
+        return snap
+    result = cmd_publish(ctx, nested)
+    result["message"] = "Published this laptop as the source of truth. " + str(result.get("message") or "")
+    result["resync"] = "local"
+    return result
+
+
 def cmd_pull(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx)
     fetch_error = fetch_repo(repo)
@@ -2020,7 +2107,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Omarchy config-sync backend")
     parser.add_argument(
         "command",
-        choices=["snapshot", "connect", "disconnect", "apply", "publish", "pull", "resolve", "set-url", "inspect", "status"],
+        choices=["snapshot", "connect", "disconnect", "apply", "publish", "pull", "resolve", "set-url", "inspect", "status", "resync"],
     )
     parser.add_argument("args", nargs="*")
     parser.add_argument("--fetch", action="store_true")
@@ -2053,6 +2140,8 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_publish(ctx, args)
     if command == "pull":
         return cmd_pull(ctx, args)
+    if command == "resync":
+        return cmd_resync(ctx, args)
     if command == "resolve":
         return cmd_resolve(ctx, args)
     if command == "set-url":
