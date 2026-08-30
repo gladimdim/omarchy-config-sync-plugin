@@ -91,7 +91,7 @@ def make_config_repo(root: Path, *, with_monitor: bool = True) -> Path:
                 "schemaVersion": 1,
                 "id": "demo.widget",
                 "name": "Demo Widget",
-                "version": "1.2.0",
+                "version": "1.2.1",
                 "description": "A demo bar widget",
                 "kinds": ["bar-widget"],
                 "entryPoints": {"barWidget": "Main.qml"},

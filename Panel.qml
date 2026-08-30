@@ -92,6 +92,41 @@ Panel {
   readonly property var incomingBundles: Model.filesByStatus(bundleDiffs, ["repo", "added-repo", "differs"])
   readonly property var localBundles: Model.filesByStatus(bundleDiffs, ["local", "added-local"])
   readonly property var bothBundles: Model.filesByStatus(bundleDiffs, ["both"])
+  readonly property var incomingTheme: {
+    if (!themeDiff) return []
+    var st = String(themeDiff.status)
+    if (st === "repo" || st === "added-repo" || st === "differs") return [themeDiff]
+    return []
+  }
+  readonly property var outgoingTheme: {
+    if (!themeDiff) return []
+    var st = String(themeDiff.status)
+    if (st === "local" || st === "added-local") return [themeDiff]
+    return []
+  }
+  readonly property var bothTheme: {
+    if (!themeDiff) return []
+    if (String(themeDiff.status) === "both") return [themeDiff]
+    return []
+  }
+  readonly property int incomingCount: incomingAddedShortcuts.length + incomingChangedShortcuts.length + incomingBundles.length + incomingFiles.length + differsFiles.length + incomingTheme.length
+  readonly property int outgoingCount: localAddedShortcuts.length + localChangedShortcuts.length + localBundles.length + localFiles.length + outgoingTheme.length
+  readonly property int bothCount: bothShortcuts.length + bothBundles.length + bothFiles.length + bothTheme.length
+  readonly property int incomingPicked: {
+    var _ = picks
+    return pickedCount("s", incomingAddedShortcuts, "keys") + pickedCount("s", incomingChangedShortcuts, "keys") + pickedCount("g", incomingBundles, "id") + pickedCount("f", incomingFiles, "path") + pickedCount("f", differsFiles, "path") + pickedCount("t", incomingTheme, "id")
+  }
+  readonly property int outgoingPicked: {
+    var _ = picks
+    return pickedCount("s", localAddedShortcuts, "keys") + pickedCount("s", localChangedShortcuts, "keys") + pickedCount("g", localBundles, "id") + pickedCount("f", localFiles, "path") + pickedCount("t", outgoingTheme, "id")
+  }
+  readonly property int bothPicked: {
+    var _ = picks
+    return pickedCount("s", bothShortcuts, "keys") + pickedCount("g", bothBundles, "id") + pickedCount("f", bothFiles, "path") + pickedCount("t", bothTheme, "id")
+  }
+  property bool incomingExpanded: false
+  property bool outgoingExpanded: false
+  property bool bothExpanded: false
   readonly property bool hasReviewable: otherFiles.length + shortcutDiffs.length + bundleDiffs.length + pluginDiffs.length + conflictFiles.length + (themeDiff ? 1 : 0) > 0
   readonly property int unresolvedBoth: {
     var n = 0
@@ -147,6 +182,15 @@ Panel {
   }
 
   function isPicked(kind, id) { return !!picks[pickId(kind, id)] }
+
+  function pickedCount(kind, items, field) {
+    var n = 0
+    var list = items || []
+    for (var i = 0; i < list.length; i++) {
+      if (isPicked(kind, list[i][field])) n++
+    }
+    return n
+  }
 
   function togglePick(kind, id) {
     var key = pickId(kind, id)
@@ -1095,15 +1139,15 @@ Panel {
           width: parent.pillW
           icon: "󰅧"
           label: "Incoming"
-          value: String(root.incomingBundles.length + root.incomingFiles.length + root.incomingAddedShortcuts.length + root.incomingChangedShortcuts.length)
-          highlightColor: (root.incomingFiles.length + root.differsFiles.length) > 0 ? root.accent : root.foreground
+          value: String(root.incomingCount)
+          highlightColor: root.incomingCount > 0 ? root.accent : root.foreground
         }
         QuickPill {
           width: parent.pillW
           icon: "󰈸"
-          label: "Local"
-          value: String(root.localFiles.length)
-          highlightColor: root.localFiles.length > 0 ? root.accent : root.foreground
+          label: "Outgoing"
+          value: String(root.outgoingCount)
+          highlightColor: root.outgoingCount > 0 ? root.accent : root.foreground
         }
       }
 
@@ -1272,7 +1316,7 @@ Panel {
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }
         TablePair { label: "Last publish"; value: Model.relativeAgo(root.status.last_publish_at) }
-        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.0") }
+        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.1") }
         TablePair {
           label: "Theme"
           value: {
@@ -1292,7 +1336,7 @@ Panel {
       }
 
       Text {
-        visible: root.status && root.status.fetch_error
+        visible: !!(root.status && root.status.fetch_error)
         width: parent.width
         textFormat: Text.PlainText
         text: "Fetch: " + root.status.fetch_error
@@ -1312,31 +1356,14 @@ Panel {
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: "Include in Apply / Publish — flip the switch or tick the box on each row."
+          text: "Incoming is from git (Apply). Outgoing is this laptop (Publish). Press a group to expand and tick each item."
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.WordWrap
         }
 
-        ChangeSection {
-          title: "THEME"
-          kind: "t"
-          idField: "id"
-          files: root.themeDiff ? [root.themeDiff] : []
-          labelField: "display"
-          summaryField: "slug"
-          both: !!(root.themeDiff && root.themeDiff.status === "both")
-        }
-
-        ChangeSection { title: "INCOMING SHORTCUTS — ADDED"; kind: "s"; idField: "keys"; files: root.incomingAddedShortcuts; labelField: "keys"; summaryField: "label" }
-        ChangeSection { title: "INCOMING SHORTCUTS — CHANGED"; kind: "s"; idField: "keys"; files: root.incomingChangedShortcuts; labelField: "keys"; summaryField: "detail" }
-        ChangeSection { title: "LOCAL SHORTCUTS — ADDED"; kind: "s"; idField: "keys"; files: root.localAddedShortcuts; labelField: "keys"; summaryField: "label" }
-        ChangeSection { title: "LOCAL SHORTCUTS — CHANGED"; kind: "s"; idField: "keys"; files: root.localChangedShortcuts; labelField: "keys"; summaryField: "detail" }
-        ChangeSection { title: "INCOMING PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.incomingBundles; labelField: "name"; summaryField: "summary" }
-        ChangeSection { title: "LOCAL PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.localBundles; labelField: "name"; summaryField: "summary" }
-        ChangeSection { title: "INCOMING FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
-        ChangeSection { title: "CHANGED ON THIS LAPTOP"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
+        DirectionGroups {}
       }
     }
   }
@@ -1350,7 +1377,7 @@ Panel {
       Text {
         width: parent.width
         textFormat: Text.PlainText
-        text: "Each row has an Include switch. On = Apply (incoming) or Publish (local). Off = leave that item alone."
+        text: "Incoming is from git (Apply). Outgoing is this laptop (Publish). Groups start collapsed — press one to tick each item. On = sync that row, Off = leave it alone."
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -1470,87 +1497,7 @@ Panel {
         }
       }
 
-      ChangeSection {
-        title: "THEME"
-        kind: "t"
-        idField: "id"
-        files: root.themeDiff ? [root.themeDiff] : []
-        labelField: "display"
-        summaryField: "slug"
-        both: !!(root.themeDiff && root.themeDiff.status === "both")
-      }
-
-      ChangeSection {
-        title: "INCOMING SHORTCUTS — ADDED"
-        kind: "s"
-        idField: "keys"
-        files: root.incomingAddedShortcuts
-        labelField: "keys"
-        summaryField: "label"
-      }
-      ChangeSection {
-        title: "INCOMING SHORTCUTS — CHANGED"
-        kind: "s"
-        idField: "keys"
-        files: root.incomingChangedShortcuts
-        labelField: "keys"
-        summaryField: "detail"
-      }
-      ChangeSection {
-        title: "LOCAL SHORTCUTS — ADDED"
-        kind: "s"
-        idField: "keys"
-        files: root.localAddedShortcuts
-        labelField: "keys"
-        summaryField: "label"
-      }
-      ChangeSection {
-        title: "LOCAL SHORTCUTS — CHANGED"
-        kind: "s"
-        idField: "keys"
-        files: root.localChangedShortcuts
-        labelField: "keys"
-        summaryField: "detail"
-      }
-      ChangeSection {
-        title: "SHORTCUTS CHANGED ON BOTH SIDES"
-        kind: "s"
-        idField: "keys"
-        files: root.bothShortcuts
-        labelField: "keys"
-        summaryField: "label"
-        both: true
-      }
-
-      ChangeSection {
-        title: "INCOMING PLUGINS & FOLDERS"
-        kind: "g"
-        idField: "id"
-        files: root.incomingBundles
-        labelField: "name"
-        summaryField: "summary"
-      }
-      ChangeSection {
-        title: "LOCAL PLUGINS & FOLDERS"
-        kind: "g"
-        idField: "id"
-        files: root.localBundles
-        labelField: "name"
-        summaryField: "summary"
-      }
-      ChangeSection {
-        title: "PLUGINS CHANGED ON BOTH SIDES"
-        kind: "g"
-        idField: "id"
-        files: root.bothBundles
-        labelField: "name"
-        summaryField: "summary"
-        both: true
-      }
-
-      ChangeSection { title: "INCOMING FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
-      ChangeSection { title: "CHANGED ON THIS LAPTOP"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
-      ChangeSection { title: "FILES CHANGED ON BOTH SIDES"; kind: "f"; idField: "path"; files: root.bothFiles; labelField: "path"; summaryField: "summary"; both: true }
+      DirectionGroups {}
 
       Text {
         visible: !root.hasReviewable
@@ -1570,43 +1517,44 @@ Panel {
     Column {
       width: parent.width
       spacing: Style.space(8)
-      PanelSectionHeader {
-        visible: root.shortcutDiffs.length > 0
-        text: "CHANGED SHORTCUTS — INCLUDE TO SYNC"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
+      CollapsibleGroup {
+        title: "Incoming"
+        count: root.incomingAddedShortcuts.length + root.incomingChangedShortcuts.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("s", root.incomingAddedShortcuts, "keys") + root.pickedCount("s", root.incomingChangedShortcuts, "keys")
+        }
+        subtitle: "From the repo — Apply"
+        expanded: root.incomingExpanded
+        onToggled: root.incomingExpanded = !root.incomingExpanded
+        ChangeSection { title: "ADDED"; kind: "s"; idField: "keys"; files: root.incomingAddedShortcuts; labelField: "keys"; summaryField: "label" }
+        ChangeSection { title: "CHANGED"; kind: "s"; idField: "keys"; files: root.incomingChangedShortcuts; labelField: "keys"; summaryField: "detail" }
       }
-      ChangeSection {
-        title: "INCOMING — ADDED"
-        kind: "s"
-        idField: "keys"
-        files: root.incomingAddedShortcuts
-        labelField: "keys"
-        summaryField: "label"
+      CollapsibleGroup {
+        title: "Outgoing"
+        count: root.localAddedShortcuts.length + root.localChangedShortcuts.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("s", root.localAddedShortcuts, "keys") + root.pickedCount("s", root.localChangedShortcuts, "keys")
+        }
+        subtitle: "This laptop — Publish"
+        expanded: root.outgoingExpanded
+        onToggled: root.outgoingExpanded = !root.outgoingExpanded
+        ChangeSection { title: "ADDED"; kind: "s"; idField: "keys"; files: root.localAddedShortcuts; labelField: "keys"; summaryField: "label" }
+        ChangeSection { title: "CHANGED"; kind: "s"; idField: "keys"; files: root.localChangedShortcuts; labelField: "keys"; summaryField: "detail" }
       }
-      ChangeSection {
-        title: "INCOMING — CHANGED"
-        kind: "s"
-        idField: "keys"
-        files: root.incomingChangedShortcuts
-        labelField: "keys"
-        summaryField: "detail"
-      }
-      ChangeSection {
-        title: "LOCAL — ADDED"
-        kind: "s"
-        idField: "keys"
-        files: root.localAddedShortcuts
-        labelField: "keys"
-        summaryField: "label"
-      }
-      ChangeSection {
-        title: "LOCAL — CHANGED"
-        kind: "s"
-        idField: "keys"
-        files: root.localChangedShortcuts
-        labelField: "keys"
-        summaryField: "detail"
+      CollapsibleGroup {
+        title: "Both sides"
+        count: root.bothShortcuts.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("s", root.bothShortcuts, "keys")
+        }
+        subtitle: "Pick Keep local or Take repo on each row"
+        expanded: root.bothExpanded
+        onToggled: root.bothExpanded = !root.bothExpanded
+        countColor: root.urgent
+        ChangeSection { title: "SHORTCUTS"; kind: "s"; idField: "keys"; files: root.bothShortcuts; labelField: "keys"; summaryField: "label"; both: true }
       }
 
       PanelSectionHeader { text: "BINDINGS IN THE REPO"; foreground: root.foreground; fontFamily: root.fontFamily }
@@ -1654,13 +1602,42 @@ Panel {
     Column {
       width: parent.width
       spacing: Style.space(8)
-      ChangeSection {
-        title: "CHANGED PLUGINS — INCLUDE TO SYNC"
-        kind: "g"
-        idField: "id"
-        files: root.incomingBundles.concat(root.localBundles).concat(root.bothBundles)
-        labelField: "name"
-        summaryField: "summary"
+      CollapsibleGroup {
+        title: "Incoming"
+        count: root.incomingBundles.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("g", root.incomingBundles, "id")
+        }
+        subtitle: "From the repo — Apply"
+        expanded: root.incomingExpanded
+        onToggled: root.incomingExpanded = !root.incomingExpanded
+        ChangeSection { title: "PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.incomingBundles; labelField: "name"; summaryField: "summary" }
+      }
+      CollapsibleGroup {
+        title: "Outgoing"
+        count: root.localBundles.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("g", root.localBundles, "id")
+        }
+        subtitle: "This laptop — Publish"
+        expanded: root.outgoingExpanded
+        onToggled: root.outgoingExpanded = !root.outgoingExpanded
+        ChangeSection { title: "PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.localBundles; labelField: "name"; summaryField: "summary" }
+      }
+      CollapsibleGroup {
+        title: "Both sides"
+        count: root.bothBundles.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("g", root.bothBundles, "id")
+        }
+        subtitle: "Pick Keep local or Take repo on each row"
+        expanded: root.bothExpanded
+        onToggled: root.bothExpanded = !root.bothExpanded
+        countColor: root.urgent
+        ChangeSection { title: "PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.bothBundles; labelField: "name"; summaryField: "summary"; both: true }
       }
 
       PanelSectionHeader { text: "PLUGINS THAT WILL LOAD"; foreground: root.foreground; fontFamily: root.fontFamily }
@@ -1760,13 +1737,42 @@ Panel {
     Column {
       width: parent.width
       spacing: Style.space(8)
-      ChangeSection {
-        title: "CHANGED FILES — INCLUDE TO SYNC"
-        kind: "f"
-        idField: "path"
-        files: root.incomingFiles.concat(root.localFiles).concat(root.bothFiles).concat(root.differsFiles)
-        labelField: "path"
-        summaryField: "summary"
+      CollapsibleGroup {
+        title: "Incoming"
+        count: root.incomingFiles.length + root.differsFiles.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("f", root.incomingFiles, "path") + root.pickedCount("f", root.differsFiles, "path")
+        }
+        subtitle: "From the repo — Apply"
+        expanded: root.incomingExpanded
+        onToggled: root.incomingExpanded = !root.incomingExpanded
+        ChangeSection { title: "FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
+      }
+      CollapsibleGroup {
+        title: "Outgoing"
+        count: root.localFiles.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("f", root.localFiles, "path")
+        }
+        subtitle: "This laptop — Publish"
+        expanded: root.outgoingExpanded
+        onToggled: root.outgoingExpanded = !root.outgoingExpanded
+        ChangeSection { title: "FILES"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
+      }
+      CollapsibleGroup {
+        title: "Both sides"
+        count: root.bothFiles.length
+        included: {
+          var _ = root.picks
+          return root.pickedCount("f", root.bothFiles, "path")
+        }
+        subtitle: "Pick Keep local or Take repo on each row"
+        expanded: root.bothExpanded
+        onToggled: root.bothExpanded = !root.bothExpanded
+        countColor: root.urgent
+        ChangeSection { title: "FILES"; kind: "f"; idField: "path"; files: root.bothFiles; labelField: "path"; summaryField: "summary"; both: true }
       }
 
       PanelSectionHeader { text: "FILES IN THE REPO"; foreground: root.foreground; fontFamily: root.fontFamily }
@@ -1861,6 +1867,186 @@ Panel {
         wrapMode: Text.WordWrap
       }
     }
+  }
+
+  component DirectionGroups: Column {
+    width: parent ? parent.width : 100
+    spacing: Style.space(8)
+
+    CollapsibleGroup {
+      title: "Incoming"
+      count: root.incomingCount
+      included: root.incomingPicked
+      subtitle: "From the repo — Apply"
+      expanded: root.incomingExpanded
+      onToggled: root.incomingExpanded = !root.incomingExpanded
+      IncomingSections {}
+    }
+    CollapsibleGroup {
+      title: "Outgoing"
+      count: root.outgoingCount
+      included: root.outgoingPicked
+      subtitle: "This laptop — Publish"
+      expanded: root.outgoingExpanded
+      onToggled: root.outgoingExpanded = !root.outgoingExpanded
+      OutgoingSections {}
+    }
+    CollapsibleGroup {
+      title: "Both sides"
+      count: root.bothCount
+      included: root.bothPicked
+      subtitle: "Pick Keep local or Take repo on each row"
+      expanded: root.bothExpanded
+      onToggled: root.bothExpanded = !root.bothExpanded
+      countColor: root.urgent
+      BothSections {}
+    }
+  }
+
+  component CollapsibleGroup: Column {
+    id: groupRoot
+    default property alias extra: bodyCol.data
+    property string title: ""
+    property int count: 0
+    property int included: -1
+    property string subtitle: ""
+    property bool expanded: false
+    property color countColor: root.accent
+    signal toggled()
+
+    width: parent ? parent.width : 100
+    spacing: Style.space(8)
+    visible: count > 0
+
+    Rectangle {
+      width: parent.width
+      implicitHeight: headerInner.implicitHeight + Style.space(14)
+      radius: Style.cornerRadius
+      color: headerMa.containsMouse || groupRoot.expanded
+        ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+        : root.cardBg
+      border.width: groupRoot.expanded ? 2 : 1
+      border.color: groupRoot.expanded ? root.accent : root.cardBorder
+
+      Row {
+        id: headerInner
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.leftMargin: Style.space(12)
+        anchors.rightMargin: Style.space(12)
+        spacing: Style.space(10)
+
+        Text {
+          text: groupRoot.expanded ? "▼" : "▶"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          font.bold: true
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(16)
+        }
+
+        Column {
+          width: parent.width - Style.space(16) - countCol.width - parent.spacing * 2
+          spacing: 2
+          anchors.verticalCenter: parent.verticalCenter
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: groupRoot.title
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            elide: Text.ElideRight
+          }
+          Text {
+            width: parent.width
+            visible: groupRoot.subtitle !== "" || groupRoot.included >= 0
+            textFormat: Text.PlainText
+            text: {
+              var bits = []
+              if (groupRoot.subtitle) bits.push(groupRoot.subtitle)
+              if (groupRoot.included >= 0) bits.push(groupRoot.included + " included")
+              bits.push(groupRoot.expanded ? "press to hide" : "press to expand")
+              return bits.join(" · ")
+            }
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+
+        Column {
+          id: countCol
+          spacing: 0
+          anchors.verticalCenter: parent.verticalCenter
+          Text {
+            text: String(groupRoot.count)
+            color: groupRoot.countColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            horizontalAlignment: Text.AlignRight
+            anchors.right: parent.right
+          }
+          Text {
+            text: groupRoot.count === 1 ? "item" : "items"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            horizontalAlignment: Text.AlignRight
+            anchors.right: parent.right
+          }
+        }
+      }
+
+      MouseArea {
+        id: headerMa
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        hoverEnabled: true
+        onClicked: groupRoot.toggled()
+      }
+    }
+
+    Column {
+      id: bodyCol
+      width: parent.width
+      spacing: Style.space(8)
+      visible: groupRoot.expanded
+    }
+  }
+
+  component IncomingSections: Column {
+    width: parent ? parent.width : 100
+    spacing: Style.space(8)
+    ChangeSection { title: "THEME"; kind: "t"; idField: "id"; files: root.incomingTheme; labelField: "display"; summaryField: "slug" }
+    ChangeSection { title: "SHORTCUTS — ADDED"; kind: "s"; idField: "keys"; files: root.incomingAddedShortcuts; labelField: "keys"; summaryField: "label" }
+    ChangeSection { title: "SHORTCUTS — CHANGED"; kind: "s"; idField: "keys"; files: root.incomingChangedShortcuts; labelField: "keys"; summaryField: "detail" }
+    ChangeSection { title: "PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.incomingBundles; labelField: "name"; summaryField: "summary" }
+    ChangeSection { title: "FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
+  }
+
+  component OutgoingSections: Column {
+    width: parent ? parent.width : 100
+    spacing: Style.space(8)
+    ChangeSection { title: "THEME"; kind: "t"; idField: "id"; files: root.outgoingTheme; labelField: "display"; summaryField: "slug" }
+    ChangeSection { title: "SHORTCUTS — ADDED"; kind: "s"; idField: "keys"; files: root.localAddedShortcuts; labelField: "keys"; summaryField: "label" }
+    ChangeSection { title: "SHORTCUTS — CHANGED"; kind: "s"; idField: "keys"; files: root.localChangedShortcuts; labelField: "keys"; summaryField: "detail" }
+    ChangeSection { title: "PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.localBundles; labelField: "name"; summaryField: "summary" }
+    ChangeSection { title: "FILES"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
+  }
+
+  component BothSections: Column {
+    width: parent ? parent.width : 100
+    spacing: Style.space(8)
+    ChangeSection { title: "THEME"; kind: "t"; idField: "id"; files: root.bothTheme; labelField: "display"; summaryField: "slug"; both: true }
+    ChangeSection { title: "SHORTCUTS"; kind: "s"; idField: "keys"; files: root.bothShortcuts; labelField: "keys"; summaryField: "label"; both: true }
+    ChangeSection { title: "PLUGINS & FOLDERS"; kind: "g"; idField: "id"; files: root.bothBundles; labelField: "name"; summaryField: "summary"; both: true }
+    ChangeSection { title: "FILES"; kind: "f"; idField: "path"; files: root.bothFiles; labelField: "path"; summaryField: "summary"; both: true }
   }
 
   component ChangeSection: Column {
