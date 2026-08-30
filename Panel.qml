@@ -70,7 +70,7 @@ Panel {
       if (f.status === "identical" || f.status === "machine") continue
       if (!includeMachine && !f.portable) continue
       if (f.group === "plugin") continue
-      if (f.group === "theme") continue
+      if (f.group === "theme" && f.path !== "omarchy/theme.name") continue
       if (f.path === "hypr/bindings.lua") continue
       out.push(f)
     }
@@ -1098,20 +1098,14 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
-        Column {
-          visible: !!root.themeDiff
-          width: parent.width
-          spacing: Style.space(6)
-          PanelSectionHeader { text: "THEME"; foreground: root.foreground; fontFamily: root.fontFamily }
-          PickRow {
-            width: parent.width
-            kind: "t"
-            itemId: "selected"
-            pathLabel: root.themeDiff ? ("Selected theme: " + String(root.themeDiff.display || root.themeDiff.slug || "")) : ""
-            summary: root.themeDiff && root.themeDiff.custom ? "includes custom overlay" : "stock theme name"
-            statusLabel: root.themeDiff ? Model.fileStatusLabel(root.themeDiff.status) : ""
-            both: !!(root.themeDiff && root.themeDiff.status === "both")
-          }
+        ChangeSection {
+          title: "THEME"
+          kind: "t"
+          idField: "id"
+          files: root.themeDiff ? [root.themeDiff] : []
+          labelField: "display"
+          summaryField: "slug"
+          both: !!(root.themeDiff && root.themeDiff.status === "both")
         }
 
         ChangeSection { title: "INCOMING SHORTCUTS"; kind: "s"; idField: "keys"; files: root.incomingShortcuts; labelField: "keys"; summaryField: "label" }
@@ -1119,7 +1113,7 @@ Panel {
         ChangeSection { title: "INCOMING PLUGINS"; kind: "p"; idField: "id"; files: root.incomingPlugins.concat(root.differsPlugins); labelField: "name"; summaryField: "id" }
         ChangeSection { title: "LOCAL PLUGINS"; kind: "p"; idField: "id"; files: root.localPlugins; labelField: "name"; summaryField: "id" }
         ChangeSection { title: "INCOMING FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
-        ChangeSection { title: "LOCAL FILES"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
+        ChangeSection { title: "CHANGED ON THIS LAPTOP"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
       }
     }
   }
@@ -1253,27 +1247,14 @@ Panel {
         }
       }
 
-      Column {
-        visible: !!root.themeDiff
-        width: parent.width
-        spacing: Style.space(6)
-        PanelSectionHeader { text: "THEME"; foreground: root.foreground; fontFamily: root.fontFamily }
-        PickRow {
-          width: parent.width
-          kind: "t"
-          itemId: "selected"
-          pathLabel: root.themeDiff ? ("Selected theme: " + String(root.themeDiff.display || root.themeDiff.slug || "")) : ""
-          summary: {
-            if (!root.themeDiff) return ""
-            var bits = []
-            if (root.themeDiff.local_slug) bits.push("this laptop " + root.themeDiff.local_slug)
-            if (root.themeDiff.repo_slug) bits.push("repo " + root.themeDiff.repo_slug)
-            if (root.themeDiff.custom) bits.push("includes custom overlay")
-            return bits.join(" · ")
-          }
-          statusLabel: root.themeDiff ? Model.fileStatusLabel(root.themeDiff.status) : ""
-          both: !!(root.themeDiff && root.themeDiff.status === "both")
-        }
+      ChangeSection {
+        title: "THEME"
+        kind: "t"
+        idField: "id"
+        files: root.themeDiff ? [root.themeDiff] : []
+        labelField: "display"
+        summaryField: "slug"
+        both: !!(root.themeDiff && root.themeDiff.status === "both")
       }
 
       ChangeSection {
@@ -1329,7 +1310,7 @@ Panel {
       }
 
       ChangeSection { title: "INCOMING FILES"; kind: "f"; idField: "path"; files: root.incomingFiles.concat(root.differsFiles); labelField: "path"; summaryField: "summary" }
-      ChangeSection { title: "LOCAL FILES"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
+      ChangeSection { title: "CHANGED ON THIS LAPTOP"; kind: "f"; idField: "path"; files: root.localFiles; labelField: "path"; summaryField: "summary" }
       ChangeSection { title: "FILES CHANGED ON BOTH SIDES"; kind: "f"; idField: "path"; files: root.bothFiles; labelField: "path"; summaryField: "summary"; both: true }
 
       Text {
@@ -1638,7 +1619,7 @@ Panel {
     property string labelField: "path"
     property string summaryField: "summary"
     width: parent.width
-    spacing: Style.space(6)
+    spacing: Style.space(8)
     visible: files && files.length > 0
 
     PanelSectionHeader {
@@ -1649,20 +1630,134 @@ Panel {
 
     Repeater {
       model: files
-      delegate: PickRow {
+
+      Rectangle {
+        id: rowBox
         required property var modelData
+        required property int index
+
+        readonly property string rowId: String(modelData[sectionRoot.idField] || "")
+        readonly property string rowKind: sectionRoot.kind
+        readonly property bool included: !!(root.picks[root.pickId(rowKind, rowId)])
+        readonly property string bothKey: rowKind === "f" ? rowId : (rowKind + ":" + rowId)
+
         width: sectionRoot.width
-        kind: sectionRoot.kind
-        itemId: String(modelData[sectionRoot.idField] || "")
-        pathLabel: String(modelData[sectionRoot.labelField] || "")
-        summary: {
-          var extra = String(modelData[sectionRoot.summaryField] || "")
-          if (sectionRoot.kind === "p")
-            extra = extra + " · " + String(modelData.changed_count || 0) + " files"
-          return extra
+        implicitHeight: rowInner.implicitHeight + Style.space(16)
+        radius: Style.cornerRadius
+        color: included ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : root.cardBg
+        border.width: 2
+        border.color: included ? root.accent : root.foreground
+
+        Row {
+          id: rowInner
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.leftMargin: Style.space(10)
+          anchors.rightMargin: Style.space(10)
+          spacing: Style.space(10)
+
+          // Large tick box — this is the checkbox.
+          Rectangle {
+            width: 28
+            height: 28
+            radius: 4
+            anchors.verticalCenter: parent.verticalCenter
+            color: rowBox.included ? root.accent : Color.background
+            border.width: 2
+            border.color: root.foreground
+
+            Text {
+              anchors.centerIn: parent
+              text: rowBox.included ? "✓" : ""
+              color: Color.background
+              font.family: root.fontFamily
+              font.pixelSize: 18
+              font.bold: true
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+            }
+          }
+
+          Column {
+            width: parent.width - 28 - includeBtn.width - (sectionRoot.both ? 168 : 0) - parent.spacing * (sectionRoot.both ? 3 : 2)
+            spacing: 2
+            anchors.verticalCenter: parent.verticalCenter
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: String(rowBox.modelData[sectionRoot.labelField] || "")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: {
+                var sum = String(rowBox.modelData[sectionRoot.summaryField] || "")
+                if (sectionRoot.kind === "p")
+                  sum = sum + " · " + String(rowBox.modelData.changed_count || 0) + " files"
+                var st = Model.fileStatusLabel(rowBox.modelData.status)
+                return (st ? st + " · " : "") + sum + (rowBox.included ? " · will sync" : " · skipped")
+              }
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          Row {
+            visible: sectionRoot.both
+            spacing: Style.space(4)
+            anchors.verticalCenter: parent.verticalCenter
+            Button {
+              text: "Keep local"
+              fontSize: Style.font.caption
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              selected: root.bothPicks[rowBox.bothKey] === "local"
+              bordered: true
+              onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "local")
+            }
+            Button {
+              text: "Take repo"
+              fontSize: Style.font.caption
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              selected: root.bothPicks[rowBox.bothKey] === "repo"
+              bordered: true
+              onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "repo")
+            }
+          }
+
+          Button {
+            id: includeBtn
+            text: rowBox.included ? "Included" : "Skip"
+            selected: rowBox.included
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            anchors.verticalCenter: parent.verticalCenter
+            onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+          }
         }
-        statusLabel: Model.fileStatusLabel(modelData.status)
-        both: sectionRoot.both
+
+        MouseArea {
+          z: -1
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+        }
       }
     }
   }
