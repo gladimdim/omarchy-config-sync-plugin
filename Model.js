@@ -266,53 +266,12 @@ function appendLooseFiles(out, files, both, hiddenMap) {
   }
 }
 
-function appendPluginFilesAsFolders(out, files, both, alreadyBundled, hiddenMap) {
-  var covered = alreadyBundled || {}
-  var buckets = {}
-  var order = []
-  var rows = files || []
-  for (var i = 0; i < rows.length; i++) {
-    var f = rows[i]
-    if (f.status === "identical" || f.status === "machine") continue
-    var p = String(f.path || "")
-    if (p.indexOf("plugins/") !== 0) continue
-    var pid = p.split("/")[1] || ""
-    if (!pid || pid === "gladimdim.config-sync" || covered[pid]) continue
-    if (isItemHidden("g", "plugin:" + pid, hiddenMap, f)) continue
-    if (isItemHidden("f", p, hiddenMap, f)) continue
-    var bid = "plugin:" + pid
-    if (!buckets[bid]) {
-      buckets[bid] = { id: bid, name: pid, count: 0, status: f.status }
-      order.push(bid)
-    }
-    buckets[bid].count++
-  }
-  for (var j = 0; j < order.length; j++) {
-    var g = buckets[order[j]]
-    var n = g.count
-    out.push(reviewItem("g", g.id, g.name, n + (n === 1 ? " file" : " files"), g.status, "Plugin", both || g.status === "both", n, false))
-  }
-}
-
-function bundledPluginIds(bundles) {
-  var covered = { "gladimdim.config-sync": true }
-  var rows = bundles || []
-  for (var i = 0; i < rows.length; i++) {
-    var b = rows[i]
-    if (b.kind === "plugin" && b.plugin_id) covered[b.plugin_id] = true
-    var id = String(b.id || "")
-    if (id.indexOf("plugin:") === 0) covered[id.substring(7)] = true
-  }
-  return covered
-}
-
 function buildIncomingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles, hiddenMap) {
   var out = []
   appendThemes(out, theme, hiddenMap)
   appendShortcuts(out, addedShortcuts, "label", false, hiddenMap)
   appendShortcuts(out, changedShortcuts, "detail", false, hiddenMap)
   appendBundles(out, bundles, false, hiddenMap)
-  appendPluginFilesAsFolders(out, allFiles, false, bundledPluginIds(bundles), hiddenMap)
   appendLooseFiles(out, files, false, hiddenMap)
   return out
 }
@@ -323,7 +282,6 @@ function buildOutgoingItems(theme, addedShortcuts, changedShortcuts, bundles, fi
   appendShortcuts(out, addedShortcuts, "label", false, hiddenMap)
   appendShortcuts(out, changedShortcuts, "detail", false, hiddenMap)
   appendBundles(out, bundles, false, hiddenMap)
-  appendPluginFilesAsFolders(out, allFiles, false, bundledPluginIds(bundles), hiddenMap)
   appendLooseFiles(out, files, false, hiddenMap)
   return out
 }
@@ -333,7 +291,6 @@ function buildBothItems(theme, shortcuts, bundles, files, allFiles, hiddenMap) {
   appendThemes(out, theme, hiddenMap)
   appendShortcuts(out, shortcuts, "label", true, hiddenMap)
   appendBundles(out, bundles, true, hiddenMap)
-  appendPluginFilesAsFolders(out, allFiles, true, bundledPluginIds(bundles), hiddenMap)
   appendLooseFiles(out, files, true, hiddenMap)
   return out
 }

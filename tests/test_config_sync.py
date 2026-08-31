@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -922,6 +923,103 @@ class SecurityTests(unittest.TestCase):
             res = cs.cmd_terminal(env.ctx, argparse_ns(args=["hypr/looknfeel.lua"]))
             self.assertTrue(res["ok"])
             self.assertEqual(res["opened_terminal"], str(local_file))
+
+
+class ModelJsTests(unittest.TestCase):
+    def test_incoming_and_outgoing_plugin_isolation(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+
+        model_path = ROOT / "Model.js"
+        script = f"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync({json.dumps(str(model_path))}, 'utf8').replace(/^\\.pragma\\s+library\\s*/m, '');
+const ctx = {{}};
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+
+// Case 1: Newly installed local plugin
+const localPluginBundle = [{{
+  id: 'plugin:local.tool',
+  kind: 'plugin',
+  plugin_id: 'local.tool',
+  name: 'local.tool',
+  summary: 'New on this machine · 2 files',
+  status: 'added-local',
+  files: ['plugins/local.tool/manifest.json', 'plugins/local.tool/Main.qml'],
+  changed_count: 2,
+  default_apply: false,
+  default_publish: true
+}}];
+const localDiffFiles = [
+  {{ path: 'plugins/local.tool/manifest.json', status: 'added-local', group: 'plugin', local_exists: true, repo_exists: false, portable: true }},
+  {{ path: 'plugins/local.tool/Main.qml', status: 'added-local', group: 'plugin', local_exists: true, repo_exists: false, portable: true }}
+];
+
+const inBundles1 = ctx.filesByStatus(localPluginBundle, ['repo', 'added-repo', 'differs']);
+const outBundles1 = ctx.filesByStatus(localPluginBundle, ['local', 'added-local']);
+const bothBundles1 = ctx.filesByStatus(localPluginBundle, ['both']);
+
+const inItems1 = ctx.buildIncomingItems([], [], [], inBundles1, [], localDiffFiles, {{}});
+const outItems1 = ctx.buildOutgoingItems([], [], [], outBundles1, [], localDiffFiles, {{}});
+const bothItems1 = ctx.buildBothItems([], [], bothBundles1, [], localDiffFiles, {{}});
+
+// Case 2: New plugin incoming from repo
+const repoPluginBundle = [{{
+  id: 'plugin:remote.tool',
+  kind: 'plugin',
+  plugin_id: 'remote.tool',
+  name: 'remote.tool',
+  summary: 'New plugin · 2 files',
+  status: 'added-repo',
+  files: ['plugins/remote.tool/manifest.json', 'plugins/remote.tool/Main.qml'],
+  changed_count: 2,
+  default_apply: true,
+  default_publish: false
+}}];
+const repoDiffFiles = [
+  {{ path: 'plugins/remote.tool/manifest.json', status: 'added-repo', group: 'plugin', local_exists: false, repo_exists: true, portable: true }},
+  {{ path: 'plugins/remote.tool/Main.qml', status: 'added-repo', group: 'plugin', local_exists: false, repo_exists: true, portable: true }}
+];
+
+const inBundles2 = ctx.filesByStatus(repoPluginBundle, ['repo', 'added-repo', 'differs']);
+const outBundles2 = ctx.filesByStatus(repoPluginBundle, ['local', 'added-local']);
+const bothBundles2 = ctx.filesByStatus(repoPluginBundle, ['both']);
+
+const inItems2 = ctx.buildIncomingItems([], [], [], inBundles2, [], repoDiffFiles, {{}});
+const outItems2 = ctx.buildOutgoingItems([], [], [], outBundles2, [], repoDiffFiles, {{}});
+const bothItems2 = ctx.buildBothItems([], [], bothBundles2, [], repoDiffFiles, {{}});
+
+console.log(JSON.stringify({{
+  local: {{
+    incoming: inItems1.length,
+    outgoing: outItems1.length,
+    both: bothItems1.length,
+    outId: outItems1.length > 0 ? outItems1[0].itemId : null
+  }},
+  repo: {{
+    incoming: inItems2.length,
+    outgoing: outItems2.length,
+    both: bothItems2.length,
+    inId: inItems2.length > 0 ? inItems2[0].itemId : null
+  }}
+}}));
+"""
+        proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+        data = json.loads(proc.stdout.strip())
+        # Local-only plugin should only be in outgoing list
+        self.assertEqual(data["local"]["incoming"], 0)
+        self.assertEqual(data["local"]["outgoing"], 1)
+        self.assertEqual(data["local"]["both"], 0)
+        self.assertEqual(data["local"]["outId"], "plugin:local.tool")
+
+        # Repo-only plugin should only be in incoming list
+        self.assertEqual(data["repo"]["incoming"], 1)
+        self.assertEqual(data["repo"]["outgoing"], 0)
+        self.assertEqual(data["repo"]["both"], 0)
+        self.assertEqual(data["repo"]["inId"], "plugin:remote.tool")
 
 
 if __name__ == "__main__":
