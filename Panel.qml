@@ -1405,7 +1405,7 @@ Panel {
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }
         TablePair { label: "Last publish"; value: Model.relativeAgo(root.status.last_publish_at) }
-        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.10") }
+        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.11") }
         TablePair {
           label: "Theme"
           value: {

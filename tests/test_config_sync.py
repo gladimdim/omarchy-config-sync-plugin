@@ -1181,6 +1181,38 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertTrue(cs.is_bundled_path("bin/x"))
         self.assertFalse(cs.is_bundled_path("hypr/bindings.lua"))
 
+    def test_credential_store_rejects_existing_symlink(self) -> None:
+        ctx = self._ctx()
+        ctx.state_dir.mkdir(parents=True, exist_ok=True)
+        target = self.tmp / "elsewhere.txt"
+        target.write_text("do-not-touch", encoding="utf-8")
+        (ctx.state_dir / ".git-credentials").symlink_to(target)
+        with self.assertRaises(cs.SyncError):
+            cs.prepare_git_credentials(ctx, "https://user:secret@github.com/x/y.git")
+        # The symlink target must never have been written through.
+        self.assertEqual(target.read_text(encoding="utf-8"), "do-not-touch")
+
+    def test_prepare_git_credentials_rejects_crlf_injection(self) -> None:
+        ctx = self._ctx()
+        with self.assertRaises(cs.SyncError):
+            cs.prepare_git_credentials(ctx, "https://user:pa%0d%0ahost=evil.example%0a@github.com/x/y.git")
+
+    def test_run_bounded_caps_output_size(self) -> None:
+        result = cs.run_bounded(
+            [sys.executable, "-c", "import sys; sys.stdout.write('A' * 200)"],
+            timeout=5,
+            max_bytes=50,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(result.stdout), 50)
+
+    def test_collect_inventory_enforces_file_cap(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            with patch.object(cs, "MAX_INVENTORY_FILES", 2):
+                with self.assertRaises(cs.SyncError):
+                    cs.collect_inventory(env.ctx, repo)
+
     def test_main_enforces_response_size_cap_before_writing(self) -> None:
         huge = cs.ok({"blob": "x" * (cs.MAX_RESPONSE_BYTES + 1000)})
         buf = io.StringIO()

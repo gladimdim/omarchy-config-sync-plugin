@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,8 @@ CLONE_TIMEOUT = 120
 FETCH_TIMEOUT = 25
 PUSH_TIMEOUT = 60
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_SUBPROCESS_BYTES = 2 * 1024 * 1024
+MAX_INVENTORY_FILES = 20_000
 
 BIND_RE = re.compile(
     r"""o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"([^"]*)")""",
@@ -47,7 +50,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.10"
+PLUGIN_VERSION = "1.2.11"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -276,6 +279,37 @@ def git_env() -> dict[str, str]:
     return env
 
 
+def run_bounded(
+    cmd: list[str],
+    *,
+    input: str | None = None,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+    timeout: float = 30,
+    max_bytes: int = MAX_SUBPROCESS_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    """subprocess.run() with stdout/stderr redirected straight to disk instead
+    of an in-memory pipe, so a runaway or malicious child (git operating on an
+    untrusted remote, hyprctl, omarchy-shell) cannot force unbounded memory
+    growth in this process. Only the first max_bytes of each stream is kept."""
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.run(
+            cmd,
+            input=input,
+            stdout=out_f,
+            stderr=err_f,
+            text=True,
+            timeout=timeout,
+            env=env,
+            cwd=cwd,
+        )
+        out_f.seek(0)
+        err_f.seek(0)
+        out = out_f.read(max_bytes).decode("utf-8", errors="replace")
+        err = err_f.read(max_bytes).decode("utf-8", errors="replace")
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def run_git(
     repo: Path | None,
     args: list[str],
@@ -288,10 +322,8 @@ def run_git(
         cmd += ["-C", str(repo)]
     cmd += args
     try:
-        result = subprocess.run(
+        result = run_bounded(
             cmd,
-            capture_output=True,
-            text=True,
             timeout=timeout,
             env=git_env(),
             cwd=str(cwd) if cwd else None,
@@ -304,6 +336,25 @@ def run_git(
 
 
 _URL_CREDENTIALS_RE = re.compile(r"^(https?://)([^/@]+)@(.+)$")
+_CRLF_NUL_RE = re.compile(r"[\r\n\x00]")
+
+
+def _open_credential_store(path: Path) -> None:
+    """Ensure the credential-store file is a plain, 0600 file we created, never
+    following a pre-existing symlink or writing through some other non-regular
+    node an attacker (or a stale/racy leftover) placed at that path."""
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise SyncError("Refusing to write git credentials: unsafe path exists at the credential store location.")
+    flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
 
 
 def prepare_git_credentials(ctx: Context, url: str) -> tuple[str, Path | None]:
@@ -318,24 +369,23 @@ def prepare_git_credentials(ctx: Context, url: str) -> tuple[str, Path | None]:
     username, _, secret = userinfo.partition(":")
     username = urllib.parse.unquote(username)
     secret = urllib.parse.unquote(secret) if secret else "x-oauth-basic"
-    clean_url = f"{scheme}{rest}"
     host = rest.split("/", 1)[0]
     protocol = scheme.split("://", 1)[0]
+    # Percent-decoding can smuggle CR/LF into git's line-based credential
+    # protocol; reject it outright rather than let it inject extra fields.
+    if any(_CRLF_NUL_RE.search(v) for v in (username, secret, host)):
+        raise SyncError("Git URL contains invalid characters in its credentials.")
+    clean_url = f"{scheme}{rest}"
     ctx.state_dir.mkdir(parents=True, exist_ok=True)
     cred_file = ctx.state_dir / ".git-credentials"
+    _open_credential_store(cred_file)
     payload = f"protocol={protocol}\nhost={host}\nusername={username}\npassword={secret}\n\n"
-    subprocess.run(
+    run_bounded(
         ["git", "-c", f"credential.helper=store --file={cred_file}", "credential", "approve"],
         input=payload,
-        text=True,
-        capture_output=True,
         timeout=10,
         env=git_env(),
     )
-    try:
-        os.chmod(cred_file, 0o600)
-    except OSError:
-        pass
     return clean_url, cred_file
 
 
@@ -781,6 +831,14 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             return
         if rel in items:
             return
+        if len(items) >= MAX_INVENTORY_FILES:
+            # Bound memory during collection itself, not just the final JSON
+            # size: a malicious/huge linked repo could otherwise balloon the
+            # in-memory inventory long before any response-size check runs.
+            raise SyncError(
+                f"Linked repo has more than {MAX_INVENTORY_FILES} tracked files; "
+                "refusing to build a diff to avoid unbounded memory use."
+            )
         local_regular = local.is_file() and not local.is_symlink() and not os.path.islink(local)
         repo_regular = repo_file.is_file() and not repo_file.is_symlink() and not os.path.islink(repo_file)
         items[rel] = {
@@ -1317,12 +1375,7 @@ def apply_omarchy_theme(slug: str, dry_run: bool) -> str:
     if not binary:
         return "omarchy CLI not found; theme name was copied but not applied"
     try:
-        result = subprocess.run(
-            [binary, "theme", "set", "--", slug],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        result = run_bounded([binary, "theme", "set", "--", slug], timeout=90)
     except subprocess.TimeoutExpired:
         return f"omarchy theme set {slug} timed out"
     if result.returncode != 0:
@@ -2027,12 +2080,12 @@ def reload_desktop() -> dict[str, str]:
     notes = {}
     hypr = shutil.which("hyprctl")
     if hypr:
-        result = subprocess.run([hypr, "reload"], capture_output=True, text=True, timeout=20)
+        result = run_bounded([hypr, "reload"], timeout=20)
         notes["hyprctl"] = "ok" if result.returncode == 0 else (result.stderr or result.stdout or "failed").strip()
     shell = shutil.which("omarchy-shell")
     if shell:
         for cmd in (["shell", "reloadConfig"], ["shell", "rescanPlugins"]):
-            result = subprocess.run([shell, *cmd], capture_output=True, text=True, timeout=20)
+            result = run_bounded([shell, *cmd], timeout=20)
             notes[" ".join(cmd)] = "ok" if result.returncode == 0 else (result.stderr or result.stdout or "failed").strip()
     return notes
 
