@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1137,21 +1138,23 @@ class SecurityHardeningTests(unittest.TestCase):
     def test_cmd_connect_never_passes_credentials_as_argv(self) -> None:
         ctx = self._ctx()
         seen_argv: list[list[str]] = []
-        real_run = subprocess.run
+        real_popen = subprocess.Popen
 
         def spy(cmd, *a, **kw):
-            if isinstance(cmd, list) and cmd and cmd[0] == "git":
-                seen_argv.append(cmd)
-            return real_run(cmd, *a, **kw)
+            if isinstance(cmd, list) and cmd:
+                seen_argv.append([str(c) for c in cmd])
+            return real_popen(cmd, *a, **kw)
 
         credentialed = "https://x-access-token:supersecrettoken@example-git-host.invalid/user/repo.git"
         # Not a resolvable host; just verify the argv-building path never emits the
         # raw secret, independent of whether the clone itself succeeds.
-        with patch.object(cs.subprocess, "run", side_effect=spy):
+        with patch.object(cs.subprocess, "Popen", side_effect=spy):
             try:
                 cs.cmd_connect(ctx, argparse_ns(args=[], stdin=False, url=credentialed))
             except cs.SyncError:
                 pass
+        git_cmds = [c for c in seen_argv if c and c[0] == "git"]
+        self.assertTrue(git_cmds, "expected at least one git invocation to be captured")
         for cmd in seen_argv:
             self.assertNotIn("supersecrettoken", " ".join(cmd))
 
@@ -1198,13 +1201,123 @@ class SecurityHardeningTests(unittest.TestCase):
             cs.prepare_git_credentials(ctx, "https://user:pa%0d%0ahost=evil.example%0a@github.com/x/y.git")
 
     def test_run_bounded_caps_output_size(self) -> None:
+        # The child may exit normally or be killed for overflow depending on
+        # timing; either way only max_bytes of output is ever kept.
         result = cs.run_bounded(
             [sys.executable, "-c", "import sys; sys.stdout.write('A' * 200)"],
             timeout=5,
             max_bytes=50,
         )
-        self.assertEqual(result.returncode, 0)
         self.assertEqual(len(result.stdout), 50)
+
+    def test_run_bounded_kills_runaway_child_before_timeout(self) -> None:
+        start = time.monotonic()
+        result = cs.run_bounded(
+            [sys.executable, "-u", "-c", "while True: print('x' * 8192)"],
+            timeout=30,
+            max_bytes=10_000,
+        )
+        elapsed = time.monotonic() - start
+        # Enforced while streaming: the writer is stopped long before the
+        # 30s timeout, and nothing beyond the cap is retained.
+        self.assertLess(elapsed, 10)
+        self.assertLessEqual(len(result.stdout), 10_000)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("output truncated", result.stderr)
+
+    def test_run_bounded_passes_input_and_captures_streams(self) -> None:
+        result = cs.run_bounded(
+            [sys.executable, "-c", "import sys; d=sys.stdin.read(); sys.stdout.write(d.upper()); sys.stderr.write('warn')"],
+            input="hello",
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "HELLO")
+        self.assertEqual(result.stderr, "warn")
+
+    def test_credential_store_rejects_fifo_via_descriptor_check(self) -> None:
+        ctx = self._ctx()
+        ctx.state_dir.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(ctx.state_dir / ".git-credentials")
+        with self.assertRaises(cs.SyncError):
+            cs.prepare_git_credentials(ctx, "https://user:secret@github.com/x/y.git")
+
+    def test_credential_store_written_without_subprocess_and_percent_encoded(self) -> None:
+        ctx = self._ctx()
+
+        def fail_popen(*a, **kw):
+            raise AssertionError("no subprocess may be spawned while storing the credential")
+
+        with patch.object(cs.subprocess, "Popen", side_effect=fail_popen):
+            clean_url, cred_file = cs.prepare_git_credentials(
+                ctx, "https://oauth2:p%40ss%3Aword@github.com/user/repo.git"
+            )
+        self.assertEqual(clean_url, "https://github.com/user/repo.git")
+        content = cred_file.read_text(encoding="utf-8")
+        # Special characters in the secret round-trip percent-encoded so they
+        # cannot corrupt the line-based store format.
+        self.assertEqual(content, "https://oauth2:p%40ss%3Aword@github.com\n")
+
+    def test_cred_helper_value_is_shell_quoted(self) -> None:
+        value = cs._cred_helper_value(Path("/home/o d'd/.git-credentials"))
+        self.assertEqual(value, "store --file='/home/o d'\\''d/.git-credentials'")
+        with self.assertRaises(cs.SyncError):
+            cs._cred_helper_value(Path("/tmp/bad\npath"))
+
+    def test_iter_files_refuses_symlinked_root(self) -> None:
+        real_dir = self.tmp / "real"
+        real_dir.mkdir()
+        (real_dir / "secret.txt").write_text("s", encoding="utf-8")
+        link = self.tmp / "link"
+        link.symlink_to(real_dir)
+        self.assertEqual(cs.iter_files(link), [])
+
+    def test_collect_inventory_skips_symlinked_hook_dir(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            outside = env.home / "outside"
+            outside.mkdir()
+            (outside / "stolen.txt").write_text("secret", encoding="utf-8")
+            hooks_dir = repo / "omarchy" / "hooks"
+            shutil.rmtree(hooks_dir)
+            hooks_dir.symlink_to(outside)
+            items = cs.collect_inventory(env.ctx, repo)
+            hook_paths = [i["path"] for i in items if i["path"].startswith("omarchy/hooks/")]
+            self.assertEqual(hook_paths, [])
+
+    def test_read_text_and_load_json_cap_oversized_files(self) -> None:
+        big = self.tmp / "big.lua"
+        big.write_text("x" * 100, encoding="utf-8")
+        with patch.object(cs, "MAX_TEXT_FILE_BYTES", 10):
+            self.assertEqual(cs.read_text(big), "")
+            self.assertEqual(cs.load_json(big, default={"d": 1}), {"d": 1})
+
+    def test_theme_scripts_never_default_or_exec(self) -> None:
+        # A theme checkbox must not expand to script files on apply...
+        files = [
+            {"path": "omarchy/themes/x/colors.conf", "group": "theme", "repo_exists": True, "local_exists": False},
+            {"path": "omarchy/themes/x/evil.sh", "group": "theme", "repo_exists": True, "local_exists": False},
+        ]
+        self.assertEqual(cs.expand_theme_paths(files, "apply"), {"omarchy/themes/x/colors.conf"})
+        # ...and a script applied outside bin//hooks/ never gets the exec bit.
+        src = self.tmp / "evil.sh"
+        src.write_text("#!/bin/sh\n", encoding="utf-8")
+        dst = self.tmp / "dst" / "evil.sh"
+        cs.copy_mapped_file({"path": "omarchy/themes/x/evil.sh", "repo_path": str(src), "local_path": str(dst)}, "apply")
+        self.assertEqual(dst.stat().st_mode & 0o777, 0o600)
+        bin_dst = self.tmp / "dst" / "tool"
+        cs.copy_mapped_file({"path": "bin/tool", "repo_path": str(src), "local_path": str(bin_dst)}, "apply")
+        self.assertEqual(bin_dst.stat().st_mode & 0o777, 0o755)
+
+    def test_merge_shortcuts_refuses_oversized_bindings(self) -> None:
+        source = self.tmp / "src.lua"
+        dest = self.tmp / "dest.lua"
+        source.write_text('o.bind("SUPER + A", "Alpha", "a")\n', encoding="utf-8")
+        dest.write_text("-- mine\n", encoding="utf-8")
+        with patch.object(cs, "MAX_TEXT_FILE_BYTES", 4):
+            with self.assertRaises(cs.SyncError):
+                cs.merge_shortcuts_file(dest, source, ["SUPER + A"])
+        self.assertEqual(dest.read_text(encoding="utf-8"), "-- mine\n")
 
     def test_collect_inventory_enforces_file_cap(self) -> None:
         with TempHome() as env:

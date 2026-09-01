@@ -13,11 +13,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import uuid
@@ -39,6 +41,9 @@ PUSH_TIMEOUT = 60
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_SUBPROCESS_BYTES = 2 * 1024 * 1024
 MAX_INVENTORY_FILES = 20_000
+MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
+MAX_SYNC_FILE_BYTES = 50 * 1024 * 1024
+MAX_URL_INPUT_BYTES = 64 * 1024
 
 BIND_RE = re.compile(
     r"""o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"([^"]*)")""",
@@ -50,7 +55,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.11"
+PLUGIN_VERSION = "1.2.12"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -144,8 +149,24 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def file_too_large(path: Path, max_bytes: int | None = None) -> bool:
+    """True when a file exceeds the cap. Untrusted repo files feed the text
+    parsers and previews; slurping them without a bound is a memory DoS."""
+    if max_bytes is None:
+        max_bytes = MAX_TEXT_FILE_BYTES
+    try:
+        return path.is_file() and path.stat().st_size > max_bytes
+    except OSError:
+        return False
+
+
 def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="replace")
+    if file_too_large(path):
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
@@ -178,6 +199,8 @@ def write_json(path: Path, data: Any) -> None:
 def load_json(path: Path, default: Any = None) -> Any:
     if not path.is_file() or path.is_symlink() or os.path.islink(path):
         return default
+    if file_too_large(path):
+        return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -204,7 +227,7 @@ def canonical_shell_bytes(path: Path) -> bytes | None:
     Apply restores the tray widget after copying, so a naive hash would
     always look dirty. Stripping our own id keeps real bar edits visible.
     """
-    if not path.is_file():
+    if not path.is_file() or file_too_large(path):
         return None
     data = load_json(path, default=None)
     if not isinstance(data, dict):
@@ -266,7 +289,7 @@ def normalize_source(raw: str) -> tuple[str, str]:
     if path.exists() and not str(path).startswith("-"):
         return "path", str(path)
     raise SyncError(
-        f"Not a local path, and not a git URL: {src}. "
+        f"Not a local path, and not a git URL: {sanitize_url(src)}. "
         "Use https://github.com/you/omarchy-config.git or ~/Github/omarchy-config."
     )
 
@@ -279,6 +302,29 @@ def git_env() -> dict[str, str]:
     return env
 
 
+def _drain_capped(pipe: Any, sink: list[bytes], max_bytes: int, overflow: threading.Event) -> None:
+    """Read a child pipe to EOF, keeping at most max_bytes and flagging overflow.
+
+    Draining continues past the cap (discarding) so the child never blocks on a
+    full pipe; the overflow flag lets the parent kill the process group instead."""
+    kept = 0
+    total = 0
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                return
+            total += len(chunk)
+            if kept < max_bytes:
+                take = chunk[: max_bytes - kept]
+                sink.append(take)
+                kept += len(take)
+            if total > max_bytes:
+                overflow.set()
+    except (OSError, ValueError):
+        pass
+
+
 def run_bounded(
     cmd: list[str],
     *,
@@ -288,25 +334,80 @@ def run_bounded(
     timeout: float = 30,
     max_bytes: int = MAX_SUBPROCESS_BYTES,
 ) -> subprocess.CompletedProcess[str]:
-    """subprocess.run() with stdout/stderr redirected straight to disk instead
-    of an in-memory pipe, so a runaway or malicious child (git operating on an
-    untrusted remote, hyprctl, omarchy-shell) cannot force unbounded memory
-    growth in this process. Only the first max_bytes of each stream is kept."""
-    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
-        proc = subprocess.run(
-            cmd,
-            input=input,
-            stdout=out_f,
-            stderr=err_f,
-            text=True,
-            timeout=timeout,
-            env=env,
-            cwd=cwd,
-        )
-        out_f.seek(0)
-        err_f.seek(0)
-        out = out_f.read(max_bytes).decode("utf-8", errors="replace")
-        err = err_f.read(max_bytes).decode("utf-8", errors="replace")
+    """subprocess.run(capture_output=True) with the byte cap enforced WHILE the
+    child (git on an untrusted remote, hyprctl, omarchy-shell) is running, not
+    after it exits: output streams through capped drain threads, nothing is
+    spooled to disk, and a child that exceeds its output budget has its whole
+    process group killed immediately instead of running until the timeout."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=cwd,
+        start_new_session=True,
+    )
+
+    def kill_group() -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+
+    overflow = threading.Event()
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    readers = [
+        threading.Thread(target=_drain_capped, args=(proc.stdout, out_chunks, max_bytes, overflow), daemon=True),
+        threading.Thread(target=_drain_capped, args=(proc.stderr, err_chunks, max_bytes, overflow), daemon=True),
+    ]
+    for t in readers:
+        t.start()
+    if input is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(input.encode("utf-8"))
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    deadline = time.monotonic() + timeout
+    truncated = False
+    while True:
+        try:
+            proc.wait(timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if overflow.is_set():
+            truncated = True
+            kill_group()
+            proc.wait()
+            break
+        if time.monotonic() >= deadline:
+            kill_group()
+            proc.wait()
+            for t in readers:
+                t.join(timeout=2)
+            for pipe in (proc.stdout, proc.stderr, proc.stdin):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except OSError:
+                    pass
+            raise subprocess.TimeoutExpired(cmd, timeout)
+    for t in readers:
+        t.join(timeout=5)
+    for pipe in (proc.stdout, proc.stderr, proc.stdin):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except OSError:
+            pass
+    out = b"".join(out_chunks).decode("utf-8", errors="replace")
+    err = b"".join(err_chunks).decode("utf-8", errors="replace")
+    if truncated:
+        err = (err + "\n[output truncated: process exceeded its output limit and was stopped]").strip()
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
@@ -339,20 +440,28 @@ _URL_CREDENTIALS_RE = re.compile(r"^(https?://)([^/@]+)@(.+)$")
 _CRLF_NUL_RE = re.compile(r"[\r\n\x00]")
 
 
-def _open_credential_store(path: Path) -> None:
-    """Ensure the credential-store file is a plain, 0600 file we created, never
-    following a pre-existing symlink or writing through some other non-regular
-    node an attacker (or a stale/racy leftover) placed at that path."""
+def _write_credential_store(path: Path, protocol: str, host: str, username: str, secret: str) -> None:
+    """Write the git-credential-store file ourselves through a verified
+    descriptor: the secret never enters a subprocess, O_NOFOLLOW blocks a
+    raced-in symlink, O_NONBLOCK keeps a raced-in FIFO from blocking the open,
+    and the S_ISREG check runs on the opened descriptor itself (fstat), so no
+    pathname race between a stat and the open can redirect the write."""
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        existing = path.lstat()
-    except FileNotFoundError:
-        existing = None
-    if existing is not None and not stat.S_ISREG(existing.st_mode):
-        raise SyncError("Refusing to write git credentials: unsafe path exists at the credential store location.")
-    flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(str(path), flags, 0o600)
+        fd = os.open(str(path), flags, 0o600)
+    except OSError as exc:
+        raise SyncError("Refusing to write git credentials: unsafe credential store path.") from exc
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SyncError("Refusing to write git credentials: credential store is not a regular file.")
         os.fchmod(fd, 0o600)
+        line = (
+            f"{protocol}://{urllib.parse.quote(username, safe='')}:"
+            f"{urllib.parse.quote(secret, safe='')}@{host}\n"
+        )
+        os.ftruncate(fd, 0)
+        os.write(fd, line.encode("utf-8"))
+        os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -371,34 +480,37 @@ def prepare_git_credentials(ctx: Context, url: str) -> tuple[str, Path | None]:
     secret = urllib.parse.unquote(secret) if secret else "x-oauth-basic"
     host = rest.split("/", 1)[0]
     protocol = scheme.split("://", 1)[0]
-    # Percent-decoding can smuggle CR/LF into git's line-based credential
-    # protocol; reject it outright rather than let it inject extra fields.
+    # Percent-decoding can smuggle CR/LF into the line-based store format and
+    # git's credential protocol; reject it rather than let it inject fields.
     if any(_CRLF_NUL_RE.search(v) for v in (username, secret, host)):
         raise SyncError("Git URL contains invalid characters in its credentials.")
     clean_url = f"{scheme}{rest}"
     ctx.state_dir.mkdir(parents=True, exist_ok=True)
     cred_file = ctx.state_dir / ".git-credentials"
-    _open_credential_store(cred_file)
-    payload = f"protocol={protocol}\nhost={host}\nusername={username}\npassword={secret}\n\n"
-    run_bounded(
-        ["git", "-c", f"credential.helper=store --file={cred_file}", "credential", "approve"],
-        input=payload,
-        timeout=10,
-        env=git_env(),
-    )
+    _write_credential_store(cred_file, protocol, host, username, secret)
     return clean_url, cred_file
+
+
+def _cred_helper_value(cred_file: Path) -> str:
+    """credential.helper value with the store path single-quoted for the shell
+    git uses to split helper commands, so a space or metacharacter in
+    HOME/XDG_DATA_HOME cannot break or extend the helper command line."""
+    p = str(cred_file)
+    if _CRLF_NUL_RE.search(p):
+        raise SyncError("Unsafe characters in the credential store path.")
+    return "store --file=" + "'" + p.replace("'", "'\\''") + "'"
 
 
 def git_cred_config_args(cred_file: Path | None) -> list[str]:
     if not cred_file:
         return []
-    return ["-c", f"credential.helper=store --file={cred_file}"]
+    return ["-c", f"credential.helper={_cred_helper_value(cred_file)}"]
 
 
 def persist_git_credential_helper(repo: Path, cred_file: Path | None) -> None:
     if not cred_file:
         return
-    run_git(repo, ["config", "credential.helper", f"store --file={cred_file}"], check=False)
+    run_git(repo, ["config", "credential.helper", _cred_helper_value(cred_file)], check=False)
 
 
 def sanitize_url(text: str) -> str:
@@ -712,6 +824,11 @@ def is_bundled_path(rel: str) -> bool:
     )
 
 
+def is_executable_payload(rel: str) -> bool:
+    """Files that would land as (or be treated as) runnable code."""
+    return rel.endswith((".sh", ".py", ".hook"))
+
+
 def is_hidden_item(kind: str, item_id: str, hidden_keys: set[str]) -> bool:
     if not hidden_keys:
         return False
@@ -754,11 +871,14 @@ def is_hidden_item(kind: str, item_id: str, hidden_keys: set[str]) -> bool:
 
 
 def iter_files(root: Path) -> list[Path]:
+    if root.is_symlink() or os.path.islink(root):
+        # os.walk(top) descends into a symlinked top directory even with
+        # followlinks=False; refuse it so a repo cannot alias a config dir
+        # to somewhere else (e.g. omarchy/hooks -> ~/.ssh).
+        return []
     if not root.exists():
         return []
     if root.is_file():
-        if root.is_symlink() or os.path.islink(root):
-            return []
         return [root]
     out: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -825,6 +945,8 @@ def terminal_map(ctx: Context) -> dict[str, Path]:
 
 def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     items: dict[str, dict[str, Any]] = {}
+    repo_resolved = repo.resolve()
+    home_resolved = ctx.home.resolve()
 
     def add(rel: str, local: Path, repo_file: Path, group: str, extra: dict[str, Any] | None = None) -> None:
         if not validate_safe_rel_path(rel):
@@ -839,6 +961,18 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
                 f"Linked repo has more than {MAX_INVENTORY_FILES} tracked files; "
                 "refusing to build a diff to avoid unbounded memory use."
             )
+        try:
+            # An intermediate directory symlink could alias a tracked path to
+            # somewhere outside the clone or the home tree; refuse the item.
+            if not repo_file.resolve().is_relative_to(repo_resolved):
+                return
+            if not local.resolve().is_relative_to(home_resolved):
+                return
+        except OSError:
+            return
+        if file_too_large(local, MAX_SYNC_FILE_BYTES) or file_too_large(repo_file, MAX_SYNC_FILE_BYTES):
+            # Not config material; skip rather than hash/copy something huge.
+            return
         local_regular = local.is_file() and not local.is_symlink() and not os.path.islink(local)
         repo_regular = repo_file.is_file() and not repo_file.is_symlink() and not os.path.islink(repo_file)
         items[rel] = {
@@ -892,7 +1026,9 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     repo_plugins = repo / "plugins"
     if repo_plugins.is_dir():
         plugin_ids.update(
-            p.name for p in repo_plugins.iterdir() if p.is_dir() and not p.name.startswith(".") and p.name != PLUGIN_ID
+            p.name
+            for p in repo_plugins.iterdir()
+            if p.is_dir() and not p.is_symlink() and not p.name.startswith(".") and p.name != PLUGIN_ID
         )
     if ctx.config_plugins.is_dir():
         plugin_ids.update(
@@ -943,7 +1079,7 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             slugs.add(slug)
     repo_themes = repo / "omarchy" / "themes"
     if repo_themes.is_dir():
-        slugs.update(p.name for p in repo_themes.iterdir() if p.is_dir() and not p.name.startswith("."))
+        slugs.update(p.name for p in repo_themes.iterdir() if p.is_dir() and not p.is_symlink() and not p.name.startswith("."))
     for slug in sorted(slugs):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug or ""):
             continue
@@ -1007,6 +1143,8 @@ def unified_preview(local_path: Path, repo_path: Path) -> str:
         import difflib
     except Exception:
         return ""
+    if file_too_large(local_path) or file_too_large(repo_path):
+        return "Binary or very large file — open the paths to compare."
     local_text = read_text(local_path) if local_path.is_file() else ""
     repo_text = read_text(repo_path) if repo_path.is_file() else ""
     if len(local_text) + len(repo_text) > MAX_DIFF_BYTES * 4:
@@ -1181,6 +1319,10 @@ def upsert_shortcut_lines(dest_text: str, source_entries: dict[str, dict[str, An
 def merge_shortcuts_file(dest: Path, source: Path, selected_keys: list[str]) -> bool:
     if not selected_keys:
         return False
+    if file_too_large(source) or file_too_large(dest):
+        # read_text() degrades oversized files to ""; merging on top of that
+        # would silently replace the user's bindings. Refuse instead.
+        raise SyncError("bindings.lua is too large to merge safely.")
     source_text = read_text(source) if (source.is_file() and not source.is_symlink() and not os.path.islink(source)) else ""
     source_entries = {e["keys"]: e for e in extract_bind_statements(source_text)}
     dest_text = read_text(dest) if (dest.is_file() and not dest.is_symlink() and not os.path.islink(dest)) else ""
@@ -1359,6 +1501,10 @@ def expand_theme_paths(files: list[dict[str, Any]], direction: str) -> set[str]:
         if item.get("group") != "theme":
             continue
         if direction == "apply" and item.get("repo_exists"):
+            # The theme checkbox must not smuggle runnable code onto the
+            # machine; scripts inside a theme overlay need their own opt-in.
+            if is_executable_payload(item["path"]):
+                continue
             out.add(item["path"])
         elif direction == "publish" and item.get("local_exists"):
             out.add(item["path"])
@@ -1595,6 +1741,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             and not item.get("git_managed")
             and not item["hidden"]
             and not is_bundled_path(item["path"])
+            and not is_executable_payload(item["path"])
         )
         item["default_publish"] = default_publish_status(status) and item["local_exists"] and not item["hidden"]
         if status not in {"identical", "machine"}:
@@ -1808,7 +1955,7 @@ def cmd_snapshot(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     source_raw = ""
     if getattr(args, "stdin", False):
-        source_raw = sys.stdin.read().strip()
+        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
     if not source_raw:
         source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
@@ -1929,11 +2076,13 @@ def copy_mapped_file(item: dict[str, Any], direction: str) -> None:
     if src.is_symlink() or os.path.islink(src):
         raise SyncError(f"Refusing to copy symlink: {src}")
     ensure_parent(dst)
+    # Only helper-script and hook trees — both explicit opt-in — ever get the
+    # executable bit; a script smuggled anywhere else lands non-executable.
     target_mode = (
         0o755
         if (
             direction == "apply"
-            and (item["path"].startswith("bin/") or src.suffix in {".py", ".sh"} or item["path"].endswith(".hook"))
+            and (item["path"].startswith("bin/") or item["path"].startswith("omarchy/hooks/"))
         )
         else 0o600
     )
@@ -2502,7 +2651,7 @@ def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx)
     source_raw = ""
     if getattr(args, "stdin", False):
-        source_raw = sys.stdin.read().strip()
+        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
     if not source_raw:
         source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
