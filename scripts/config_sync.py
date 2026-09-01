@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ MAX_DIFF_BYTES = 12_000
 CLONE_TIMEOUT = 120
 FETCH_TIMEOUT = 25
 PUSH_TIMEOUT = 60
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
 BIND_RE = re.compile(
     r"""o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"([^"]*)")""",
@@ -45,7 +47,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.9"
+PLUGIN_VERSION = "1.2.10"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -299,6 +301,54 @@ def run_git(
     if check and result.returncode != 0:
         raise SyncError(git_error_message(args, result))
     return result
+
+
+_URL_CREDENTIALS_RE = re.compile(r"^(https?://)([^/@]+)@(.+)$")
+
+
+def prepare_git_credentials(ctx: Context, url: str) -> tuple[str, Path | None]:
+    """Strip HTTP(S) credentials embedded in a git URL before it ever becomes a
+    git child-process argument. The credential is stashed in a 0600 git
+    credential-store file instead, so git authenticates via credential.helper
+    rather than argv, .git/config, or our own state/UI carrying the secret."""
+    match = _URL_CREDENTIALS_RE.match(url)
+    if not match:
+        return url, None
+    scheme, userinfo, rest = match.groups()
+    username, _, secret = userinfo.partition(":")
+    username = urllib.parse.unquote(username)
+    secret = urllib.parse.unquote(secret) if secret else "x-oauth-basic"
+    clean_url = f"{scheme}{rest}"
+    host = rest.split("/", 1)[0]
+    protocol = scheme.split("://", 1)[0]
+    ctx.state_dir.mkdir(parents=True, exist_ok=True)
+    cred_file = ctx.state_dir / ".git-credentials"
+    payload = f"protocol={protocol}\nhost={host}\nusername={username}\npassword={secret}\n\n"
+    subprocess.run(
+        ["git", "-c", f"credential.helper=store --file={cred_file}", "credential", "approve"],
+        input=payload,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        env=git_env(),
+    )
+    try:
+        os.chmod(cred_file, 0o600)
+    except OSError:
+        pass
+    return clean_url, cred_file
+
+
+def git_cred_config_args(cred_file: Path | None) -> list[str]:
+    if not cred_file:
+        return []
+    return ["-c", f"credential.helper=store --file={cred_file}"]
+
+
+def persist_git_credential_helper(repo: Path, cred_file: Path | None) -> None:
+    if not cred_file:
+        return
+    run_git(repo, ["config", "credential.helper", f"store --file={cred_file}"], check=False)
 
 
 def sanitize_url(text: str) -> str:
@@ -597,6 +647,19 @@ def summary_for(rel: str) -> str:
 
 def is_machine_local(rel: str) -> bool:
     return rel in MACHINE_LOCAL_PATHS
+
+
+def is_bundled_path(rel: str) -> bool:
+    """True for plugin/hook/agent/helper trees that carry executable code or
+    agent instructions and must never be auto-selected for Apply."""
+    return (
+        rel.startswith("plugins/")
+        or rel.startswith("omarchy/hooks/")
+        or rel.startswith("omarchy/agents/")
+        or rel.startswith("omarchy/branding/")
+        or rel.startswith("omarchy/extensions/")
+        or rel.startswith("bin/")
+    )
 
 
 def is_hidden_item(kind: str, item_id: str, hidden_keys: set[str]) -> bool:
@@ -1123,7 +1186,8 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "file_count": len(g["files"]),
                 "changed_count": len(statuses),
                 "git_managed": g["git_managed"],
-                "default_apply": status in {"repo", "added-repo", "differs", "both"} and not g["git_managed"],
+                # Plugins carry executable code; incoming ones require explicit opt-in, never a default-checked Apply.
+                "default_apply": False,
                 "default_publish": status in {"local", "added-local", "differs", "both"},
             }
         )
@@ -1201,7 +1265,9 @@ def file_bundles(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "status": status,
                 "files": [p for p, s in zip(b["files"], b["statuses"]) if s not in {"identical", "machine"}],
                 "changed_count": n,
-                "default_apply": status in {"repo", "added-repo", "differs"},
+                # Hooks/agents/branding/extensions/bin run code or steer an agent;
+                # incoming bundles require explicit opt-in, never a default-checked Apply.
+                "default_apply": False,
                 "default_publish": status in {"local", "added-local", "differs"},
             }
         )
@@ -1475,6 +1541,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             and item["repo_exists"]
             and not item.get("git_managed")
             and not item["hidden"]
+            and not is_bundled_path(item["path"])
         )
         item["default_publish"] = default_publish_status(status) and item["local_exists"] and not item["hidden"]
         if status not in {"identical", "machine"}:
@@ -1703,16 +1770,18 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 raise SyncError(f"{repo} is not a git repository.")
         return finish_connect(ctx, repo, git_out(repo, "remote", "get-url", "origin") or str(repo), using_existing=True, fetch=True)
 
+    clean_url, cred_file = prepare_git_credentials(ctx, value)
     clone_path = ctx.default_clone
     existing_state = load_state(ctx)
     previous_clone: Path | None = None
     if clone_path.exists() and (clone_path / ".git").exists():
         current_origin = git_out(clone_path, "remote", "get-url", "origin")
         same = (
-            current_origin.rstrip("/") == value.rstrip("/")
-            or current_origin.rstrip("/").removesuffix(".git") == value.rstrip("/").removesuffix(".git")
+            current_origin.rstrip("/") == clean_url.rstrip("/")
+            or current_origin.rstrip("/").removesuffix(".git") == clean_url.rstrip("/").removesuffix(".git")
         )
         if same:
+            persist_git_credential_helper(clone_path, cred_file)
             fetch_error = fetch_repo(clone_path)
             if fetch_error:
                 raise SyncError(fetch_error)
@@ -1722,25 +1791,37 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             previous_clone = ctx.state_dir / f"repo.bak.{int(time.time())}"
             clone_path.rename(previous_clone)
             clone_path = ctx.default_clone
-            result = run_git(None, ["clone", "--", value, str(clone_path)], timeout=CLONE_TIMEOUT, cwd=ctx.state_dir)
+            result = run_git(
+                None,
+                [*git_cred_config_args(cred_file), "clone", "--", clean_url, str(clone_path)],
+                timeout=CLONE_TIMEOUT,
+                cwd=ctx.state_dir,
+            )
             if result.returncode != 0:
                 if clone_path.exists():
                     shutil.rmtree(clone_path, ignore_errors=True)
                 if previous_clone.exists():
                     previous_clone.rename(ctx.default_clone)
-                raise SyncError(git_error_message(["clone", value], result))
+                raise SyncError(git_error_message(["clone", clean_url], result))
+            persist_git_credential_helper(clone_path, cred_file)
     else:
         if clone_path.exists():
             shutil.rmtree(clone_path)
-        result = run_git(None, ["clone", "--", value, str(clone_path)], timeout=CLONE_TIMEOUT, cwd=ctx.state_dir)
+        result = run_git(
+            None,
+            [*git_cred_config_args(cred_file), "clone", "--", clean_url, str(clone_path)],
+            timeout=CLONE_TIMEOUT,
+            cwd=ctx.state_dir,
+        )
         if result.returncode != 0:
             if clone_path.exists():
                 shutil.rmtree(clone_path, ignore_errors=True)
-            raise SyncError(git_error_message(["clone", value], result))
+            raise SyncError(git_error_message(["clone", clean_url], result))
+        persist_git_credential_helper(clone_path, cred_file)
 
     try:
-        snap = finish_connect(ctx, clone_path, value, using_existing=False, fetch=False)
-        snap["message"] = snap.get("message") or f"Linked {value}"
+        snap = finish_connect(ctx, clone_path, clean_url, using_existing=False, fetch=False)
+        snap["message"] = snap.get("message") or f"Linked {clean_url}"
         return snap
     except SyncError:
         if clone_path.exists() and not existing_state.get("using_existing_clone"):
@@ -2374,16 +2455,18 @@ def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     kind, value = normalize_source(source_raw)
     if kind != "url":
         raise SyncError("set-url expects a git remote URL.")
+    clean_url, cred_file = prepare_git_credentials(ctx, value)
     result = run_git(repo, ["remote", "get-url", "origin"])
     if result.returncode != 0:
-        run_git(repo, ["remote", "add", "origin", value], check=True)
+        run_git(repo, ["remote", "add", "origin", clean_url], check=True)
     else:
-        run_git(repo, ["remote", "set-url", "origin", value], check=True)
+        run_git(repo, ["remote", "set-url", "origin", clean_url], check=True)
+    persist_git_credential_helper(repo, cred_file)
     state = load_state(ctx)
-    state["repo_url"] = value
+    state["repo_url"] = clean_url
     save_state(ctx, state)
     snap = build_snapshot(ctx, fetch=True)
-    snap["message"] = f"Origin set to {value}"
+    snap["message"] = f"Origin set to {clean_url}"
     return snap
 
 
@@ -2707,7 +2790,12 @@ def main(argv: list[str] | None = None) -> int:
         result = fail(str(exc), **exc.extra)
     except Exception as exc:  # noqa: BLE001 — CLI must never print a traceback to QML
         result = fail(str(exc) or exc.__class__.__name__)
-    sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    payload = json.dumps(result, ensure_ascii=False)
+    if len(payload.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        # Enforce the bound before writing, not after the panel has buffered it all.
+        result = fail("Sync response exceeded the maximum size (5MB); the repo has too much changed data to display safely.")
+        payload = json.dumps(result, ensure_ascii=False)
+    sys.stdout.write(payload + "\n")
     return 0 if result.get("ok") else 1
 
 

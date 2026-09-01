@@ -241,12 +241,14 @@ Panel {
     for (i = 0; i < pluginDiffs.length; i++) {
       item = pluginDiffs[i]
       key = pickId("p", item.id)
-      next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish || item.status === "differs")
+      // Plugins run code: never default-check an incoming one, only ever an outgoing publish.
+      next[key] = (key in picks) ? picks[key] : !!item.default_publish
     }
     for (i = 0; i < bundleDiffs.length; i++) {
       item = bundleDiffs[i]
       key = pickId("g", item.id)
-      next[key] = (key in picks) ? picks[key] : !!(item.default_apply || item.default_publish || item.status === "differs")
+      // Hooks/agents/branding/extensions/bin run code or steer an agent: same rule as plugins.
+      next[key] = (key in picks) ? picks[key] : !!item.default_publish
     }
     if (themeDiff) {
       key = pickId("t", "selected")
@@ -1403,7 +1405,7 @@ Panel {
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }
         TablePair { label: "Last publish"; value: Model.relativeAgo(root.status.last_publish_at) }
-        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.9") }
+        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.10") }
         TablePair {
           label: "Theme"
           value: {

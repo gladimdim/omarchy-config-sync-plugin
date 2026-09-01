@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -264,6 +265,16 @@ class ShortcutTests(unittest.TestCase):
             cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
             applied = cs.cmd_apply(env.ctx, argparse_ns())
             self.assertTrue(applied["ok"], applied)
+            # Plugins/hooks/bin run code, so they need a separate explicit opt-in apply.
+            bundle_applied = cs.cmd_apply(
+                env.ctx,
+                argparse_ns(
+                    explicit=True,
+                    files="bin/useful-tool,omarchy/hooks/post-update.d/setup-agent.hook",
+                    plugin=["demo.widget"],
+                ),
+            )
+            self.assertTrue(bundle_applied["ok"], bundle_applied)
             original = (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8")
             write(repo / "hypr" / "bindings.lua", "-- only a comment changed\n" + original)
             commit_all(repo, "comment-only bindings")
@@ -449,17 +460,34 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertIn(cs.PLUGIN_ID, right)
             kept = [e for e in shell["bar"]["layout"]["right"] if isinstance(e, dict) and e.get("id") == cs.PLUGIN_ID][0]
             self.assertEqual(kept.get("note"), "keep-me")
+            self.assertTrue(Path(applied["backup_dir"]).is_dir())
+
+            # Plugins/bin run code, so they require a separate explicit opt-in apply
+            # rather than landing via the default (unselected) Apply above.
+            bundle_applied = cs.cmd_apply(
+                env.ctx,
+                argparse_ns(explicit=True, files="bin/useful-tool", plugin=["demo.widget"]),
+            )
+            self.assertTrue(bundle_applied["ok"], bundle_applied)
             self.assertTrue((env.ctx.config_plugins / "demo.widget" / "manifest.json").is_file())
             self.assertTrue((env.ctx.local_bin / "useful-tool").is_file())
             self.assertTrue(os.access(env.ctx.local_bin / "useful-tool", os.X_OK))
-            self.assertTrue(Path(applied["backup_dir"]).is_dir())
 
     def test_publish_local_shortcut_and_ignores_config_sync_plugin(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
             cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
-            # First apply so hashes exist, then edit locally.
+            # First apply so hashes exist, then edit locally. Plugins/hooks/bin
+            # run code, so they need a separate explicit opt-in apply.
             cs.cmd_apply(env.ctx, argparse_ns())
+            cs.cmd_apply(
+                env.ctx,
+                argparse_ns(
+                    explicit=True,
+                    files="bin/useful-tool,omarchy/hooks/post-update.d/setup-agent.hook",
+                    plugin=["demo.widget"],
+                ),
+            )
             bindings = env.ctx.config_hypr / "bindings.lua"
             text = bindings.read_text(encoding="utf-8")
             bindings.write_text(text + 'o.bind("SUPER + Y", "New shortcut", "true")\n', encoding="utf-8")
@@ -1077,6 +1105,92 @@ class SecurityHardeningTests(unittest.TestCase):
         sanitized2 = cs.sanitize_url(url_with_user_only)
         self.assertNotIn("ghp_secretToken123", sanitized2)
         self.assertEqual(sanitized2, "https://***@github.com/user/repo.git")
+
+    def _ctx(self) -> "cs.Context":
+        return cs.Context(home=self.tmp, state_dir=self.tmp / "state", default_clone=self.tmp / "state" / "repo")
+
+    def test_prepare_git_credentials_strips_embedded_secret(self) -> None:
+        ctx = self._ctx()
+        clean_url, cred_file = cs.prepare_git_credentials(
+            ctx, "https://oauth2:ghp_secretToken123@github.com/user/repo.git"
+        )
+        self.assertEqual(clean_url, "https://github.com/user/repo.git")
+        self.assertNotIn("ghp_secretToken123", clean_url)
+        self.assertIsNotNone(cred_file)
+        self.assertTrue(cred_file.is_file())
+        mode = cred_file.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        # The secret lives only in the 0600 credential store, never in the clean URL.
+        self.assertIn("ghp_secretToken123", cred_file.read_text(encoding="utf-8"))
+
+    def test_prepare_git_credentials_noop_without_embedded_secret(self) -> None:
+        ctx = self._ctx()
+        clean_url, cred_file = cs.prepare_git_credentials(ctx, "https://github.com/user/repo.git")
+        self.assertEqual(clean_url, "https://github.com/user/repo.git")
+        self.assertIsNone(cred_file)
+
+        ssh_url = "git@github.com:user/repo.git"
+        clean_ssh, cred_ssh = cs.prepare_git_credentials(ctx, ssh_url)
+        self.assertEqual(clean_ssh, ssh_url)
+        self.assertIsNone(cred_ssh)
+
+    def test_cmd_connect_never_passes_credentials_as_argv(self) -> None:
+        ctx = self._ctx()
+        seen_argv: list[list[str]] = []
+        real_run = subprocess.run
+
+        def spy(cmd, *a, **kw):
+            if isinstance(cmd, list) and cmd and cmd[0] == "git":
+                seen_argv.append(cmd)
+            return real_run(cmd, *a, **kw)
+
+        credentialed = "https://x-access-token:supersecrettoken@example-git-host.invalid/user/repo.git"
+        # Not a resolvable host; just verify the argv-building path never emits the
+        # raw secret, independent of whether the clone itself succeeds.
+        with patch.object(cs.subprocess, "run", side_effect=spy):
+            try:
+                cs.cmd_connect(ctx, argparse_ns(args=[], stdin=False, url=credentialed))
+            except cs.SyncError:
+                pass
+        for cmd in seen_argv:
+            self.assertNotIn("supersecrettoken", " ".join(cmd))
+
+    def test_plugin_groups_never_default_apply_incoming(self) -> None:
+        for status in ("added-repo", "repo", "differs", "both"):
+            files = [{"path": "plugins/evil.plugin/Panel.qml", "status": status}]
+            groups = cs.plugin_groups(files)
+            self.assertEqual(len(groups), 1)
+            self.assertFalse(groups[0]["default_apply"], f"status={status} must not default-apply a plugin")
+
+    def test_file_bundles_never_default_apply_incoming(self) -> None:
+        paths = [
+            "omarchy/hooks/pre-apply.d/evil.sh",
+            "omarchy/agents/evil-agent.md",
+            "bin/evil-helper",
+            "omarchy/extensions/evil-ext.js",
+        ]
+        for path in paths:
+            bundles = cs.file_bundles([{"path": path, "status": "added-repo"}])
+            self.assertEqual(len(bundles), 1)
+            self.assertFalse(bundles[0]["default_apply"], f"{path} should not default-apply")
+
+    def test_annotate_diff_default_apply_excludes_bundled_paths(self) -> None:
+        self.assertTrue(cs.is_bundled_path("plugins/foo/Panel.qml"))
+        self.assertTrue(cs.is_bundled_path("omarchy/hooks/pre-apply.d/x.sh"))
+        self.assertTrue(cs.is_bundled_path("omarchy/agents/x.md"))
+        self.assertTrue(cs.is_bundled_path("bin/x"))
+        self.assertFalse(cs.is_bundled_path("hypr/bindings.lua"))
+
+    def test_main_enforces_response_size_cap_before_writing(self) -> None:
+        huge = cs.ok({"blob": "x" * (cs.MAX_RESPONSE_BYTES + 1000)})
+        buf = io.StringIO()
+        with patch.object(cs, "dispatch", return_value=huge), patch("sys.stdout", buf):
+            cs.main(["snapshot"])
+        out = buf.getvalue()
+        self.assertLess(len(out.encode("utf-8")), cs.MAX_RESPONSE_BYTES)
+        data = json.loads(out)
+        self.assertFalse(data["ok"])
+        self.assertIn("exceeded", data["error"])
 
 
 if __name__ == "__main__":
