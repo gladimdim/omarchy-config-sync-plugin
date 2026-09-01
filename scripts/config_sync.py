@@ -8,6 +8,7 @@ a message instead of hanging the panel.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -55,7 +56,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.12"
+PLUGIN_VERSION = "1.2.13"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -160,13 +161,77 @@ def file_too_large(path: Path, max_bytes: int | None = None) -> bool:
         return False
 
 
-def read_text(path: Path) -> str:
-    if file_too_large(path):
-        return ""
+def _open_bound(path: Path | str, max_bytes: int | None = None, within: Path | None = None) -> int | None:
+    """Open a file with every trust property bound to the opened inode:
+    O_NOFOLLOW refuses a symlink leaf at open time, S_ISREG and the size cap
+    run via fstat on the descriptor, and (when `within` is given) the opened
+    inode's canonical path is rechecked through /proc/self/fd. Nothing a
+    concurrent writer swaps in between a stat and an open can redirect the
+    read, inflate it past its cap, or escape containment. Returns None when
+    the file is missing, a symlink, non-regular, oversized, or out of tree."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        fd = os.open(str(path), flags)
     except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        if max_bytes is not None and st.st_size > max_bytes:
+            raise OSError(errno.EFBIG, "exceeds size cap")
+        if within is not None:
+            proc_link = f"/proc/self/fd/{fd}"
+            if os.path.lexists(proc_link):
+                actual = Path(os.path.realpath(proc_link))
+                if not actual.is_relative_to(within.resolve()):
+                    raise OSError(errno.EXDEV, "resolves outside the allowed root")
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def _read_fd_capped(fd: int, max_bytes: int) -> bytes | None:
+    """Read at most max_bytes from fd; None when more data exists (covers a
+    file that grows after the fstat size check)."""
+    chunks: list[bytes] = []
+    remaining = max_bytes + 1
+    while remaining > 0:
+        try:
+            chunk = os.read(fd, min(65536, remaining))
+        except OSError:
+            return None
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if remaining <= 0:
+        return None
+    return b"".join(chunks)
+
+
+def read_bytes_bound(path: Path, max_bytes: int | None = None, within: Path | None = None) -> bytes | None:
+    cap = MAX_TEXT_FILE_BYTES if max_bytes is None else max_bytes
+    fd = _open_bound(path, cap, within)
+    if fd is None:
+        return None
+    try:
+        return _read_fd_capped(fd, cap)
+    finally:
+        os.close(fd)
+
+
+def read_text(path: Path) -> str:
+    data = read_bytes_bound(path)
+    if data is None:
         return ""
+    return data.decode("utf-8", errors="replace")
 
 
 def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
@@ -199,11 +264,12 @@ def write_json(path: Path, data: Any) -> None:
 def load_json(path: Path, default: Any = None) -> Any:
     if not path.is_file() or path.is_symlink() or os.path.islink(path):
         return default
-    if file_too_large(path):
+    data = read_bytes_bound(path)
+    if data is None:
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return default
 
 
@@ -212,12 +278,24 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def sha256_file(path: Path) -> str | None:
-    if not path.is_file() or path.is_symlink() or os.path.islink(path):
+    fd = _open_bound(path, MAX_SYNC_FILE_BYTES)
+    if fd is None:
         return None
     h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 256), b""):
+    total = 0
+    try:
+        while True:
+            chunk = os.read(fd, 1024 * 256)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_SYNC_FILE_BYTES:
+                return None
             h.update(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
     return h.hexdigest()
 
 
@@ -231,10 +309,7 @@ def canonical_shell_bytes(path: Path) -> bytes | None:
         return None
     data = load_json(path, default=None)
     if not isinstance(data, dict):
-        try:
-            return path.read_bytes()
-        except OSError:
-            return None
+        return read_bytes_bound(path)
     bar = data.get("bar")
     if isinstance(bar, dict):
         layout = bar.get("layout")
@@ -563,10 +638,9 @@ def read_or_create_session(plugin_root: Path | None) -> str | None:
     if plugin_root is None:
         return None
     path = plugin_root / SESSION_FILE
-    if path.is_file() and not path.is_symlink() and not os.path.islink(path):
-        value = path.read_text(encoding="utf-8").strip()
-        if value:
-            return value
+    value = read_text(path).strip()
+    if value:
+        return value
     value = uuid.uuid4().hex
     try:
         atomic_write_text(path, value + "\n", mode=0o600)
@@ -2068,42 +2142,75 @@ def cmd_disconnect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return ok({"disconnected": True, "deleted_clone": deleted})
 
 
-def copy_mapped_file(item: dict[str, Any], direction: str) -> None:
+def copy_mapped_file(item: dict[str, Any], direction: str, src_root: Path | None = None) -> None:
     src = Path(item["repo_path"] if direction == "apply" else item["local_path"])
     dst = Path(item["local_path"] if direction == "apply" else item["repo_path"])
-    if not src.is_file():
-        raise SyncError(f"Missing source file: {src}")
-    if src.is_symlink() or os.path.islink(src):
-        raise SyncError(f"Refusing to copy symlink: {src}")
-    ensure_parent(dst)
-    # Only helper-script and hook trees — both explicit opt-in — ever get the
-    # executable bit; a script smuggled anywhere else lands non-executable.
-    target_mode = (
-        0o755
-        if (
-            direction == "apply"
-            and (item["path"].startswith("bin/") or item["path"].startswith("omarchy/hooks/"))
-        )
-        else 0o600
+    # Every check is bound to the inode actually copied: O_NOFOLLOW at open,
+    # S_ISREG/size via fstat on the descriptor, containment rechecked through
+    # /proc/self/fd, and the bytes read from that same descriptor. A pathname
+    # swapped between check and copy cannot redirect what gets copied.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
     )
-    with tempfile.NamedTemporaryFile(
-        dir=dst.parent,
-        prefix=f".{dst.name}.tmp-",
-        delete=False,
-    ) as tmp:
-        tmp_path = Path(tmp.name)
-        try:
-            os.chmod(tmp.fileno(), target_mode)
-            with open(src, "rb") as fsrc:
-                shutil.copyfileobj(fsrc, tmp)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        except Exception:
-            tmp.close()
-            if tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
-            raise
-    os.replace(tmp_path, dst)
+    try:
+        src_fd = os.open(str(src), flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SyncError(f"Refusing to copy symlink: {src}") from exc
+        raise SyncError(f"Missing source file: {src}") from exc
+    try:
+        st = os.fstat(src_fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SyncError(f"Refusing to copy non-regular file: {src}")
+        if st.st_size > MAX_SYNC_FILE_BYTES:
+            raise SyncError(f"Refusing to copy oversized file: {src}")
+        if src_root is not None:
+            proc_link = f"/proc/self/fd/{src_fd}"
+            if os.path.lexists(proc_link):
+                actual = Path(os.path.realpath(proc_link))
+                if not actual.is_relative_to(src_root.resolve()):
+                    raise SyncError(f"Refusing to copy {src}: it resolves outside {src_root}")
+        ensure_parent(dst)
+        # Only helper-script and hook trees — both explicit opt-in — ever get the
+        # executable bit; a script smuggled anywhere else lands non-executable.
+        target_mode = (
+            0o755
+            if (
+                direction == "apply"
+                and (item["path"].startswith("bin/") or item["path"].startswith("omarchy/hooks/"))
+            )
+            else 0o600
+        )
+        with tempfile.NamedTemporaryFile(
+            dir=dst.parent,
+            prefix=f".{dst.name}.tmp-",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            try:
+                os.chmod(tmp.fileno(), target_mode)
+                remaining = MAX_SYNC_FILE_BYTES + 1
+                while True:
+                    chunk = os.read(src_fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    remaining -= len(chunk)
+                    if remaining <= 0:
+                        raise SyncError(f"Refusing to copy {src}: it grew past the size limit during the copy.")
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            except Exception:
+                tmp.close()
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+                raise
+        os.replace(tmp_path, dst)
+    finally:
+        os.close(src_fd)
 
 
 def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
@@ -2112,7 +2219,8 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
     copied = 0
     for item in files:
         src = Path(item["local_path"])
-        if not src.is_file() or src.is_symlink() or os.path.islink(src):
+        src_fd = _open_bound(src, MAX_SYNC_FILE_BYTES)
+        if src_fd is None:
             continue
         rel = Path(item["path"])
         # Map back into a backup tree that mirrors ~/.config and ~/.local/bin
@@ -2133,7 +2241,8 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
             tmp_path = Path(tmp.name)
             try:
                 os.chmod(tmp.fileno(), 0o600)
-                with open(src, "rb") as fsrc:
+                with os.fdopen(src_fd, "rb") as fsrc:
+                    src_fd = None
                     shutil.copyfileobj(fsrc, tmp)
                 tmp.flush()
                 os.fsync(tmp.fileno())
@@ -2142,6 +2251,9 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
                 if tmp_path.exists():
                     tmp_path.unlink(missing_ok=True)
                 raise
+            finally:
+                if src_fd is not None:
+                    os.close(src_fd)
         os.replace(tmp_path, dest)
         copied += 1
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -2306,7 +2418,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     for item in chosen:
         if not Path(item["repo_path"]).is_file():
             continue
-        copy_mapped_file(item, "apply")
+        copy_mapped_file(item, "apply", src_root=repo)
         applied.append(item["path"])
     if shortcut_keys:
         if merge_shortcuts_file(bindings_local, repo / "hypr" / "bindings.lua", shortcut_keys):
@@ -2432,7 +2544,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     for item in chosen:
         if not Path(item["local_path"]).is_file():
             continue
-        copy_mapped_file(item, "publish")
+        copy_mapped_file(item, "publish", src_root=ctx.home)
         published.append(item["path"])
     if shortcut_keys:
         if merge_shortcuts_file(repo / "hypr" / "bindings.lua", ctx.config_hypr / "bindings.lua", shortcut_keys):

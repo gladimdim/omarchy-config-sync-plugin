@@ -1319,6 +1319,72 @@ class SecurityHardeningTests(unittest.TestCase):
                 cs.merge_shortcuts_file(dest, source, ["SUPER + A"])
         self.assertEqual(dest.read_text(encoding="utf-8"), "-- mine\n")
 
+    def test_read_text_is_inode_bound(self) -> None:
+        real = self.tmp / "real.txt"
+        real.write_text("secret", encoding="utf-8")
+        link = self.tmp / "link.txt"
+        link.symlink_to(real)
+        # A symlink leaf is refused at open time (O_NOFOLLOW), not via a
+        # separate racy pathname check.
+        self.assertEqual(cs.read_text(link), "")
+        fifo = self.tmp / "fifo.txt"
+        os.mkfifo(fifo)
+        # A FIFO neither blocks the open (O_NONBLOCK) nor passes fstat S_ISREG.
+        self.assertEqual(cs.read_text(fifo), "")
+        self.assertEqual(cs.read_text(real), "secret")
+
+    def test_sha256_file_refuses_non_regular_inodes(self) -> None:
+        real = self.tmp / "real.bin"
+        real.write_bytes(b"data")
+        link = self.tmp / "link.bin"
+        link.symlink_to(real)
+        fifo = self.tmp / "fifo.bin"
+        os.mkfifo(fifo)
+        self.assertIsNone(cs.sha256_file(link))
+        self.assertIsNone(cs.sha256_file(fifo))
+        self.assertIsNotNone(cs.sha256_file(real))
+
+    def test_copy_mapped_file_refuses_fifo_and_oversized_src(self) -> None:
+        fifo = self.tmp / "fifo.lua"
+        os.mkfifo(fifo)
+        dst = self.tmp / "out" / "f.lua"
+        with self.assertRaises(cs.SyncError) as cm:
+            cs.copy_mapped_file({"path": "hypr/f.lua", "repo_path": str(fifo), "local_path": str(dst)}, "apply")
+        self.assertIn("non-regular", str(cm.exception))
+        big = self.tmp / "big.lua"
+        big.write_text("x" * 100, encoding="utf-8")
+        with patch.object(cs, "MAX_SYNC_FILE_BYTES", 10):
+            with self.assertRaises(cs.SyncError) as cm2:
+                cs.copy_mapped_file({"path": "hypr/f.lua", "repo_path": str(big), "local_path": str(dst)}, "apply")
+        self.assertIn("oversized", str(cm2.exception))
+        self.assertFalse(dst.exists())
+
+    def test_copy_mapped_file_containment_bound_to_descriptor(self) -> None:
+        clone = self.tmp / "clone"
+        (clone / "hypr").mkdir(parents=True)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "leak.lua").write_text("private", encoding="utf-8")
+        # A directory symlink inside the "clone" aliases a tracked path to a
+        # regular file outside it: the leaf open succeeds, but the descriptor
+        # containment recheck must refuse it.
+        (clone / "sub").symlink_to(outside)
+        dst = self.tmp / "out" / "leak.lua"
+        item = {"path": "sub/leak.lua", "repo_path": str(clone / "sub" / "leak.lua"), "local_path": str(dst)}
+        with self.assertRaises(cs.SyncError) as cm:
+            cs.copy_mapped_file(item, "apply", src_root=clone)
+        self.assertIn("outside", str(cm.exception))
+        self.assertFalse(dst.exists())
+        # The same copy without escaping succeeds.
+        (clone / "hypr" / "ok.lua").write_text("fine", encoding="utf-8")
+        ok_dst = self.tmp / "out" / "ok.lua"
+        cs.copy_mapped_file(
+            {"path": "hypr/ok.lua", "repo_path": str(clone / "hypr" / "ok.lua"), "local_path": str(ok_dst)},
+            "apply",
+            src_root=clone,
+        )
+        self.assertEqual(ok_dst.read_text(encoding="utf-8"), "fine")
+
     def test_collect_inventory_enforces_file_cap(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
