@@ -879,35 +879,45 @@ Panel {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(6)
+            height: Math.max(btnRefresh.implicitHeight, btnEdit.implicitHeight, btnClose.implicitHeight)
 
             Button {
+              id: btnRefresh
               iconText: "󰑐"
               tooltipText: "Refresh (r)"
               foreground: root.foreground
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              height: parent.height
               enabled: !root.busy
               onClicked: root.refresh(true)
             }
 
             Button {
+              id: btnEdit
               visible: root.configured
               text: "Edit"
               tooltipText: "Use a different git repo"
               foreground: root.foreground
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              height: parent.height
               enabled: !root.busy
               onClicked: root.startEditRepo()
             }
 
             Button {
+              id: btnClose
               visible: root.configured
               iconText: "󰅖"
               tooltipText: "Unlink this repo"
               foreground: root.foreground
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              height: parent.height
               enabled: !root.busy
               onClicked: root.confirmKind = "disconnect"
             }
