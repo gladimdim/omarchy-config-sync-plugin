@@ -16,6 +16,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -44,7 +45,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.8"
+PLUGIN_VERSION = "1.2.9"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -142,15 +143,35 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def write_json(path: Path, data: Any) -> None:
+def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
     ensure_parent(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    data = content.encode("utf-8")
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.tmp-",
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+        try:
+            os.chmod(tmp.fileno(), mode)
+            tmp.write(data)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        except Exception:
+            tmp.close()
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise
+    os.replace(tmp_path, path)
+
+
+def write_json(path: Path, data: Any) -> None:
+    content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    atomic_write_text(path, content, mode=0o600)
 
 
 def load_json(path: Path, default: Any = None) -> Any:
-    if not path.is_file():
+    if not path.is_file() or path.is_symlink() or os.path.islink(path):
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -163,7 +184,7 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def sha256_file(path: Path) -> str | None:
-    if not path.is_file():
+    if not path.is_file() or path.is_symlink() or os.path.islink(path):
         return None
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -280,9 +301,15 @@ def run_git(
     return result
 
 
+def sanitize_url(text: str) -> str:
+    """Mask tokens or passwords embedded in git URLs (e.g. https://token@github.com)."""
+    return re.sub(r"://([^/@:]+):([^/@]+)@", "://***:***@", re.sub(r"://([^/@:]+)@", "://***@", text))
+
+
 def git_error_message(args: list[str], result: subprocess.CompletedProcess[str]) -> str:
     err = (result.stderr or result.stdout or "").strip()
     err = re.sub(r"\s+", " ", err)
+    err = sanitize_url(err)
     if "Permission denied" in err or "Could not read from remote" in err:
         return "Git could not authenticate with the remote. Set up SSH keys or a credential helper, then try again."
     if "Repository not found" in err or "not found" in err.lower():
@@ -324,14 +351,13 @@ def read_or_create_session(plugin_root: Path | None) -> str | None:
     if plugin_root is None:
         return None
     path = plugin_root / SESSION_FILE
-    if path.is_file():
+    if path.is_file() and not path.is_symlink() and not os.path.islink(path):
         value = path.read_text(encoding="utf-8").strip()
         if value:
             return value
     value = uuid.uuid4().hex
     try:
-        plugin_root.mkdir(parents=True, exist_ok=True)
-        path.write_text(value + "\n", encoding="utf-8")
+        atomic_write_text(path, value + "\n", mode=0o600)
     except OSError:
         return None
     return value
@@ -618,16 +644,27 @@ def iter_files(root: Path) -> list[Path]:
     if not root.exists():
         return []
     if root.is_file():
+        if root.is_symlink() or os.path.islink(root):
+            return []
         return [root]
     out: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES and not d.startswith(".")]
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in SKIP_DIR_NAMES
+            and not d.startswith(".")
+            and not os.path.islink(os.path.join(dirpath, d))
+        ]
         for name in filenames:
             if name.startswith(".") and name not in {MARKER_NAME}:
                 continue
             if is_skipped_file(name):
                 continue
-            out.append(Path(dirpath) / name)
+            fpath = Path(dirpath) / name
+            if fpath.is_symlink() or os.path.islink(fpath):
+                continue
+            out.append(fpath)
     return out
 
 
@@ -677,8 +714,12 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     items: dict[str, dict[str, Any]] = {}
 
     def add(rel: str, local: Path, repo_file: Path, group: str, extra: dict[str, Any] | None = None) -> None:
+        if not validate_safe_rel_path(rel):
+            return
         if rel in items:
             return
+        local_regular = local.is_file() and not local.is_symlink() and not os.path.islink(local)
+        repo_regular = repo_file.is_file() and not repo_file.is_symlink() and not os.path.islink(repo_file)
         items[rel] = {
             "path": rel,
             "group": group,
@@ -686,10 +727,10 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             "portable": not is_machine_local(rel),
             "local_path": str(local),
             "repo_path": str(repo_file),
-            "local_exists": local.is_file(),
-            "repo_exists": repo_file.is_file(),
-            "local_hash": file_hash(local, rel),
-            "repo_hash": file_hash(repo_file, rel),
+            "local_exists": local_regular,
+            "repo_exists": repo_regular,
+            "local_hash": file_hash(local, rel) if local_regular else None,
+            "repo_hash": file_hash(repo_file, rel) if repo_regular else None,
             "git_managed": False,
         }
         if extra:
@@ -1019,14 +1060,13 @@ def upsert_shortcut_lines(dest_text: str, source_entries: dict[str, dict[str, An
 def merge_shortcuts_file(dest: Path, source: Path, selected_keys: list[str]) -> bool:
     if not selected_keys:
         return False
-    source_text = read_text(source) if source.is_file() else ""
+    source_text = read_text(source) if (source.is_file() and not source.is_symlink() and not os.path.islink(source)) else ""
     source_entries = {e["keys"]: e for e in extract_bind_statements(source_text)}
-    dest_text = read_text(dest) if dest.is_file() else ""
+    dest_text = read_text(dest) if (dest.is_file() and not dest.is_symlink() and not os.path.islink(dest)) else ""
     merged = upsert_shortcut_lines(dest_text, source_entries, selected_keys)
     if merged == dest_text:
         return False
-    ensure_parent(dest)
-    dest.write_text(merged, encoding="utf-8")
+    atomic_write_text(dest, merged, mode=0o600)
     return True
 
 
@@ -1646,7 +1686,11 @@ def cmd_snapshot(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
-    source_raw = " ".join(args.args).strip() or (args.url or "")
+    source_raw = ""
+    if getattr(args, "stdin", False):
+        source_raw = sys.stdin.read().strip()
+    if not source_raw:
+        source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
     ctx.state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1748,14 +1792,35 @@ def copy_mapped_file(item: dict[str, Any], direction: str) -> None:
     dst = Path(item["local_path"] if direction == "apply" else item["repo_path"])
     if not src.is_file():
         raise SyncError(f"Missing source file: {src}")
+    if src.is_symlink() or os.path.islink(src):
+        raise SyncError(f"Refusing to copy symlink: {src}")
     ensure_parent(dst)
-    # Prevent symlink hijacking / overwriting external files via symlinks
-    if dst.is_symlink() or os.path.islink(dst):
-        dst.unlink()
-    shutil.copy2(src, dst)
-    if direction == "apply" and (item["path"].startswith("bin/") or src.suffix == ".py" or src.suffix == ".sh" or item["path"].endswith(".hook")):
-        mode = dst.stat().st_mode
-        dst.chmod(mode | 0o111)
+    target_mode = (
+        0o755
+        if (
+            direction == "apply"
+            and (item["path"].startswith("bin/") or src.suffix in {".py", ".sh"} or item["path"].endswith(".hook"))
+        )
+        else 0o600
+    )
+    with tempfile.NamedTemporaryFile(
+        dir=dst.parent,
+        prefix=f".{dst.name}.tmp-",
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+        try:
+            os.chmod(tmp.fileno(), target_mode)
+            with open(src, "rb") as fsrc:
+                shutil.copyfileobj(fsrc, tmp)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        except Exception:
+            tmp.close()
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise
+    os.replace(tmp_path, dst)
 
 
 def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
@@ -1764,7 +1829,7 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
     copied = 0
     for item in files:
         src = Path(item["local_path"])
-        if not src.is_file():
+        if not src.is_file() or src.is_symlink() or os.path.islink(src):
             continue
         rel = Path(item["path"])
         # Map back into a backup tree that mirrors ~/.config and ~/.local/bin
@@ -1777,13 +1842,30 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
         else:
             dest = backup_dir / rel
         ensure_parent(dest)
-        if dest.is_symlink() or os.path.islink(dest):
-            dest.unlink()
-        shutil.copy2(src, dest)
+        with tempfile.NamedTemporaryFile(
+            dir=dest.parent,
+            prefix=f".{dest.name}.tmp-",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            try:
+                os.chmod(tmp.fileno(), 0o600)
+                with open(src, "rb") as fsrc:
+                    shutil.copyfileobj(fsrc, tmp)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            except Exception:
+                tmp.close()
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+                raise
+        os.replace(tmp_path, dest)
         copied += 1
     backup_dir.mkdir(parents=True, exist_ok=True)
-    (backup_dir / "README.txt").write_text(
-        f"Omarchy config-sync backup of {copied} files at {now_iso()}\n", encoding="utf-8"
+    atomic_write_text(
+        backup_dir / "README.txt",
+        f"Omarchy config-sync backup of {copied} files at {now_iso()}\n",
+        mode=0o600,
     )
     return backup_dir
 
@@ -2284,7 +2366,11 @@ def cmd_resolve(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx)
-    source_raw = " ".join(args.args).strip()
+    source_raw = ""
+    if getattr(args, "stdin", False):
+        source_raw = sys.stdin.read().strip()
+    if not source_raw:
+        source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
     if kind != "url":
         raise SyncError("set-url expects a git remote URL.")
@@ -2574,6 +2660,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delete-clone", action="store_true")
     parser.add_argument("--side", default=None)
     parser.add_argument("--url", default=None)
+    parser.add_argument("--stdin", action="store_true", help="Read input URL from stdin")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser

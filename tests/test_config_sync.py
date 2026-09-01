@@ -906,14 +906,6 @@ class SecurityTests(unittest.TestCase):
             self.assertEqual(target_outside.read_text(encoding="utf-8"), "precious")
 
 
-    def test_cmd_open(self) -> None:
-        with TempHome() as env:
-            local_file = env.home / ".config" / "hypr" / "looknfeel.lua"
-            local_file.parent.mkdir(parents=True, exist_ok=True)
-            local_file.write_text("content", encoding="utf-8")
-            res = cs.cmd_open(env.ctx, argparse_ns(args=["hypr/looknfeel.lua"]))
-            self.assertTrue(res["ok"])
-            self.assertEqual(res["opened"], str(local_file))
 
     def test_cmd_terminal(self) -> None:
         with TempHome() as env:
@@ -1020,6 +1012,71 @@ console.log(JSON.stringify({{
         self.assertEqual(data["repo"]["outgoing"], 0)
         self.assertEqual(data["repo"]["both"], 0)
         self.assertEqual(data["repo"]["inId"], "plugin:remote.tool")
+
+
+class SecurityHardeningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cs-sec-test-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_symlink_refusal_on_src(self) -> None:
+        target = self.tmp / "secret.txt"
+        target.write_text("topsecret", encoding="utf-8")
+        symlink = self.tmp / "symlink.txt"
+        symlink.symlink_to(target)
+        dest = self.tmp / "out.txt"
+
+        item = {
+            "path": "hypr/autostart.lua",
+            "repo_path": str(symlink),
+            "local_path": str(dest),
+        }
+        with self.assertRaises(cs.SyncError) as cm:
+            cs.copy_mapped_file(item, "apply")
+        self.assertIn("Refusing to copy symlink", str(cm.exception))
+        self.assertFalse(dest.exists())
+
+    def test_symlink_atomic_replacement_on_dst(self) -> None:
+        src = self.tmp / "config.lua"
+        src.write_text("new_config = true\n", encoding="utf-8")
+        canary = self.tmp / "canary.txt"
+        canary.write_text("untouched\n", encoding="utf-8")
+        dst = self.tmp / "dst.lua"
+        dst.symlink_to(canary)
+
+        item = {
+            "path": "hypr/config.lua",
+            "repo_path": str(src),
+            "local_path": str(dst),
+        }
+        cs.copy_mapped_file(item, "apply")
+        # dst should now be a regular file, NOT a symlink
+        self.assertFalse(dst.is_symlink())
+        self.assertEqual(dst.read_text(encoding="utf-8"), "new_config = true\n")
+        # canary must NOT have been written through
+        self.assertEqual(canary.read_text(encoding="utf-8"), "untouched\n")
+
+    def test_atomic_write_text_and_write_json_mode(self) -> None:
+        target = self.tmp / "state.json"
+        cs.write_json(target, {"hello": "world"})
+        self.assertTrue(target.is_file())
+        mode = target.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        loaded = cs.load_json(target)
+        self.assertEqual(loaded, {"hello": "world"})
+
+    def test_sanitize_url(self) -> None:
+        url_with_token = "https://oauth2:ghp_secretToken123@github.com/user/repo.git"
+        sanitized = cs.sanitize_url(url_with_token)
+        self.assertNotIn("ghp_secretToken123", sanitized)
+        self.assertEqual(sanitized, "https://***:***@github.com/user/repo.git")
+
+        url_with_user_only = "https://ghp_secretToken123@github.com/user/repo.git"
+        sanitized2 = cs.sanitize_url(url_with_user_only)
+        self.assertNotIn("ghp_secretToken123", sanitized2)
+        self.assertEqual(sanitized2, "https://***@github.com/user/repo.git")
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ Panel {
   property string lastMessage: ""
   property string pendingAction: ""
   property var pendingArgs: []
+  property string pendingStdin: ""
   property string repoUrlInput: ""
   property int activeTab: 0
   property bool includeMachine: false
@@ -197,7 +198,7 @@ Panel {
       return
     }
     lastError = ""
-    run(["connect", url])
+    run(["connect", "--stdin"], url)
   }
 
   function cloneMap(obj) {
@@ -550,7 +551,8 @@ Panel {
     } else if (kind === "switch-repo") {
       editingRepo = false
       lastError = ""
-      run(["connect", String(repoUrlInput || "").trim()])
+      var targetUrl = String(repoUrlInput || "").trim()
+      run(["connect", "--stdin"], targetUrl)
     } else if (kind === "resync-repo") {
       run(["resync", "--side", "repo"])
     } else if (kind === "resync-local") {
@@ -649,9 +651,10 @@ Panel {
     })
   }
 
-  function run(args) {
+  function run(args, stdinData) {
     if (syncProc.running) {
       pendingArgs = args
+      pendingStdin = String(stdinData || "")
       return
     }
     busy = true
@@ -659,6 +662,9 @@ Panel {
     pendingAction = args[0] || ""
     syncProc.command = ["python3", "-u", root.scriptPath].concat(args)
     syncProc.running = true
+    if (stdinData) {
+      syncProc.write(String(stdinData) + "\n")
+    }
   }
 
   function handleOutput(text) {
@@ -666,6 +672,10 @@ Panel {
     var raw = String(text || "").trim()
     if (!raw) {
       lastError = "The sync helper returned no output."
+      return
+    }
+    if (raw.length > 5 * 1024 * 1024) {
+      lastError = "Sync response exceeded maximum buffer size limit (5MB)."
       return
     }
     var data
@@ -721,14 +731,17 @@ Panel {
 
   Process {
     id: syncProc
+    stdinEnabled: true
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         root.handleOutput(text)
         if (root.pendingArgs.length > 0) {
           var next = root.pendingArgs
+          var nextStdin = root.pendingStdin
           root.pendingArgs = []
-          root.run(next)
+          root.pendingStdin = ""
+          root.run(next, nextStdin)
         }
       }
     }
@@ -1380,7 +1393,7 @@ Panel {
         TablePair { label: "Ahead / behind"; value: String(root.status.ahead || 0) + " / " + String(root.status.behind || 0) }
         TablePair { label: "Last apply"; value: Model.relativeAgo(root.status.last_apply_at) }
         TablePair { label: "Last publish"; value: Model.relativeAgo(root.status.last_publish_at) }
-        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.8") }
+        TablePair { label: "Plugin"; value: "config-sync " + String((root.status && root.status.plugin_version) || "1.2.9") }
         TablePair {
           label: "Theme"
           value: {
