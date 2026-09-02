@@ -56,7 +56,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.13"
+PLUGIN_VERSION = "1.2.14"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -187,10 +187,13 @@ def _open_bound(path: Path | str, max_bytes: int | None = None, within: Path | N
             raise OSError(errno.EFBIG, "exceeds size cap")
         if within is not None:
             proc_link = f"/proc/self/fd/{fd}"
-            if os.path.lexists(proc_link):
-                actual = Path(os.path.realpath(proc_link))
-                if not actual.is_relative_to(within.resolve()):
-                    raise OSError(errno.EXDEV, "resolves outside the allowed root")
+            if not os.path.lexists(proc_link):
+                # Containment was requested; without /proc we cannot prove it,
+                # so refuse rather than silently skipping the check.
+                raise OSError(errno.ENOSYS, "cannot verify containment without /proc")
+            actual = Path(os.path.realpath(proc_link))
+            if not actual.is_relative_to(within.resolve()):
+                raise OSError(errno.EXDEV, "resolves outside the allowed root")
         return fd
     except OSError:
         os.close(fd)
@@ -227,16 +230,105 @@ def read_bytes_bound(path: Path, max_bytes: int | None = None, within: Path | No
         os.close(fd)
 
 
-def read_text(path: Path) -> str:
-    data = read_bytes_bound(path)
+def read_text(path: Path, within: Path | None = None) -> str:
+    data = read_bytes_bound(path, within=within)
     if data is None:
         return ""
     return data.decode("utf-8", errors="replace")
 
 
-def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
-    ensure_parent(path)
+def _open_dir_bound(root: Path, rel_parent: Path) -> int:
+    """Open root/rel_parent as a directory descriptor whose canonical location
+    is verified to sit inside root, creating missing directories on the way.
+    Symlinked components that stay inside root (dotfiles setups) still pass;
+    ones that escape are refused on the opened descriptor, so a concurrent
+    swap cannot redirect anything written dir_fd-relative to it. Directory
+    creation itself is pathname-based, but nothing is ever written through a
+    directory that failed this descriptor check."""
+    if any(part in ("..", "") for part in rel_parent.parts):
+        raise SyncError(f"Refusing to write through unsafe path: {rel_parent}")
+    target = root / rel_parent if rel_parent.parts else root
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # the open below is the authority on whether this is usable
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(target), flags)
+    except OSError as exc:
+        raise SyncError(f"Cannot open destination directory: {target}") from exc
+    try:
+        proc_link = f"/proc/self/fd/{fd}"
+        if not os.path.lexists(proc_link):
+            raise SyncError("Cannot verify write containment without /proc; refusing to write.")
+        actual = Path(os.path.realpath(proc_link))
+        if not actual.is_relative_to(root.resolve()):
+            raise SyncError(f"Refusing to write into {target}: it resolves outside {root}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _replace_at(dir_fd: int, name: str, mode: int, write_body) -> None:
+    """Create an exclusive temp file relative to an already-verified directory
+    descriptor, let write_body(fd) fill it, then atomically rename it over
+    `name` inside that same directory. rename never follows a symlink target,
+    so a planted link named `name` is replaced, not traversed."""
+    tmp_name = f".{name}.tmp-{os.getpid()}-{os.urandom(4).hex()}"
+    open_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    tmp_fd = os.open(tmp_name, open_flags, 0o600, dir_fd=dir_fd)
+    try:
+        os.fchmod(tmp_fd, mode)
+        write_body(tmp_fd)
+        os.fsync(tmp_fd)
+    except Exception:
+        os.close(tmp_fd)
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    os.close(tmp_fd)
+    try:
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except Exception:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _write_within(root: Path, dst: Path, mode: int, write_body) -> None:
+    """Write dst atomically with its parent directory bound to root: the
+    directory is opened and containment-verified first, and both the temp
+    file and the final rename are dir_fd-relative to that descriptor."""
+    try:
+        rel = dst.relative_to(root)
+    except ValueError as exc:
+        raise SyncError(f"Refusing to write {dst}: outside {root}") from exc
+    dir_fd = _open_dir_bound(root, rel.parent)
+    try:
+        _replace_at(dir_fd, rel.name, mode, write_body)
+    finally:
+        os.close(dir_fd)
+
+
+def atomic_write_text(path: Path, content: str, mode: int = 0o600, within: Path | None = None) -> None:
     data = content.encode("utf-8")
+    if within is not None:
+        def body(fd: int) -> None:
+            os.write(fd, data)
+        _write_within(within, path, mode, body)
+        return
+    ensure_parent(path)
     with tempfile.NamedTemporaryFile(
         dir=path.parent,
         prefix=f".{path.name}.tmp-",
@@ -256,15 +348,15 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
     os.replace(tmp_path, path)
 
 
-def write_json(path: Path, data: Any) -> None:
+def write_json(path: Path, data: Any, within: Path | None = None) -> None:
     content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    atomic_write_text(path, content, mode=0o600)
+    atomic_write_text(path, content, mode=0o600, within=within)
 
 
-def load_json(path: Path, default: Any = None) -> Any:
+def load_json(path: Path, default: Any = None, within: Path | None = None) -> Any:
     if not path.is_file() or path.is_symlink() or os.path.islink(path):
         return default
-    data = read_bytes_bound(path)
+    data = read_bytes_bound(path, within=within)
     if data is None:
         return default
     try:
@@ -277,8 +369,8 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def sha256_file(path: Path) -> str | None:
-    fd = _open_bound(path, MAX_SYNC_FILE_BYTES)
+def sha256_file(path: Path, within: Path | None = None) -> str | None:
+    fd = _open_bound(path, MAX_SYNC_FILE_BYTES, within)
     if fd is None:
         return None
     h = hashlib.sha256()
@@ -299,7 +391,7 @@ def sha256_file(path: Path) -> str | None:
     return h.hexdigest()
 
 
-def canonical_shell_bytes(path: Path) -> bytes | None:
+def canonical_shell_bytes(path: Path, within: Path | None = None) -> bytes | None:
     """Hash shell.json without this plugin's bar entry.
 
     Apply restores the tray widget after copying, so a naive hash would
@@ -307,9 +399,9 @@ def canonical_shell_bytes(path: Path) -> bytes | None:
     """
     if not path.is_file() or file_too_large(path):
         return None
-    data = load_json(path, default=None)
+    data = load_json(path, default=None, within=within)
     if not isinstance(data, dict):
-        return read_bytes_bound(path)
+        return read_bytes_bound(path, within=within)
     bar = data.get("bar")
     if isinstance(bar, dict):
         layout = bar.get("layout")
@@ -325,11 +417,11 @@ def canonical_shell_bytes(path: Path) -> bytes | None:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def file_hash(path: Path, rel: str) -> str | None:
+def file_hash(path: Path, rel: str, within: Path | None = None) -> str | None:
     if rel == "omarchy/shell.json":
-        data = canonical_shell_bytes(path)
+        data = canonical_shell_bytes(path, within=within)
         return sha256_bytes(data) if data is not None else None
-    return sha256_file(path)
+    return sha256_file(path, within=within)
 
 
 def is_skipped_file(name: str) -> bool:
@@ -619,7 +711,7 @@ def git_out(repo: Path, *args: str, timeout: int = 20) -> str:
 
 def load_state(ctx: Context) -> dict[str, Any]:
     bind_install_session(ctx)
-    data = load_json(ctx.state_path, default={})
+    data = load_json(ctx.state_path, default={}, within=ctx.state_dir)
     if not isinstance(data, dict):
         return {}
     return data
@@ -631,20 +723,20 @@ def save_state(ctx: Context, state: dict[str, Any]) -> None:
     if session:
         state["plugin_instance"] = session
     ctx.state_dir.mkdir(parents=True, exist_ok=True)
-    write_json(ctx.state_path, state)
+    write_json(ctx.state_path, state, within=ctx.state_dir)
 
 
 def read_or_create_session(plugin_root: Path | None) -> str | None:
     if plugin_root is None:
         return None
     path = plugin_root / SESSION_FILE
-    value = read_text(path).strip()
+    value = read_text(path, within=plugin_root).strip()
     if value:
         return value
     value = uuid.uuid4().hex
     try:
-        atomic_write_text(path, value + "\n", mode=0o600)
-    except OSError:
+        atomic_write_text(path, value + "\n", mode=0o600, within=plugin_root)
+    except (OSError, SyncError):
         return None
     return value
 
@@ -654,7 +746,7 @@ def purge_saved_settings(ctx: Context) -> bool:
     deleted_clone = False
     state: dict[str, Any] = {}
     if ctx.state_path.is_file():
-        loaded = load_json(ctx.state_path, default={})
+        loaded = load_json(ctx.state_path, default={}, within=ctx.state_dir)
         if isinstance(loaded, dict):
             state = loaded
     clone = Path(state.get("clone_path") or "")
@@ -687,7 +779,7 @@ def bind_install_session(ctx: Context) -> None:
     session = read_or_create_session(ctx.plugin_root)
     if not session:
         return
-    data = load_json(ctx.state_path, default={})
+    data = load_json(ctx.state_path, default={}, within=ctx.state_dir)
     if not isinstance(data, dict) or not data:
         return
     stored = str(data.get("plugin_instance") or "")
@@ -698,8 +790,8 @@ def bind_install_session(ctx: Context) -> None:
         return
     data["plugin_instance"] = session
     try:
-        write_json(ctx.state_path, data)
-    except OSError:
+        write_json(ctx.state_path, data, within=ctx.state_dir)
+    except (OSError, SyncError):
         return
 
 
@@ -722,7 +814,7 @@ def validate_repo(path: Path) -> dict[str, Any]:
 
     marker = path / MARKER_NAME
     if marker.is_file():
-        marker_data = load_json(marker, default={})
+        marker_data = load_json(marker, default={}, within=path)
         if isinstance(marker_data, dict) and marker_data.get("format") == MARKER_FORMAT:
             score += 5
             reasons.append("Omarchy config marker")
@@ -844,10 +936,10 @@ def is_seedable_empty(path: Path) -> bool:
 
 def write_marker(repo: Path) -> None:
     marker_path = repo / MARKER_NAME
-    existing = load_json(marker_path, default={})
+    existing = load_json(marker_path, default={}, within=repo)
     data = existing if isinstance(existing, dict) else {}
     data.update({"format": MARKER_FORMAT, "version": 1, "synced_by": PLUGIN_ID})
-    write_json(marker_path, data)
+    write_json(marker_path, data, within=repo)
 
 
 def summary_for(rel: str) -> str:
@@ -979,10 +1071,10 @@ def rel_posix(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def read_theme_slug(path: Path) -> str:
+def read_theme_slug(path: Path, within: Path | None = None) -> str:
     if not path.is_file():
         return ""
-    for line in read_text(path).splitlines():
+    for line in read_text(path, within=within).splitlines():
         slug = line.strip().lower().replace(" ", "-")
         if slug and not slug.startswith("#"):
             return slug
@@ -1058,8 +1150,8 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             "repo_path": str(repo_file),
             "local_exists": local_regular,
             "repo_exists": repo_regular,
-            "local_hash": file_hash(local, rel) if local_regular else None,
-            "repo_hash": file_hash(repo_file, rel) if repo_regular else None,
+            "local_hash": file_hash(local, rel, within=ctx.home) if local_regular else None,
+            "repo_hash": file_hash(repo_file, rel, within=repo) if repo_regular else None,
             "git_managed": False,
         }
         if extra:
@@ -1148,7 +1240,7 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         add(THEME_REL, local_theme, repo_theme, "theme")
 
     slugs: set[str] = set()
-    for slug in (read_theme_slug(local_theme), read_theme_slug(repo_theme)):
+    for slug in (read_theme_slug(local_theme, within=ctx.home), read_theme_slug(repo_theme, within=repo)):
         if slug:
             slugs.add(slug)
     repo_themes = repo / "omarchy" / "themes"
@@ -1212,15 +1304,15 @@ def classify_file(item: dict[str, Any], stored_hash: str | None) -> str:
     return "differs"
 
 
-def unified_preview(local_path: Path, repo_path: Path) -> str:
+def unified_preview(local_path: Path, repo_path: Path, local_within: Path | None = None, repo_within: Path | None = None) -> str:
     try:
         import difflib
     except Exception:
         return ""
     if file_too_large(local_path) or file_too_large(repo_path):
         return "Binary or very large file — open the paths to compare."
-    local_text = read_text(local_path) if local_path.is_file() else ""
-    repo_text = read_text(repo_path) if repo_path.is_file() else ""
+    local_text = read_text(local_path, within=local_within) if local_path.is_file() else ""
+    repo_text = read_text(repo_path, within=repo_within) if repo_path.is_file() else ""
     if len(local_text) + len(repo_text) > MAX_DIFF_BYTES * 4:
         return "Binary or very large file — open the paths to compare."
     diff = list(
@@ -1295,13 +1387,19 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
     return [by_key[key] for key in order]
 
 
-def shortcut_diff(local_path: Path, repo_path: Path, stored_hash: str | None = None) -> list[dict[str, Any]]:
-    local_text = read_text(local_path) if local_path.is_file() else ""
-    repo_text = read_text(repo_path) if repo_path.is_file() else ""
+def shortcut_diff(
+    local_path: Path,
+    repo_path: Path,
+    stored_hash: str | None = None,
+    local_within: Path | None = None,
+    repo_within: Path | None = None,
+) -> list[dict[str, Any]]:
+    local_text = read_text(local_path, within=local_within) if local_path.is_file() else ""
+    repo_text = read_text(repo_path, within=repo_within) if repo_path.is_file() else ""
     local_map = {e["keys"]: e for e in extract_bind_statements(local_text)}
     repo_map = {e["keys"]: e for e in extract_bind_statements(repo_text)}
-    local_file_hash = file_hash(local_path, "hypr/bindings.lua") if local_path.is_file() else None
-    repo_file_hash = file_hash(repo_path, "hypr/bindings.lua") if repo_path.is_file() else None
+    local_file_hash = file_hash(local_path, "hypr/bindings.lua", within=local_within) if local_path.is_file() else None
+    repo_file_hash = file_hash(repo_path, "hypr/bindings.lua", within=repo_within) if repo_path.is_file() else None
     local_at_baseline = bool(stored_hash) and local_file_hash == stored_hash
     repo_at_baseline = bool(stored_hash) and repo_file_hash == stored_hash
     rows = []
@@ -1390,20 +1488,26 @@ def upsert_shortcut_lines(dest_text: str, source_entries: dict[str, dict[str, An
     return "".join(out)
 
 
-def merge_shortcuts_file(dest: Path, source: Path, selected_keys: list[str]) -> bool:
+def merge_shortcuts_file(
+    dest: Path,
+    source: Path,
+    selected_keys: list[str],
+    dest_within: Path | None = None,
+    source_within: Path | None = None,
+) -> bool:
     if not selected_keys:
         return False
     if file_too_large(source) or file_too_large(dest):
         # read_text() degrades oversized files to ""; merging on top of that
         # would silently replace the user's bindings. Refuse instead.
         raise SyncError("bindings.lua is too large to merge safely.")
-    source_text = read_text(source) if (source.is_file() and not source.is_symlink() and not os.path.islink(source)) else ""
+    source_text = read_text(source, within=source_within) if (source.is_file() and not source.is_symlink() and not os.path.islink(source)) else ""
     source_entries = {e["keys"]: e for e in extract_bind_statements(source_text)}
-    dest_text = read_text(dest) if (dest.is_file() and not dest.is_symlink() and not os.path.islink(dest)) else ""
+    dest_text = read_text(dest, within=dest_within) if (dest.is_file() and not dest.is_symlink() and not os.path.islink(dest)) else ""
     merged = upsert_shortcut_lines(dest_text, source_entries, selected_keys)
     if merged == dest_text:
         return False
-    atomic_write_text(dest, merged, mode=0o600)
+    atomic_write_text(dest, merged, mode=0o600, within=dest_within)
     return True
 
 
@@ -1606,13 +1710,14 @@ def apply_omarchy_theme(slug: str, dry_run: bool) -> str:
 
 def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[str, Any]:
     validation = validate_repo(repo)
+    tree_root = ctx.home if prefer_local else repo
     hypr_root = ctx.config_hypr if prefer_local else repo / "hypr"
     omarchy_root = ctx.config_omarchy if prefer_local else repo / "omarchy"
     plugins_dir = ctx.config_plugins if prefer_local else repo / "plugins"
     shortcuts: list[dict[str, str]] = []
     bindings = hypr_root / "bindings.lua"
     if bindings.is_file():
-        shortcuts = parse_shortcuts(read_text(bindings))
+        shortcuts = parse_shortcuts(read_text(bindings, within=tree_root))
 
     plugins = []
     if plugins_dir.is_dir():
@@ -1620,7 +1725,7 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
             manifest_path = child / "manifest.json"
             if not child.is_dir() or not manifest_path.is_file():
                 continue
-            manifest = load_json(manifest_path, default={}) or {}
+            manifest = load_json(manifest_path, default={}, within=tree_root) or {}
             plugins.append(
                 {
                     "id": manifest.get("id") or child.name,
@@ -1633,7 +1738,7 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
 
     bar = {"position": "", "widgets": {"left": [], "center": [], "right": []}}
     idle = {}
-    shell = load_json(omarchy_root / "shell.json", default={}) or {}
+    shell = load_json(omarchy_root / "shell.json", default={}, within=tree_root) or {}
     if isinstance(shell, dict):
         idle = shell.get("idle") or {}
         bar_cfg = shell.get("bar") or {}
@@ -1708,8 +1813,8 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
 
 
 def inspect_theme(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[str, Any]:
-    local_slug = read_theme_slug(ctx.theme_name_path)
-    repo_slug = read_theme_slug(repo / THEME_REL)
+    local_slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
+    repo_slug = read_theme_slug(repo / THEME_REL, within=repo)
     slug = local_slug if prefer_local else (repo_slug or local_slug)
     custom = bool(slug) and (
         (ctx.user_themes / slug).is_dir() or (repo / "omarchy" / "themes" / slug).is_dir()
@@ -1819,7 +1924,12 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         )
         item["default_publish"] = default_publish_status(status) and item["local_exists"] and not item["hidden"]
         if status not in {"identical", "machine"}:
-            item["preview"] = unified_preview(Path(item["local_path"]), Path(item["repo_path"]))
+            item["preview"] = unified_preview(
+                Path(item["local_path"]),
+                Path(item["repo_path"]),
+                local_within=ctx.home,
+                repo_within=repo,
+            )
             if not item["hidden"]:
                 counts["changed"] += 1
         else:
@@ -1833,14 +1943,16 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         ctx.config_hypr / "bindings.lua",
         repo / "hypr" / "bindings.lua",
         stored.get("hypr/bindings.lua"),
+        local_within=ctx.home,
+        repo_within=repo,
     )
     for s in shortcuts:
         s["hidden"] = is_hidden_item("s", s["keys"], hidden_keys)
     drop_bindings_file_without_shortcut_diffs(files, counts, shortcuts)
     plugins = plugin_groups(files)
     for plugin in plugins:
-        manifest = load_json(repo / "plugins" / plugin["id"] / "manifest.json", default=None) or load_json(
-            ctx.config_plugins / plugin["id"] / "manifest.json", default=None
+        manifest = load_json(repo / "plugins" / plugin["id"] / "manifest.json", default=None, within=repo) or load_json(
+            ctx.config_plugins / plugin["id"] / "manifest.json", default=None, within=ctx.home
         )
         if isinstance(manifest, dict) and manifest.get("name"):
             plugin["name"] = str(manifest.get("name"))
@@ -1865,8 +1977,8 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             status = "added-repo" if "added-repo" in unique else "repo"
         else:
             status = "differs"
-        local_slug = read_theme_slug(ctx.theme_name_path)
-        repo_slug = read_theme_slug(repo / THEME_REL)
+        local_slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
+        repo_slug = read_theme_slug(repo / THEME_REL, within=repo)
         slug = repo_slug or local_slug
         theme_diff = {
             "id": "selected",
@@ -2142,13 +2254,21 @@ def cmd_disconnect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return ok({"disconnected": True, "deleted_clone": deleted})
 
 
-def copy_mapped_file(item: dict[str, Any], direction: str, src_root: Path | None = None) -> None:
+def copy_mapped_file(
+    item: dict[str, Any],
+    direction: str,
+    src_root: Path | None = None,
+    dst_root: Path | None = None,
+) -> None:
     src = Path(item["repo_path"] if direction == "apply" else item["local_path"])
     dst = Path(item["local_path"] if direction == "apply" else item["repo_path"])
-    # Every check is bound to the inode actually copied: O_NOFOLLOW at open,
-    # S_ISREG/size via fstat on the descriptor, containment rechecked through
-    # /proc/self/fd, and the bytes read from that same descriptor. A pathname
-    # swapped between check and copy cannot redirect what gets copied.
+    # Every check is bound to the inode actually touched: the source is opened
+    # O_NOFOLLOW, S_ISREG/size run via fstat on that descriptor, containment
+    # is rechecked through /proc/self/fd, and the bytes are read from the same
+    # descriptor with a running budget. The destination side mirrors it: the
+    # parent directory is opened and containment-verified once, and the temp
+    # file plus the final rename are dir_fd-relative to that descriptor, so a
+    # symlinked parent swapped in concurrently cannot redirect the write.
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -2161,6 +2281,7 @@ def copy_mapped_file(item: dict[str, Any], direction: str, src_root: Path | None
         if exc.errno == errno.ELOOP:
             raise SyncError(f"Refusing to copy symlink: {src}") from exc
         raise SyncError(f"Missing source file: {src}") from exc
+    dir_fd: int | None = None
     try:
         st = os.fstat(src_fd)
         if not stat.S_ISREG(st.st_mode):
@@ -2169,11 +2290,11 @@ def copy_mapped_file(item: dict[str, Any], direction: str, src_root: Path | None
             raise SyncError(f"Refusing to copy oversized file: {src}")
         if src_root is not None:
             proc_link = f"/proc/self/fd/{src_fd}"
-            if os.path.lexists(proc_link):
-                actual = Path(os.path.realpath(proc_link))
-                if not actual.is_relative_to(src_root.resolve()):
-                    raise SyncError(f"Refusing to copy {src}: it resolves outside {src_root}")
-        ensure_parent(dst)
+            if not os.path.lexists(proc_link):
+                raise SyncError("Cannot verify copy containment without /proc; refusing to copy.")
+            actual = Path(os.path.realpath(proc_link))
+            if not actual.is_relative_to(src_root.resolve()):
+                raise SyncError(f"Refusing to copy {src}: it resolves outside {src_root}")
         # Only helper-script and hook trees — both explicit opt-in — ever get the
         # executable bit; a script smuggled anywhere else lands non-executable.
         target_mode = (
@@ -2184,33 +2305,34 @@ def copy_mapped_file(item: dict[str, Any], direction: str, src_root: Path | None
             )
             else 0o600
         )
-        with tempfile.NamedTemporaryFile(
-            dir=dst.parent,
-            prefix=f".{dst.name}.tmp-",
-            delete=False,
-        ) as tmp:
-            tmp_path = Path(tmp.name)
+        if dst_root is not None:
             try:
-                os.chmod(tmp.fileno(), target_mode)
-                remaining = MAX_SYNC_FILE_BYTES + 1
-                while True:
-                    chunk = os.read(src_fd, min(1024 * 1024, remaining))
-                    if not chunk:
-                        break
-                    tmp.write(chunk)
-                    remaining -= len(chunk)
-                    if remaining <= 0:
-                        raise SyncError(f"Refusing to copy {src}: it grew past the size limit during the copy.")
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            except Exception:
-                tmp.close()
-                if tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
-                raise
-        os.replace(tmp_path, dst)
+                rel = dst.relative_to(dst_root)
+            except ValueError as exc:
+                raise SyncError(f"Refusing to write {dst}: outside {dst_root}") from exc
+            dir_fd = _open_dir_bound(dst_root, rel.parent)
+            dst_name = rel.name
+        else:
+            ensure_parent(dst)
+            dir_fd = os.open(str(dst.parent), os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+            dst_name = dst.name
+
+        def body(tmp_fd: int) -> None:
+            remaining = MAX_SYNC_FILE_BYTES + 1
+            while True:
+                chunk = os.read(src_fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                os.write(tmp_fd, chunk)
+                remaining -= len(chunk)
+                if remaining <= 0:
+                    raise SyncError(f"Refusing to copy {src}: it grew past the size limit during the copy.")
+
+        _replace_at(dir_fd, dst_name, target_mode, body)
     finally:
         os.close(src_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
 
 
 def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
@@ -2219,48 +2341,51 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
     copied = 0
     for item in files:
         src = Path(item["local_path"])
-        src_fd = _open_bound(src, MAX_SYNC_FILE_BYTES)
+        # The open is bound to $HOME: O_NOFOLLOW covers the leaf, and the
+        # /proc/self/fd containment recheck covers symlinked parents, so a
+        # path that resolves outside the home tree is skipped instead of
+        # copying unrelated local data into the backup.
+        src_fd = _open_bound(src, MAX_SYNC_FILE_BYTES, within=ctx.home)
         if src_fd is None:
             continue
-        rel = Path(item["path"])
-        # Map back into a backup tree that mirrors ~/.config and ~/.local/bin
-        if item["path"].startswith("bin/"):
-            dest = backup_dir / "local-bin" / rel.name
-        elif item["path"].startswith("terminals/"):
-            dest = backup_dir / "terminals" / rel.name
-        elif item["path"].startswith("plugins/"):
-            dest = backup_dir / "omarchy" / rel
-        else:
-            dest = backup_dir / rel
-        ensure_parent(dest)
-        with tempfile.NamedTemporaryFile(
-            dir=dest.parent,
-            prefix=f".{dest.name}.tmp-",
-            delete=False,
-        ) as tmp:
-            tmp_path = Path(tmp.name)
-            try:
-                os.chmod(tmp.fileno(), 0o600)
-                with os.fdopen(src_fd, "rb") as fsrc:
-                    src_fd = None
-                    shutil.copyfileobj(fsrc, tmp)
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            except Exception:
-                tmp.close()
-                if tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
-                raise
-            finally:
-                if src_fd is not None:
-                    os.close(src_fd)
-        os.replace(tmp_path, dest)
+        try:
+            rel = Path(item["path"])
+            # Map back into a backup tree that mirrors ~/.config and ~/.local/bin
+            if item["path"].startswith("bin/"):
+                dest = backup_dir / "local-bin" / rel.name
+            elif item["path"].startswith("terminals/"):
+                dest = backup_dir / "terminals" / rel.name
+            elif item["path"].startswith("plugins/"):
+                dest = backup_dir / "omarchy" / rel
+            else:
+                dest = backup_dir / rel
+
+            def body(tmp_fd: int) -> None:
+                # Hard byte budget during the copy itself: the fstat size
+                # check bounds what the file was at open time, this bounds
+                # what it becomes if it grows while being copied.
+                remaining = MAX_SYNC_FILE_BYTES + 1
+                while True:
+                    chunk = os.read(src_fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    os.write(tmp_fd, chunk)
+                    remaining -= len(chunk)
+                    if remaining <= 0:
+                        raise SyncError(
+                            f"Backup aborted: {src} grew past the size limit while it was being copied."
+                        )
+
+            _write_within(ctx.home, dest, 0o600, body)
+        finally:
+            os.close(src_fd)
         copied += 1
     backup_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         backup_dir / "README.txt",
         f"Omarchy config-sync backup of {copied} files at {now_iso()}\n",
         mode=0o600,
+        within=ctx.home,
     )
     return backup_dir
 
@@ -2311,10 +2436,16 @@ def extract_widget_entry(shell_data: Any) -> tuple[str | None, dict[str, Any] | 
     return None, None, -1
 
 
-def restore_widget_entry(shell_path: Path, section: str | None, entry: dict[str, Any] | None, index: int) -> None:
+def restore_widget_entry(
+    shell_path: Path,
+    section: str | None,
+    entry: dict[str, Any] | None,
+    index: int,
+    within: Path | None = None,
+) -> None:
     if not entry or not shell_path.is_file():
         return
-    data = load_json(shell_path, default=None)
+    data = load_json(shell_path, default=None, within=within)
     if not isinstance(data, dict):
         return
     current_section, _, _ = extract_widget_entry(data)
@@ -2334,7 +2465,7 @@ def restore_widget_entry(shell_path: Path, section: str | None, entry: dict[str,
                 break
     entries.insert(insert_at, entry)
     layout[target] = entries
-    write_json(shell_path, data)
+    write_json(shell_path, data, within=within)
 
 
 def reload_desktop() -> dict[str, str]:
@@ -2402,7 +2533,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return snap
 
     shell_path = ctx.config_omarchy / "shell.json"
-    section, widget_entry, widget_index = extract_widget_entry(load_json(shell_path, default={}))
+    section, widget_entry, widget_index = extract_widget_entry(load_json(shell_path, default={}, within=ctx.home))
     backup_targets = [i for i in chosen if i["local_exists"]]
     bindings_local = ctx.config_hypr / "bindings.lua"
     if shortcut_keys and bindings_local.is_file():
@@ -2418,19 +2549,25 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     for item in chosen:
         if not Path(item["repo_path"]).is_file():
             continue
-        copy_mapped_file(item, "apply", src_root=repo)
+        copy_mapped_file(item, "apply", src_root=repo, dst_root=ctx.home)
         applied.append(item["path"])
     if shortcut_keys:
-        if merge_shortcuts_file(bindings_local, repo / "hypr" / "bindings.lua", shortcut_keys):
+        if merge_shortcuts_file(
+            bindings_local,
+            repo / "hypr" / "bindings.lua",
+            shortcut_keys,
+            dest_within=ctx.home,
+            source_within=repo,
+        ):
             applied.append("hypr/bindings.lua")
-    restore_widget_entry(shell_path, section, widget_entry, widget_index)
+    restore_widget_entry(shell_path, section, widget_entry, widget_index, within=ctx.home)
 
     # Refresh hashes for every tracked file after apply.
     post = collect_inventory(ctx, repo)
     hashes = dict(state.get("file_hashes") or {})
     applied_set = set(applied)
     for item in post:
-        live = file_hash(Path(item["local_path"]), item["path"]) if Path(item["local_path"]).is_file() else None
+        live = file_hash(Path(item["local_path"]), item["path"], within=ctx.home) if Path(item["local_path"]).is_file() else None
         if item["path"] in applied_set and live:
             hashes[item["path"]] = live
         elif not item["portable"]:
@@ -2448,7 +2585,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     if not args.dry_run:
         notes = reload_desktop()
         if THEME_REL in applied:
-            slug = read_theme_slug(ctx.theme_name_path)
+            slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
             theme_note = apply_omarchy_theme(slug, dry_run=False)
             if theme_note:
                 notes["theme"] = theme_note
@@ -2458,7 +2595,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     snap["reload"] = notes
     theme_msg = ""
     if THEME_REL in applied:
-        slug = read_theme_slug(ctx.theme_name_path)
+        slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
         if slug:
             theme_msg = f" Theme set to {theme_display_name(slug)}."
     snap["message"] = (
@@ -2544,10 +2681,16 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     for item in chosen:
         if not Path(item["local_path"]).is_file():
             continue
-        copy_mapped_file(item, "publish", src_root=ctx.home)
+        copy_mapped_file(item, "publish", src_root=ctx.home, dst_root=repo)
         published.append(item["path"])
     if shortcut_keys:
-        if merge_shortcuts_file(repo / "hypr" / "bindings.lua", ctx.config_hypr / "bindings.lua", shortcut_keys):
+        if merge_shortcuts_file(
+            repo / "hypr" / "bindings.lua",
+            ctx.config_hypr / "bindings.lua",
+            shortcut_keys,
+            dest_within=repo,
+            source_within=ctx.home,
+        ):
             published.append("hypr/bindings.lua")
 
     # Strip any accidental .git dirs copied with plugins
@@ -2588,7 +2731,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         if item["local_exists"] and item["repo_exists"] and item["local_hash"] == item["repo_hash"] and item["local_hash"]:
             hashes[item["path"]] = item["local_hash"]
         elif item["path"] in published:
-            live = sha256_file(Path(item["repo_path"]))
+            live = sha256_file(Path(item["repo_path"]), within=repo)
             if live:
                 hashes[item["path"]] = live
     state["file_hashes"] = hashes

@@ -1392,6 +1392,103 @@ class SecurityHardeningTests(unittest.TestCase):
                 with self.assertRaises(cs.SyncError):
                     cs.collect_inventory(env.ctx, repo)
 
+    def test_backup_local_refuses_sources_outside_home(self) -> None:
+        ctx = self._ctx()
+        outside = Path(tempfile.mkdtemp(prefix="cs-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "secret.txt").write_text("private", encoding="utf-8")
+        # A symlinked parent inside $HOME aliases the "local" path to a file
+        # outside the home tree; O_NOFOLLOW alone would not catch it.
+        (self.tmp / "link").symlink_to(outside)
+        good = self.tmp / ".config" / "hypr" / "a.lua"
+        good.parent.mkdir(parents=True)
+        good.write_text("keep me", encoding="utf-8")
+        backup_dir = cs.backup_local(
+            ctx,
+            [
+                {"path": "hypr/secret.txt", "local_path": str(self.tmp / "link" / "secret.txt")},
+                {"path": "hypr/a.lua", "local_path": str(good)},
+            ],
+        )
+        self.assertEqual((backup_dir / "hypr" / "a.lua").read_text(encoding="utf-8"), "keep me")
+        self.assertFalse((backup_dir / "hypr" / "secret.txt").exists())
+        self.assertIn("1 files", (backup_dir / "README.txt").read_text(encoding="utf-8"))
+
+    def test_backup_local_bounds_copy_of_growing_file(self) -> None:
+        ctx = self._ctx()
+        big = self.tmp / ".config" / "grown.lua"
+        big.parent.mkdir(parents=True)
+        big.write_text("x" * 100, encoding="utf-8")
+        # Simulate a file that passed the fstat size check and then grew: hand
+        # backup_local a descriptor whose content exceeds the cap and assert
+        # the running byte budget aborts the copy instead of spooling it all.
+        def fake_open_bound(path, max_bytes=None, within=None):
+            return os.open(str(big), os.O_RDONLY)
+
+        with patch.object(cs, "MAX_SYNC_FILE_BYTES", 4), patch.object(cs, "_open_bound", fake_open_bound):
+            with self.assertRaises(cs.SyncError) as cm:
+                cs.backup_local(ctx, [{"path": "hypr/grown.lua", "local_path": str(big)}])
+        self.assertIn("grew past the size limit", str(cm.exception))
+
+    def test_copy_mapped_file_dest_containment_bound_to_descriptor(self) -> None:
+        repo = self.tmp / "clone"
+        repo.mkdir()
+        outside = Path(tempfile.mkdtemp(prefix="cs-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        # A symlinked directory committed to the repo aliases the destination
+        # parent to somewhere outside the clone: publish must refuse to write
+        # through it, verified on the opened directory descriptor.
+        (repo / "hypr").symlink_to(outside)
+        src = self.tmp / ".config" / "hypr" / "b.lua"
+        src.parent.mkdir(parents=True)
+        src.write_text("mine", encoding="utf-8")
+        item = {"path": "hypr/b.lua", "local_path": str(src), "repo_path": str(repo / "hypr" / "b.lua")}
+        with self.assertRaises(cs.SyncError) as cm:
+            cs.copy_mapped_file(item, "publish", src_root=self.tmp, dst_root=repo)
+        self.assertIn("outside", str(cm.exception))
+        self.assertEqual(list(outside.iterdir()), [])
+        # A symlink that stays inside the root (dotfiles-style) still works,
+        # and missing destination directories are created on the way.
+        (repo / "real").mkdir()
+        (repo / "alias").symlink_to(repo / "real")
+        ok_item = {"path": "alias/c.lua", "local_path": str(src), "repo_path": str(repo / "alias" / "c.lua")}
+        cs.copy_mapped_file(ok_item, "publish", src_root=self.tmp, dst_root=repo)
+        self.assertEqual((repo / "real" / "c.lua").read_text(encoding="utf-8"), "mine")
+        deep_item = {"path": "omarchy/hooks/new.d/x.hook", "local_path": str(src), "repo_path": str(repo / "omarchy" / "hooks" / "new.d" / "x.hook")}
+        cs.copy_mapped_file(deep_item, "publish", src_root=self.tmp, dst_root=repo)
+        self.assertEqual((repo / "omarchy" / "hooks" / "new.d" / "x.hook").read_text(encoding="utf-8"), "mine")
+
+    def test_atomic_write_text_within_refuses_escape(self) -> None:
+        root = self.tmp / "tree"
+        root.mkdir()
+        outside = Path(tempfile.mkdtemp(prefix="cs-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (root / "d").symlink_to(outside)
+        with self.assertRaises(cs.SyncError):
+            cs.atomic_write_text(root / "d" / "x.txt", "hi", within=root)
+        self.assertEqual(list(outside.iterdir()), [])
+        with self.assertRaises(cs.SyncError):
+            cs.atomic_write_text(outside / "y.txt", "hi", within=root)
+        cs.atomic_write_text(root / "nested" / "x.txt", "hi", within=root)
+        self.assertEqual((root / "nested" / "x.txt").read_text(encoding="utf-8"), "hi")
+
+    def test_read_helpers_refuse_parent_symlink_escape_with_within(self) -> None:
+        root = self.tmp / "tree"
+        root.mkdir()
+        outside = Path(tempfile.mkdtemp(prefix="cs-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "secret.txt").write_text("private", encoding="utf-8")
+        (outside / "secret.json").write_text('{"k": 1}', encoding="utf-8")
+        (root / "esc").symlink_to(outside)
+        self.assertEqual(cs.read_text(root / "esc" / "secret.txt", within=root), "")
+        self.assertIsNone(cs.sha256_file(root / "esc" / "secret.txt", within=root))
+        self.assertEqual(cs.load_json(root / "esc" / "secret.json", default={"d": 1}, within=root), {"d": 1})
+        # An internal symlink that resolves inside the root keeps working.
+        (root / "realdir").mkdir()
+        (root / "realdir" / "ok.txt").write_text("fine", encoding="utf-8")
+        (root / "in").symlink_to(root / "realdir")
+        self.assertEqual(cs.read_text(root / "in" / "ok.txt", within=root), "fine")
+
     def test_main_enforces_response_size_cap_before_writing(self) -> None:
         huge = cs.ok({"blob": "x" * (cs.MAX_RESPONSE_BYTES + 1000)})
         buf = io.StringIO()
