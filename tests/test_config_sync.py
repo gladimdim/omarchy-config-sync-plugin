@@ -1543,6 +1543,144 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertFalse(clone.exists())
         self.assertFalse(ctx.state_dir.exists())
 
+    def test_writers_survive_short_writes(self) -> None:
+        real_write = os.write
+
+        def one_byte_write(fd, data):
+            # Emulate the POSIX short-write case: only one byte lands per call.
+            return real_write(fd, memoryview(data)[:1])
+
+        src = self.tmp / "src.lua"
+        payload = "abcdefghij" * 300
+        src.write_text(payload, encoding="utf-8")
+        dst = self.tmp / "out" / "dst.lua"
+        root = self.tmp / "tree"
+        root.mkdir()
+        with patch.object(cs.os, "write", one_byte_write):
+            cs.copy_mapped_file(
+                {"path": "hypr/dst.lua", "repo_path": str(src), "local_path": str(dst)},
+                "apply",
+                src_root=self.tmp,
+                dst_root=self.tmp,
+            )
+            cs.atomic_write_text(root / "state.json", payload, within=root)
+            cs._write_credential_store(self.tmp / "creds", "https", "github.com", "user", "s3cret" * 50)
+        self.assertEqual(dst.read_text(encoding="utf-8"), payload)
+        self.assertEqual((root / "state.json").read_text(encoding="utf-8"), payload)
+        self.assertIn("s3cret" * 50, (self.tmp / "creds").read_text(encoding="utf-8"))
+
+    def test_writers_fail_closed_on_zero_progress_write(self) -> None:
+        src = self.tmp / "src.lua"
+        src.write_text("content", encoding="utf-8")
+        dst_dir = self.tmp / "out"
+        dst_dir.mkdir()
+        dst = dst_dir / "dst.lua"
+        with patch.object(cs.os, "write", lambda fd, data: 0):
+            with self.assertRaises(OSError):
+                cs.copy_mapped_file(
+                    {"path": "hypr/dst.lua", "repo_path": str(src), "local_path": str(dst)},
+                    "apply",
+                    src_root=self.tmp,
+                    dst_root=self.tmp,
+                )
+        # Nothing installed and no temp file left behind.
+        self.assertEqual(list(dst_dir.iterdir()), [])
+
+    def test_byte_budget_bounds_aggregate_copies(self) -> None:
+        budget = cs.ByteBudget(10, "Apply")
+        budget.consume(6)
+        budget.consume(4)
+        with self.assertRaises(cs.SyncError) as cm:
+            budget.consume(1)
+        self.assertIn("per-operation size limit", str(cm.exception))
+        # The budget is shared across copies of one operation.
+        src = self.tmp / "src.lua"
+        src.write_text("x" * 100, encoding="utf-8")
+        shared = cs.ByteBudget(150, "Apply")
+        cs.copy_mapped_file({"path": "hypr/a.lua", "repo_path": str(src), "local_path": str(self.tmp / "o" / "a.lua")}, "apply", src_root=self.tmp, dst_root=self.tmp, budget=shared)
+        with self.assertRaises(cs.SyncError):
+            cs.copy_mapped_file({"path": "hypr/b.lua", "repo_path": str(src), "local_path": str(self.tmp / "o" / "b.lua")}, "apply", src_root=self.tmp, dst_root=self.tmp, budget=shared)
+        self.assertFalse((self.tmp / "o" / "b.lua").exists())
+
+    def test_run_bounded_kills_child_exceeding_disk_budget(self) -> None:
+        grow = self.tmp / "grow"
+        grow.mkdir()
+        script = "i=0; while :; do head -c 65536 /dev/zero > f$i; i=$((i+1)); done"
+        started = time.monotonic()
+        result = cs.run_bounded(
+            ["sh", "-c", script],
+            cwd=str(grow),
+            timeout=30,
+            disk_root=grow,
+            max_disk_bytes=1024 * 1024,
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("on-disk budget", result.stderr)
+        # The child was stopped long before the timeout let it fill the disk.
+        self.assertLess(cs._tree_disk_usage(grow), 16 * 1024 * 1024)
+
+    def test_run_bounded_disk_budget_is_hard_even_after_fast_exit(self) -> None:
+        # A child that finishes between two watcher samples is still caught by
+        # the post-exit check, so the bound does not depend on poll timing.
+        d = self.tmp / "d"
+        d.mkdir()
+        result = cs.run_bounded(
+            ["sh", "-c", "head -c 300000 /dev/zero > big"],
+            cwd=str(d),
+            timeout=30,
+            disk_root=d,
+            max_disk_bytes=64 * 1024,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("on-disk budget", result.stderr)
+        ok = cs.run_bounded(["sh", "-c", "echo fine > small"], cwd=str(d), timeout=30, disk_root=d / "nope", max_disk_bytes=64 * 1024)
+        self.assertEqual(ok.returncode, 0)
+
+    def test_cmd_connect_removes_clone_that_exceeds_disk_budget(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            with patch.object(cs, "MAX_REPO_DISK_BYTES", 4096):
+                with self.assertRaises(cs.SyncError) as cm:
+                    cs.cmd_connect(env.ctx, argparse_ns(args=[f"file://{repo}"]))
+            self.assertIn("on-disk budget", str(cm.exception))
+            # The incomplete managed clone was cleaned up, the source untouched.
+            self.assertFalse(env.ctx.default_clone.exists())
+            self.assertTrue((repo / ".git").is_dir())
+
+    def test_collect_inventory_refuses_oversized_clone(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            with patch.object(cs, "MAX_REPO_DISK_BYTES", 1):
+                with self.assertRaises(cs.SyncError) as cm:
+                    cs.collect_inventory(env.ctx, repo)
+            self.assertIn("on disk", str(cm.exception))
+
+    def test_apply_refuses_selection_over_aggregate_budget(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            with patch.object(cs, "MAX_SYNC_TOTAL_BYTES", 10):
+                with self.assertRaises(cs.SyncError) as cm:
+                    cs.cmd_apply(env.ctx, argparse_ns())
+            self.assertIn("per-operation size limit", str(cm.exception))
+            # Nothing was installed or backed up.
+            self.assertFalse((env.home / ".config" / "hypr" / "looknfeel.lua").exists())
+            self.assertEqual([p for p in (env.home / ".config").glob("omarchy-backup.*")], [])
+
+    def test_remove_managed_clone_never_touches_outside_checkout(self) -> None:
+        ctx = self._ctx()
+        ctx.state_dir.mkdir(parents=True)
+        outside = self.tmp / "checkout"
+        (outside / ".git").mkdir(parents=True)
+        self.assertFalse(cs._remove_managed_clone(ctx, outside))
+        self.assertTrue((outside / ".git").is_dir())
+        inside = ctx.state_dir / "repo"
+        (inside / ".git").mkdir(parents=True)
+        self.assertTrue(cs._remove_managed_clone(ctx, inside))
+        self.assertFalse(inside.exists())
+
     def test_main_enforces_response_size_cap_before_writing(self) -> None:
         huge = cs.ok({"blob": "x" * (cs.MAX_RESPONSE_BYTES + 1000)})
         buf = io.StringIO()

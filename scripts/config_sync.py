@@ -45,6 +45,12 @@ MAX_INVENTORY_FILES = 20_000
 MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 MAX_SYNC_FILE_BYTES = 50 * 1024 * 1024
 MAX_URL_INPUT_BYTES = 64 * 1024
+# Hard on-disk budget for the managed clone while git (clone/fetch/pull/merge/
+# checkout) runs against an untrusted remote, and for the clone at rest.
+MAX_REPO_DISK_BYTES = 512 * 1024 * 1024
+# Aggregate bytes one apply/publish may copy (backup + installed files), so the
+# per-file cap cannot be multiplied by the inventory cap.
+MAX_SYNC_TOTAL_BYTES = 512 * 1024 * 1024
 
 BIND_RE = re.compile(
     r"""o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"([^"]*)")""",
@@ -56,7 +62,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.15"
+PLUGIN_VERSION = "1.2.16"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -219,6 +225,63 @@ def _read_fd_capped(fd: int, max_bytes: int) -> bytes | None:
     return b"".join(chunks)
 
 
+def _write_all(fd: int, data: bytes | memoryview) -> int:
+    """Write the whole buffer to fd. POSIX permits short writes even to regular
+    files, so a single os.write() may leave bytes unwritten; loop until every
+    byte is out and fail on zero progress rather than installing a truncated
+    file. (os.write already retries EINTR itself.) Returns bytes written."""
+    view = memoryview(data)
+    total = 0
+    while total < len(view):
+        n = os.write(fd, view[total:])
+        if n <= 0:
+            raise OSError(errno.EIO, "short write: no progress")
+        total += n
+    return total
+
+
+class ByteBudget:
+    """Running aggregate byte limit shared across the copies of one operation."""
+
+    def __init__(self, limit: int, what: str) -> None:
+        self.limit = limit
+        self.what = what
+        self.used = 0
+
+    def consume(self, n: int) -> None:
+        self.used += n
+        if self.used > self.limit:
+            raise SyncError(
+                f"{self.what} exceeded the {self.limit // (1024 * 1024)} MiB per-operation size limit; "
+                "select fewer files at a time."
+            )
+
+
+def _tree_disk_usage(root: Path, cap: int | None = None) -> int:
+    """Allocated bytes (st_blocks) under root without following symlinks —
+    covers worktree files, loose objects, packs and their temp files alike.
+    Stops early once `cap` is exceeded so a runaway tree is not fully walked."""
+    total = 0
+    stack = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    total += st.st_blocks * 512
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    if cap is not None and total > cap:
+                        return total
+        except OSError:
+            continue
+    return total
+
+
 def read_bytes_bound(path: Path, max_bytes: int | None = None, within: Path | None = None) -> bytes | None:
     cap = MAX_TEXT_FILE_BYTES if max_bytes is None else max_bytes
     fd = _open_bound(path, cap, within)
@@ -345,7 +408,7 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600, within: Path 
     data = content.encode("utf-8")
     if within is not None:
         def body(fd: int) -> None:
-            os.write(fd, data)
+            _write_all(fd, data)
         _write_within(within, path, mode, body)
         return
     ensure_parent(path)
@@ -520,12 +583,20 @@ def run_bounded(
     cwd: str | None = None,
     timeout: float = 30,
     max_bytes: int = MAX_SUBPROCESS_BYTES,
+    disk_root: Path | None = None,
+    max_disk_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """subprocess.run(capture_output=True) with the byte cap enforced WHILE the
     child (git on an untrusted remote, hyprctl, omarchy-shell) is running, not
     after it exits: output streams through capped drain threads, nothing is
     spooled to disk, and a child that exceeds its output budget has its whole
-    process group killed immediately instead of running until the timeout."""
+    process group killed immediately instead of running until the timeout.
+
+    With disk_root/max_disk_bytes, the tree's allocated size is also sampled
+    while the child runs (packs, loose objects, worktree files and anything a
+    helper descendant writes there) and the process group is killed the moment
+    it exceeds the budget; a final check after exit makes the bound hard even
+    for a child that finished between two samples."""
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
@@ -558,44 +629,72 @@ def run_bounded(
         except (BrokenPipeError, OSError):
             pass
 
+    disk_overflow = threading.Event()
+    watcher_done = threading.Event()
+    watcher: threading.Thread | None = None
+    if disk_root is not None and max_disk_bytes is not None:
+        def watch_disk() -> None:
+            while not watcher_done.is_set():
+                if _tree_disk_usage(disk_root, max_disk_bytes) > max_disk_bytes:
+                    disk_overflow.set()
+                    return
+                watcher_done.wait(0.25)
+
+        watcher = threading.Thread(target=watch_disk, daemon=True)
+        watcher.start()
+
+    def close_pipes() -> None:
+        for pipe in (proc.stdout, proc.stderr, proc.stdin):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except OSError:
+                pass
+
     deadline = time.monotonic() + timeout
     truncated = False
-    while True:
-        try:
-            proc.wait(timeout=0.05)
-            break
-        except subprocess.TimeoutExpired:
-            pass
-        if overflow.is_set():
-            truncated = True
-            kill_group()
-            proc.wait()
-            break
-        if time.monotonic() >= deadline:
-            kill_group()
-            proc.wait()
-            for t in readers:
-                t.join(timeout=2)
-            for pipe in (proc.stdout, proc.stderr, proc.stdin):
-                try:
-                    if pipe is not None:
-                        pipe.close()
-                except OSError:
-                    pass
-            raise subprocess.TimeoutExpired(cmd, timeout)
+    disk_exceeded = False
+    try:
+        while True:
+            try:
+                proc.wait(timeout=0.05)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if overflow.is_set() or disk_overflow.is_set():
+                truncated = overflow.is_set()
+                disk_exceeded = disk_overflow.is_set()
+                kill_group()
+                proc.wait()
+                break
+            if time.monotonic() >= deadline:
+                kill_group()
+                proc.wait()
+                for t in readers:
+                    t.join(timeout=2)
+                close_pipes()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+    finally:
+        watcher_done.set()
+        if watcher is not None:
+            watcher.join(timeout=5)
     for t in readers:
         t.join(timeout=5)
-    for pipe in (proc.stdout, proc.stderr, proc.stdin):
-        try:
-            if pipe is not None:
-                pipe.close()
-        except OSError:
-            pass
+    close_pipes()
+    returncode = proc.returncode
+    if disk_root is not None and max_disk_bytes is not None and not disk_exceeded:
+        if _tree_disk_usage(disk_root, max_disk_bytes) > max_disk_bytes:
+            disk_exceeded = True
     out = b"".join(out_chunks).decode("utf-8", errors="replace")
     err = b"".join(err_chunks).decode("utf-8", errors="replace")
     if truncated:
         err = (err + "\n[output truncated: process exceeded its output limit and was stopped]").strip()
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    if disk_exceeded:
+        limit_mib = (max_disk_bytes or 0) // (1024 * 1024)
+        err = (err + f"\n[repository exceeded its {limit_mib} MiB on-disk budget and was stopped]").strip()
+        if returncode == 0:
+            returncode = 1
+    return subprocess.CompletedProcess(cmd, returncode, out, err)
 
 
 def run_git(
@@ -604,7 +703,10 @@ def run_git(
     timeout: int = 30,
     check: bool = False,
     cwd: Path | None = None,
+    disk_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """disk_root enables the on-disk budget for operations that can grow the
+    clone from untrusted data (clone, fetch, pull, merge, checkout)."""
     cmd = ["git"]
     if repo is not None:
         cmd += ["-C", str(repo)]
@@ -615,6 +717,8 @@ def run_git(
             timeout=timeout,
             env=git_env(),
             cwd=str(cwd) if cwd else None,
+            disk_root=disk_root,
+            max_disk_bytes=MAX_REPO_DISK_BYTES if disk_root is not None else None,
         )
     except subprocess.TimeoutExpired as exc:
         raise SyncError(f"git {' '.join(args)} timed out after {timeout}s") from exc
@@ -647,7 +751,7 @@ def _write_credential_store(path: Path, protocol: str, host: str, username: str,
             f"{urllib.parse.quote(secret, safe='')}@{host}\n"
         )
         os.ftruncate(fd, 0)
-        os.write(fd, line.encode("utf-8"))
+        _write_all(fd, line.encode("utf-8"))
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -761,6 +865,32 @@ def read_or_create_session(plugin_root: Path | None) -> str | None:
     return value
 
 
+def _remove_managed_clone(ctx: Context, clone: Path) -> bool:
+    """Delete a plugin-managed clone (incomplete, over budget, or being
+    forgotten) only if it sits inside state_dir, relative to a verified
+    state_dir descriptor: the containment-checked path cannot be swapped for
+    a symlink between the check and the rmtree, the rmtree descends
+    dir_fd-relative, and a symlink at the top is refused. Never touches a
+    user's own checkout."""
+    if not clone.is_dir():
+        return False
+    try:
+        rel = clone.resolve().relative_to(ctx.state_dir.resolve())
+    except (ValueError, OSError):
+        return False
+    if not rel.parts:
+        return False
+    try:
+        state_fd = _open_dir_bound(ctx.state_dir, Path(), create=False)
+    except SyncError:
+        return False
+    try:
+        shutil.rmtree(str(rel), ignore_errors=True, dir_fd=state_fd)
+    finally:
+        os.close(state_fd)
+    return not clone.is_dir()
+
+
 def purge_saved_settings(ctx: Context) -> bool:
     """Forget linked-repo settings. Never deletes a user clone outside state_dir."""
     deleted_clone = False
@@ -771,26 +901,8 @@ def purge_saved_settings(ctx: Context) -> bool:
             state = loaded
     clone = Path(state.get("clone_path") or "")
     using_existing = bool(state.get("using_existing_clone"))
-    if clone.is_dir() and not using_existing:
-        try:
-            rel = clone.resolve().relative_to(ctx.state_dir.resolve())
-        except (ValueError, OSError):
-            rel = None
-        if rel is not None and rel.parts:
-            # Delete relative to a verified descriptor for state_dir so the
-            # containment-checked path cannot be swapped for a symlink between
-            # the check and the rmtree; the rmtree descends dir_fd-relative
-            # and refuses a symlink at the top.
-            try:
-                state_fd = _open_dir_bound(ctx.state_dir, Path(), create=False)
-            except SyncError:
-                state_fd = None
-            if state_fd is not None:
-                try:
-                    shutil.rmtree(str(rel), ignore_errors=True, dir_fd=state_fd)
-                finally:
-                    os.close(state_fd)
-                deleted_clone = not clone.is_dir()
+    if not using_existing:
+        deleted_clone = _remove_managed_clone(ctx, clone)
     if ctx.state_dir.is_dir():
         # rmtree refuses a symlinked root itself, and state_dir is a fixed
         # plugin-owned path, so a plain pathname delete is safe here.
@@ -1145,6 +1257,13 @@ def terminal_map(ctx: Context) -> dict[str, Path]:
 
 def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     items: dict[str, dict[str, Any]] = {}
+    if _tree_disk_usage(repo, MAX_REPO_DISK_BYTES) > MAX_REPO_DISK_BYTES:
+        # The clone is budgeted while git writes it; this catches a tree that
+        # grew past the budget by any other route before we walk or hash it.
+        raise SyncError(
+            f"Linked repo uses more than {MAX_REPO_DISK_BYTES // (1024 * 1024)} MiB on disk; "
+            "refusing to inspect it. Remove large files from the config repo."
+        )
     repo_resolved = repo.resolve()
     home_resolved = ctx.home.resolve()
 
@@ -1904,7 +2023,7 @@ def git_status_fields(repo: Path, fetch_error: str | None = None) -> dict[str, A
 
 def maybe_fast_forward(repo: Path, git_fields: dict[str, Any]) -> dict[str, Any]:
     if git_fields["behind"] and not git_fields["ahead"] and not git_fields["dirty"] and not git_fields["conflicts"]:
-        result = run_git(repo, ["merge", "--ff-only", git_fields["upstream"] or "FETCH_HEAD"], timeout=40)
+        result = run_git(repo, ["merge", "--ff-only", git_fields["upstream"] or "FETCH_HEAD"], timeout=40, disk_root=repo)
         if result.returncode == 0:
             return git_status_fields(repo, git_fields.get("fetch_error"))
         git_fields["fetch_error"] = git_fields.get("fetch_error") or git_error_message(["merge", "--ff-only"], result)
@@ -1912,7 +2031,7 @@ def maybe_fast_forward(repo: Path, git_fields: dict[str, Any]) -> dict[str, Any]
 
 
 def fetch_repo(repo: Path) -> str | None:
-    result = run_git(repo, ["fetch", "--prune", "origin"], timeout=FETCH_TIMEOUT)
+    result = run_git(repo, ["fetch", "--prune", "origin"], timeout=FETCH_TIMEOUT, disk_root=repo)
     if result.returncode != 0:
         return git_error_message(["fetch"], result)
     return None
@@ -2205,7 +2324,9 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             fetch_error = fetch_repo(clone_path)
             if fetch_error:
                 raise SyncError(fetch_error)
-            run_git(clone_path, ["pull", "--ff-only"], timeout=40)
+            result = run_git(clone_path, ["pull", "--ff-only"], timeout=40, disk_root=clone_path)
+            if result.returncode != 0 and "on-disk budget" in (result.stderr or ""):
+                raise SyncError(git_error_message(["pull", "--ff-only"], result))
         else:
             # Different remote: move the old clone aside rather than deleting blindly.
             previous_clone = ctx.state_dir / f"repo.bak.{int(time.time())}"
@@ -2216,26 +2337,25 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 [*git_cred_config_args(cred_file), "clone", "--", clean_url, str(clone_path)],
                 timeout=CLONE_TIMEOUT,
                 cwd=ctx.state_dir,
+                disk_root=clone_path,
             )
             if result.returncode != 0:
-                if clone_path.exists():
-                    shutil.rmtree(clone_path, ignore_errors=True)
+                _remove_managed_clone(ctx, clone_path)
                 if previous_clone.exists():
                     previous_clone.rename(ctx.default_clone)
                 raise SyncError(git_error_message(["clone", clean_url], result))
             persist_git_credential_helper(clone_path, cred_file)
     else:
-        if clone_path.exists():
-            shutil.rmtree(clone_path)
+        _remove_managed_clone(ctx, clone_path)
         result = run_git(
             None,
             [*git_cred_config_args(cred_file), "clone", "--", clean_url, str(clone_path)],
             timeout=CLONE_TIMEOUT,
             cwd=ctx.state_dir,
+            disk_root=clone_path,
         )
         if result.returncode != 0:
-            if clone_path.exists():
-                shutil.rmtree(clone_path, ignore_errors=True)
+            _remove_managed_clone(ctx, clone_path)
             raise SyncError(git_error_message(["clone", clean_url], result))
         persist_git_credential_helper(clone_path, cred_file)
 
@@ -2244,8 +2364,8 @@ def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = snap.get("message") or f"Linked {clean_url}"
         return snap
     except SyncError:
-        if clone_path.exists() and not existing_state.get("using_existing_clone"):
-            shutil.rmtree(clone_path, ignore_errors=True)
+        if not existing_state.get("using_existing_clone"):
+            _remove_managed_clone(ctx, clone_path)
         if previous_clone is not None and previous_clone.exists() and not ctx.default_clone.exists():
             previous_clone.rename(ctx.default_clone)
         raise
@@ -2293,6 +2413,7 @@ def copy_mapped_file(
     direction: str,
     src_root: Path | None = None,
     dst_root: Path | None = None,
+    budget: ByteBudget | None = None,
 ) -> None:
     src = Path(item["repo_path"] if direction == "apply" else item["local_path"])
     dst = Path(item["local_path"] if direction == "apply" else item["repo_path"])
@@ -2358,8 +2479,10 @@ def copy_mapped_file(
                 chunk = os.read(src_fd, min(1024 * 1024, remaining))
                 if not chunk:
                     break
-                os.write(tmp_fd, chunk)
-                remaining -= len(chunk)
+                written = _write_all(tmp_fd, chunk)
+                remaining -= written
+                if budget is not None:
+                    budget.consume(written)
                 if remaining <= 0:
                     raise SyncError(f"Refusing to copy {src}: it grew past the size limit during the copy.")
 
@@ -2370,7 +2493,7 @@ def copy_mapped_file(
             os.close(dir_fd)
 
 
-def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
+def backup_local(ctx: Context, files: list[dict[str, Any]], budget: ByteBudget | None = None) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = ctx.home / ".config" / f"omarchy-backup.{stamp}"
     copied = 0
@@ -2404,8 +2527,10 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
                     chunk = os.read(src_fd, min(1024 * 1024, remaining))
                     if not chunk:
                         break
-                    os.write(tmp_fd, chunk)
-                    remaining -= len(chunk)
+                    written = _write_all(tmp_fd, chunk)
+                    remaining -= written
+                    if budget is not None:
+                        budget.consume(written)
                     if remaining <= 0:
                         raise SyncError(
                             f"Backup aborted: {src} grew past the size limit while it was being copied."
@@ -2423,6 +2548,25 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
         within=ctx.home,
     )
     return backup_dir
+
+
+def _check_operation_size(paths: list[str], what: str) -> None:
+    """Upfront pathname estimate of an apply/publish selection so an oversized
+    selection fails before any file is backed up or replaced. Only a
+    pre-filter: the ByteBudget on the copies is the enforcement."""
+    total = 0
+    for raw in paths:
+        try:
+            st = os.lstat(raw)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            total += st.st_size
+    if total > MAX_SYNC_TOTAL_BYTES:
+        raise SyncError(
+            f"{what} selection totals {total // (1024 * 1024)} MiB, above the "
+            f"{MAX_SYNC_TOTAL_BYTES // (1024 * 1024)} MiB per-operation size limit; select fewer files at a time."
+        )
 
 
 def strip_plugin_git_dirs(repo: Path) -> None:
@@ -2615,12 +2759,18 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 "local_exists": True,
             }
         )
-    backup_dir = backup_local(ctx, backup_targets)
+    # Aggregate budget for the whole operation (backup + installed files), so
+    # the per-file cap cannot be multiplied by the inventory cap. The upfront
+    # estimate fails before anything is touched; the running budget is the
+    # enforcement, decremented by bytes actually written.
+    _check_operation_size([i["repo_path"] for i in chosen] + [i["local_path"] for i in backup_targets], "Apply")
+    budget = ByteBudget(MAX_SYNC_TOTAL_BYTES, "Apply")
+    backup_dir = backup_local(ctx, backup_targets, budget=budget)
     applied = []
     for item in chosen:
         if not Path(item["repo_path"]).is_file():
             continue
-        copy_mapped_file(item, "apply", src_root=repo, dst_root=ctx.home)
+        copy_mapped_file(item, "apply", src_root=repo, dst_root=ctx.home, budget=budget)
         applied.append(item["path"])
     if shortcut_keys:
         if merge_shortcuts_file(
@@ -2747,12 +2897,14 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = "Nothing to publish."
         return snap
 
+    _check_operation_size([i["local_path"] for i in chosen], "Publish")
+    budget = ByteBudget(MAX_SYNC_TOTAL_BYTES, "Publish")
     write_marker(repo)
     published = []
     for item in chosen:
         if not Path(item["local_path"]).is_file():
             continue
-        copy_mapped_file(item, "publish", src_root=ctx.home, dst_root=repo)
+        copy_mapped_file(item, "publish", src_root=ctx.home, dst_root=repo, budget=budget)
         published.append(item["path"])
     if shortcut_keys:
         if merge_shortcuts_file(
@@ -2833,7 +2985,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     git_fields = git_status_fields(repo, fetch_error)
     git_fields = maybe_fast_forward(repo, git_fields)
     if git_fields["behind"] and side == "repo":
-        merge = run_git(repo, ["merge", git_fields["upstream"] or "origin/" + (git_fields["branch"] or "main")], timeout=40)
+        merge = run_git(repo, ["merge", git_fields["upstream"] or "origin/" + (git_fields["branch"] or "main")], timeout=40, disk_root=repo)
         if merge.returncode != 0:
             conflicts = git_status_fields(repo).get("conflicts") or []
             if conflicts:
@@ -2919,7 +3071,7 @@ def cmd_pull(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = "Already up to date with origin."
         snap["pulled"] = False
         return snap
-    result = run_git(repo, ["merge", git_fields["upstream"] or "origin/" + git_fields["branch"]], timeout=40)
+    result = run_git(repo, ["merge", git_fields["upstream"] or "origin/" + git_fields["branch"]], timeout=40, disk_root=repo)
     if result.returncode != 0:
         conflicts = git_status_fields(repo).get("conflicts") or []
         if conflicts:
@@ -2949,7 +3101,7 @@ def cmd_resolve(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         label = "incoming (theirs)"
     else:
         raise SyncError("Side must be ours/local or theirs/repo.")
-    result = run_git(repo, ["checkout", checkout, "--", rel])
+    result = run_git(repo, ["checkout", checkout, "--", rel], disk_root=repo)
     if result.returncode != 0:
         raise SyncError(git_error_message(["checkout", checkout, rel], result))
     run_git(repo, ["add", "--", rel], check=True)
