@@ -56,7 +56,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.14"
+PLUGIN_VERSION = "1.2.15"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -237,33 +237,53 @@ def read_text(path: Path, within: Path | None = None) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _open_dir_bound(root: Path, rel_parent: Path) -> int:
+def _open_dir_bound(root: Path, rel_parent: Path, create: bool = True) -> int:
     """Open root/rel_parent as a directory descriptor whose canonical location
-    is verified to sit inside root, creating missing directories on the way.
-    Symlinked components that stay inside root (dotfiles setups) still pass;
-    ones that escape are refused on the opened descriptor, so a concurrent
-    swap cannot redirect anything written dir_fd-relative to it. Directory
-    creation itself is pathname-based, but nothing is ever written through a
-    directory that failed this descriptor check."""
+    is verified to sit inside root. The walk is descriptor-relative end to
+    end: each component is opened with openat() from the previous descriptor
+    and missing ones are created with mkdirat(), so not even directory
+    creation traverses a symlinked parent by pathname. A component that is a
+    symlink is followed, but the directory it lands on is containment-checked
+    on the opened descriptor via /proc/self/fd at every hop — symlinks that
+    stay inside root (dotfiles setups) pass, escapes are refused."""
     if any(part in ("..", "") for part in rel_parent.parts):
         raise SyncError(f"Refusing to write through unsafe path: {rel_parent}")
-    target = root / rel_parent if rel_parent.parts else root
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass  # the open below is the authority on whether this is usable
+    root_resolved = root.resolve()
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(str(target), flags)
+        fd = os.open(str(root), flags)
     except OSError as exc:
-        raise SyncError(f"Cannot open destination directory: {target}") from exc
-    try:
-        proc_link = f"/proc/self/fd/{fd}"
+        raise SyncError(f"Cannot open destination directory: {root}") from exc
+
+    def verify(fd_: int) -> None:
+        proc_link = f"/proc/self/fd/{fd_}"
         if not os.path.lexists(proc_link):
             raise SyncError("Cannot verify write containment without /proc; refusing to write.")
         actual = Path(os.path.realpath(proc_link))
-        if not actual.is_relative_to(root.resolve()):
-            raise SyncError(f"Refusing to write into {target}: it resolves outside {root}")
+        if not actual.is_relative_to(root_resolved):
+            raise SyncError(f"Refusing to write into {root / rel_parent}: it resolves outside {root}")
+
+    try:
+        verify(fd)
+        for part in rel_parent.parts:
+            try:
+                nxt = os.open(part, flags, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno != errno.ENOENT or not create:
+                    raise SyncError(f"Cannot open destination directory: {root / rel_parent}") from exc
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                except OSError as mk_exc:
+                    raise SyncError(f"Cannot create destination directory: {root / rel_parent}") from mk_exc
+                try:
+                    nxt = os.open(part, flags, dir_fd=fd)
+                except OSError as exc2:
+                    raise SyncError(f"Cannot open destination directory: {root / rel_parent}") from exc2
+            os.close(fd)
+            fd = nxt
+            verify(fd)
         return fd
     except Exception:
         os.close(fd)
@@ -753,13 +773,27 @@ def purge_saved_settings(ctx: Context) -> bool:
     using_existing = bool(state.get("using_existing_clone"))
     if clone.is_dir() and not using_existing:
         try:
-            clone.resolve().relative_to(ctx.state_dir.resolve())
+            rel = clone.resolve().relative_to(ctx.state_dir.resolve())
         except (ValueError, OSError):
-            pass
-        else:
-            shutil.rmtree(clone, ignore_errors=True)
-            deleted_clone = True
+            rel = None
+        if rel is not None and rel.parts:
+            # Delete relative to a verified descriptor for state_dir so the
+            # containment-checked path cannot be swapped for a symlink between
+            # the check and the rmtree; the rmtree descends dir_fd-relative
+            # and refuses a symlink at the top.
+            try:
+                state_fd = _open_dir_bound(ctx.state_dir, Path(), create=False)
+            except SyncError:
+                state_fd = None
+            if state_fd is not None:
+                try:
+                    shutil.rmtree(str(rel), ignore_errors=True, dir_fd=state_fd)
+                finally:
+                    os.close(state_fd)
+                deleted_clone = not clone.is_dir()
     if ctx.state_dir.is_dir():
+        # rmtree refuses a symlinked root itself, and state_dir is a fixed
+        # plugin-owned path, so a plain pathname delete is safe here.
         shutil.rmtree(ctx.state_dir, ignore_errors=True)
     return deleted_clone
 
@@ -2266,9 +2300,10 @@ def copy_mapped_file(
     # O_NOFOLLOW, S_ISREG/size run via fstat on that descriptor, containment
     # is rechecked through /proc/self/fd, and the bytes are read from the same
     # descriptor with a running budget. The destination side mirrors it: the
-    # parent directory is opened and containment-verified once, and the temp
-    # file plus the final rename are dir_fd-relative to that descriptor, so a
-    # symlinked parent swapped in concurrently cannot redirect the write.
+    # parent directory is reached by a descriptor-relative walk with
+    # containment verified at every hop, and the temp file plus the final
+    # rename are dir_fd-relative to that descriptor, so a symlinked parent
+    # swapped in concurrently cannot redirect the write.
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -2388,6 +2423,42 @@ def backup_local(ctx: Context, files: list[dict[str, Any]]) -> Path:
         within=ctx.home,
     )
     return backup_dir
+
+
+def strip_plugin_git_dirs(repo: Path) -> None:
+    """Drop accidental .git dirs copied along with plugins before committing.
+
+    Deletion is anchored to a verified descriptor for the clone's plugins/
+    tree and every plugin dir is opened O_NOFOLLOW, so a repo that commits
+    plugins/<x> as a symlink cannot steer the rmtree at a .git directory
+    elsewhere on the machine; the rmtree itself descends dir_fd-relative."""
+    plugins_dir = repo / "plugins"
+    if not plugins_dir.is_dir() or plugins_dir.is_symlink():
+        return
+    try:
+        plugins_fd = _open_dir_bound(repo, Path("plugins"), create=False)
+    except SyncError:
+        return
+    try:
+        for name in os.listdir(plugins_fd):
+            try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=plugins_fd,
+                )
+            except OSError:
+                continue  # symlinked or non-directory entry: leave it alone
+            try:
+                st = os.stat(".git", dir_fd=child_fd, follow_symlinks=False)
+                if stat.S_ISDIR(st.st_mode):
+                    shutil.rmtree(".git", ignore_errors=True, dir_fd=child_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(child_fd)
+    finally:
+        os.close(plugins_fd)
 
 
 def selected_items(diff_files: list[dict[str, Any]], wanted: set[str] | None, include_machine: bool, direction: str) -> list[dict[str, Any]]:
@@ -2693,13 +2764,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         ):
             published.append("hypr/bindings.lua")
 
-    # Strip any accidental .git dirs copied with plugins
-    plugins_dir = repo / "plugins"
-    if plugins_dir.is_dir():
-        for child in plugins_dir.iterdir():
-            gitdir = child / ".git"
-            if gitdir.exists():
-                shutil.rmtree(gitdir, ignore_errors=True)
+    strip_plugin_git_dirs(repo)
 
     ensure_git_identity(repo)
     run_git(repo, ["add", "-A"], check=True)

@@ -1489,6 +1489,60 @@ class SecurityHardeningTests(unittest.TestCase):
         (root / "in").symlink_to(root / "realdir")
         self.assertEqual(cs.read_text(root / "in" / "ok.txt", within=root), "fine")
 
+    def test_strip_plugin_git_dirs_refuses_symlinked_plugin_dirs(self) -> None:
+        repo = self.tmp / "clone"
+        (repo / "plugins").mkdir(parents=True)
+        # A real plugin dir with a stray .git gets stripped...
+        real = repo / "plugins" / "demo.widget"
+        (real / ".git").mkdir(parents=True)
+        (real / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        # ...but a symlinked plugin dir pointing at another checkout must not
+        # have that checkout's .git deleted through the link.
+        victim = Path(tempfile.mkdtemp(prefix="cs-victim-"))
+        self.addCleanup(shutil.rmtree, victim, ignore_errors=True)
+        (victim / ".git").mkdir()
+        (victim / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (repo / "plugins" / "evil").symlink_to(victim)
+        # A .git that is itself a symlink is left alone too.
+        real2 = repo / "plugins" / "linked.git"
+        real2.mkdir()
+        (real2 / ".git").symlink_to(victim / ".git")
+        cs.strip_plugin_git_dirs(repo)
+        self.assertFalse((real / ".git").exists())
+        self.assertTrue((victim / ".git" / "HEAD").is_file())
+        self.assertTrue((real2 / ".git").is_symlink())
+
+    def test_open_dir_bound_never_creates_outside_root(self) -> None:
+        root = self.tmp / "tree"
+        root.mkdir()
+        outside = Path(tempfile.mkdtemp(prefix="cs-outside-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (root / "esc").symlink_to(outside)
+        # The old pathname mkdir(parents=True) would have created esc/sub/
+        # outside the root before the containment check refused the write;
+        # the descriptor-relative walk must not create anything out there.
+        with self.assertRaises(cs.SyncError):
+            cs.atomic_write_text(root / "esc" / "sub" / "x.txt", "hi", within=root)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_purge_saved_settings_deletes_only_in_state_clones(self) -> None:
+        ctx = self._ctx()
+        ctx.state_dir.mkdir(parents=True)
+        # Clone recorded outside state_dir is never deleted.
+        keep = self.tmp / "mycheckout"
+        (keep / ".git").mkdir(parents=True)
+        cs.write_json(ctx.state_path, {"clone_path": str(keep)}, within=ctx.state_dir)
+        self.assertFalse(cs.purge_saved_settings(ctx))
+        self.assertTrue((keep / ".git").is_dir())
+        # Clone inside state_dir is deleted, descriptor-relative.
+        ctx.state_dir.mkdir(parents=True)
+        clone = ctx.state_dir / "repo"
+        (clone / ".git").mkdir(parents=True)
+        cs.write_json(ctx.state_path, {"clone_path": str(clone)}, within=ctx.state_dir)
+        self.assertTrue(cs.purge_saved_settings(ctx))
+        self.assertFalse(clone.exists())
+        self.assertFalse(ctx.state_dir.exists())
+
     def test_main_enforces_response_size_cap_before_writing(self) -> None:
         huge = cs.ok({"blob": "x" * (cs.MAX_RESPONSE_BYTES + 1000)})
         buf = io.StringIO()
