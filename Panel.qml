@@ -2492,6 +2492,33 @@ Panel {
                   font.pixelSize: Style.font.caption
                   wrapMode: Text.WordWrap
                 }
+
+                Flow {
+                  visible: catRowBox.modelData && catRowBox.modelData.changes && catRowBox.modelData.changes.length > 0
+                  width: parent.width
+                  spacing: Style.space(4)
+                  Repeater {
+                    model: (catRowBox.modelData && catRowBox.modelData.changes) ? catRowBox.modelData.changes : []
+                    Rectangle {
+                      radius: Style.cornerRadius > 0 ? Style.space(4) : 2
+                      color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
+                      border.width: 1
+                      border.color: root.accent
+                      implicitWidth: catChangeText.implicitWidth + Style.space(10)
+                      implicitHeight: catChangeText.implicitHeight + Style.space(4)
+                      Text {
+                        id: catChangeText
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: String(modelData)
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+                    }
+                  }
+                }
               }
 
               Row {
@@ -2792,6 +2819,33 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
+            }
+
+            Flow {
+              visible: rowBox.modelData && rowBox.modelData.changes && rowBox.modelData.changes.length > 0
+              width: parent.width
+              spacing: Style.space(4)
+              Repeater {
+                model: (rowBox.modelData && rowBox.modelData.changes) ? rowBox.modelData.changes : []
+                Rectangle {
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 2
+                  color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
+                  border.width: 1
+                  border.color: root.accent
+                  implicitWidth: changeText.implicitWidth + Style.space(10)
+                  implicitHeight: changeText.implicitHeight + Style.space(4)
+                  Text {
+                    id: changeText
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: String(modelData)
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                }
+              }
             }
           }
 

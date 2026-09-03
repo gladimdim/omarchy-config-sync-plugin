@@ -1693,5 +1693,86 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertIn("exceeded", data["error"])
 
 
+class SemanticDiffTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="cs-sem-test-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_shell_json_semantic_diff(self) -> None:
+        loc = self.tmp / "local.json"
+        rep = self.tmp / "repo.json"
+        loc.write_text(
+            json.dumps({
+                "bar": {"position": "top", "transparent": False, "layout": {"left": ["omarchy.menu"]}},
+                "idle": {"lock": 300},
+            })
+        )
+        rep.write_text(
+            json.dumps({
+                "bar": {"position": "bottom", "transparent": True, "layout": {"left": ["omarchy.menu", "gladimdim.audio"]}},
+                "idle": {"lock": 600},
+            })
+        )
+
+        # Incoming from repo
+        summary, changes = cs.summarize_file_diff("omarchy/shell.json", loc, rep, "repo")
+        self.assertIn("Dock Bar: top → bottom", changes)
+        self.assertIn("Bar transparency: off → on", changes)
+        self.assertIn("Idle Lock: 5m → 10m", changes)
+        self.assertIn("+audio", changes)
+        self.assertIn("Dock Bar: top → bottom", summary)
+
+        # Outgoing from local
+        summary, changes = cs.summarize_file_diff("omarchy/shell.json", loc, rep, "local")
+        self.assertIn("Dock Bar: bottom → top", changes)
+        self.assertIn("Idle Lock: 10m → 5m", changes)
+
+    def test_shell_toml_semantic_diff(self) -> None:
+        loc = self.tmp / "local.toml"
+        rep = self.tmp / "repo.toml"
+        loc.write_text("[font]\nbase-size = 12\n")
+        rep.write_text("[font]\nbase-size = 18\n")
+        summary, changes = cs.summarize_file_diff("omarchy/shell.toml", loc, rep, "repo")
+        self.assertEqual(changes, ["Font base-size: 12px → 18px"])
+
+    def test_terminal_font_semantic_diff(self) -> None:
+        loc = self.tmp / "local.config"
+        rep = self.tmp / "repo.config"
+        loc.write_text('font-size = 9\nfont-family = "Adwaita Mono"\n')
+        rep.write_text('font-size = 12\nfont-family = "JetBrains Mono"\n')
+        summary, changes = cs.summarize_file_diff("terminals/ghostty.config", loc, rep, "repo")
+        self.assertIn("Font size: 9 → 12", changes)
+        self.assertIn("Font: Adwaita Mono → JetBrains Mono", changes)
+
+    def test_looknfeel_semantic_diff(self) -> None:
+        loc = self.tmp / "local.lua"
+        rep = self.tmp / "repo.lua"
+        loc.write_text('hl.config({ general = { gaps_in = 5, gaps_out = 10, border_size = 2 }, decoration = { rounding = 8 } })\n')
+        rep.write_text('hl.config({ general = { gaps_in = 0, gaps_out = 0, border_size = 1 }, decoration = { rounding = 12 } })\n')
+        summary, changes = cs.summarize_file_diff("hypr/looknfeel.lua", loc, rep, "repo")
+        self.assertIn("Gaps: 5/10 → 0/0", changes)
+        self.assertIn("Border: 2px → 1px", changes)
+        self.assertIn("Corners: 8px → 12px", changes)
+
+    def test_input_lua_semantic_diff(self) -> None:
+        loc = self.tmp / "local.lua"
+        rep = self.tmp / "repo.lua"
+        loc.write_text('hl.config({ input = { kb_layout = "us", touchpad = { tap_to_click = false } } })\n')
+        rep.write_text('hl.config({ input = { kb_layout = "us,ua", touchpad = { tap_to_click = true } } })\n')
+        summary, changes = cs.summarize_file_diff("hypr/input.lua", loc, rep, "repo")
+        self.assertIn("Keyboard: us → us,ua", changes)
+        self.assertIn("Tap-to-click: off → on", changes)
+
+    def test_generic_fallback_diff(self) -> None:
+        loc = self.tmp / "local.sh"
+        rep = self.tmp / "repo.sh"
+        loc.write_text("echo hello\n")
+        rep.write_text("echo hello\necho world\necho again\n")
+        summary, changes = cs.summarize_file_diff("bin/test.sh", loc, rep, "repo")
+        self.assertEqual(changes, ["+2, -0 lines"])
+
+
 if __name__ == "__main__":
     unittest.main()

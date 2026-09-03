@@ -90,7 +90,7 @@ function isBundledPath(path) {
     || p.indexOf("bin/") === 0
 }
 
-function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCount, hidden) {
+function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCount, hidden, changes) {
   return {
     kind: kind,
     itemId: String(id || ""),
@@ -100,7 +100,8 @@ function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCo
     typeLabel: typeLabel || "",
     both: !!both || String(status) === "both",
     changed_count: changedCount || 0,
-    hidden: !!hidden
+    hidden: !!hidden,
+    changes: changes || []
   }
 }
 
@@ -262,7 +263,8 @@ function appendLooseFiles(out, files, both, hiddenMap) {
     var p = String(f.path || "")
     if (!p || isBundledPath(p) || p.indexOf("plugins/gladimdim.config-sync") === 0) continue
     if (isItemHidden("f", p, hiddenMap, f)) continue
-    out.push(reviewItem("f", p, p, f.summary || "", f.status, "File", both || f.status === "both", 0, false))
+    var sum = f.semantic_summary || f.summary || ""
+    out.push(reviewItem("f", p, p, sum, f.status, "File", both || f.status === "both", 0, false, f.changes || []))
   }
 }
 

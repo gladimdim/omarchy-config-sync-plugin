@@ -75,6 +75,7 @@ FILE_SUMMARIES = {
     "hypr/monitors.lua": "Display layout (machine-specific)",
     "hypr/xdph.conf": "Screen share / XDG portal",
     "omarchy/shell.json": "Bar layout, widgets, and idle lock",
+    "omarchy/shell.toml": "Shell font and type scale",
     "omarchy/theme.name": "Selected Omarchy theme",
 }
 
@@ -1341,6 +1342,11 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     if repo_shell.is_file() or local_shell.is_file():
         add("omarchy/shell.json", local_shell, repo_shell, "omarchy")
 
+    repo_shell_toml = repo / "omarchy" / "shell.toml"
+    local_shell_toml = ctx.config_omarchy / "shell.toml"
+    if repo_shell_toml.is_file() or local_shell_toml.is_file():
+        add("omarchy/shell.toml", local_shell_toml, repo_shell_toml, "omarchy")
+
     plugin_ids: set[str] = set()
     repo_plugins = repo / "plugins"
     if repo_plugins.is_dir():
@@ -1486,6 +1492,293 @@ def unified_preview(local_path: Path, repo_path: Path, local_within: Path | None
     if len(text) > MAX_DIFF_BYTES:
         text = text[: MAX_DIFF_BYTES - 20] + "\n… truncated"
     return text
+
+
+def format_change_duration(sec: Any) -> str:
+    if sec is None:
+        return "none"
+    try:
+        s = int(sec)
+        if s <= 0:
+            return "disabled"
+        if s % 60 == 0:
+            return f"{s // 60}m"
+        return f"{s // 60}m{s % 60}s" if s > 60 else f"{s}s"
+    except (ValueError, TypeError):
+        return str(sec)
+
+
+def format_setting_change(label: str, old_val: Any, new_val: Any, status: str) -> str:
+    if old_val is None or old_val == "None":
+        return f"{label}: {new_val}"
+    if new_val is None or new_val == "None":
+        return f"{label}: {old_val} (removed)"
+    if status in {"repo", "added-repo"}:
+        return f"{label}: {old_val} → {new_val}"
+    elif status in {"local", "added-local"}:
+        return f"{label}: {old_val} → {new_val}"
+    else:
+        return f"{label}: local {old_val} vs repo {new_val}"
+
+
+def extract_shell_widgets(data: Any) -> set[str]:
+    if not isinstance(data, dict):
+        return set()
+    bar = data.get("bar") or {}
+    layout = bar.get("layout") or {}
+    widgets: set[str] = set()
+    for section in ("left", "center", "right"):
+        for item in layout.get(section) or []:
+            if isinstance(item, dict) and item.get("id"):
+                widgets.add(item["id"])
+            elif isinstance(item, str):
+                widgets.add(item)
+    return widgets
+
+
+def parse_lua_simple_vars(text: str) -> dict[str, str]:
+    vals: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("--"):
+            continue
+        if " --" in line:
+            line = line.split(" --", 1)[0]
+        for m in re.finditer(r'(\w+)\s*=\s*("[^"]*"|\'[^\']*\'|[^\s,;{}]+)', line):
+            vals[m.group(1)] = m.group(2).strip("\"'")
+    return vals
+
+
+def parse_terminal_font_settings(rel: str, text: str) -> tuple[str | None, str | None]:
+    font_size: str | None = None
+    font_family: str | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            continue
+        if "ghostty" in rel:
+            m_sz = re.search(r"font-size\s*=\s*([0-9.]+)", line)
+            m_fam = re.search(r"font-family\s*=\s*[\"']?([^\"'\n#]+)[\"']?", line)
+            if m_sz:
+                font_size = m_sz.group(1)
+            if m_fam:
+                font_family = m_fam.group(1).strip()
+        elif "alacritty" in rel:
+            m_sz = re.search(r"size\s*=\s*([0-9.]+)", line)
+            m_fam = re.search(r"family\s*=\s*[\"']?([^\"'\n#]+)[\"']?", line)
+            if m_sz:
+                font_size = m_sz.group(1)
+            if m_fam:
+                font_family = m_fam.group(1).strip()
+        elif "kitty" in rel:
+            m_sz = re.search(r"^font_size\s+([0-9.]+)", line)
+            m_fam = re.search(r"^font_family\s+([^\n#]+)", line)
+            if m_sz:
+                font_size = m_sz.group(1)
+            if m_fam:
+                font_family = m_fam.group(1).strip()
+        elif "foot" in rel:
+            m = re.search(r"^font\s*=\s*([^:\n#]+)(?::size=([0-9.]+))?", line)
+            if m:
+                font_family = m.group(1).strip()
+                if m.group(2):
+                    font_size = m.group(2)
+    return font_size, font_family
+
+
+def summarize_file_diff(
+    rel: str,
+    local_path: Path,
+    repo_path: Path,
+    status: str,
+    local_within: Path | None = None,
+    repo_within: Path | None = None,
+) -> tuple[str, list[str]]:
+    """Generate human-readable semantic summary and change pills for config diffs."""
+    try:
+        import difflib
+    except Exception:
+        return ("", [])
+
+    if file_too_large(local_path) or file_too_large(repo_path):
+        return ("", [])
+
+    local_text = read_text(local_path, within=local_within) if local_path.is_file() else ""
+    repo_text = read_text(repo_path, within=repo_within) if repo_path.is_file() else ""
+
+    if not local_text and not repo_text:
+        return ("", [])
+
+    changes: list[str] = []
+
+    # 1. omarchy/shell.json
+    if rel == "omarchy/shell.json":
+        try:
+            loc = json.loads(local_text) if local_text.strip() else {}
+        except Exception:
+            loc = {}
+        try:
+            rep = json.loads(repo_text) if repo_text.strip() else {}
+        except Exception:
+            rep = {}
+
+        before, after = (loc, rep) if status in {"repo", "added-repo"} else (rep, loc)
+
+        # Bar position
+        b_pos = (before.get("bar") or {}).get("position")
+        a_pos = (after.get("bar") or {}).get("position")
+        if b_pos != a_pos and (b_pos or a_pos):
+            changes.append(format_setting_change("Dock Bar", b_pos or "top", a_pos or "top", status))
+
+        # Transparency
+        b_tr = (before.get("bar") or {}).get("transparent")
+        a_tr = (after.get("bar") or {}).get("transparent")
+        if b_tr != a_tr and (b_tr is not None or a_tr is not None):
+            changes.append(format_setting_change("Bar transparency", "on" if b_tr else "off", "on" if a_tr else "off", status))
+
+        # Idle lock
+        b_lock = (before.get("idle") or {}).get("lock")
+        a_lock = (after.get("idle") or {}).get("lock")
+        if b_lock != a_lock and (b_lock is not None or a_lock is not None):
+            changes.append(format_setting_change("Idle Lock", format_change_duration(b_lock), format_change_duration(a_lock), status))
+
+        # Screensaver
+        b_ss = (before.get("idle") or {}).get("screensaver")
+        a_ss = (after.get("idle") or {}).get("screensaver")
+        if b_ss != a_ss and (b_ss is not None or a_ss is not None):
+            changes.append(format_setting_change("Screensaver", format_change_duration(b_ss), format_change_duration(a_ss), status))
+
+        # Widgets
+        b_w = extract_shell_widgets(before)
+        a_w = extract_shell_widgets(after)
+        added = a_w - b_w
+        removed = b_w - a_w
+        if added:
+            top_added = sorted(added)[:2]
+            s = ", ".join("+" + w.split(".")[-1] for w in top_added)
+            if len(added) > 2:
+                s += f" (+{len(added)-2} more)"
+            changes.append(s)
+        if removed:
+            top_removed = sorted(removed)[:2]
+            s = ", ".join("-" + w.split(".")[-1] for w in top_removed)
+            if len(removed) > 2:
+                s += f" (-{len(removed)-2} more)"
+            changes.append(s)
+
+    # 2. omarchy/shell.toml
+    elif rel == "omarchy/shell.toml":
+        m_loc = re.search(r"base-size\s*=\s*([0-9.]+)", local_text)
+        m_rep = re.search(r"base-size\s*=\s*([0-9.]+)", repo_text)
+        loc_sz = m_loc.group(1) if m_loc else None
+        rep_sz = m_rep.group(1) if m_rep else None
+        if loc_sz != rep_sz:
+            b_sz, a_sz = (loc_sz, rep_sz) if status in {"repo", "added-repo"} else (rep_sz, loc_sz)
+            old_str = f"{b_sz}px" if b_sz else None
+            new_str = f"{a_sz}px" if a_sz else None
+            changes.append(format_setting_change("Font base-size", old_str, new_str, status))
+
+    # 3. Terminal configs
+    elif rel.startswith("terminals/"):
+        loc_sz, loc_fam = parse_terminal_font_settings(rel, local_text)
+        rep_sz, rep_fam = parse_terminal_font_settings(rel, repo_text)
+        if loc_sz != rep_sz and (loc_sz or rep_sz):
+            b_sz, a_sz = (loc_sz, rep_sz) if status in {"repo", "added-repo"} else (rep_sz, loc_sz)
+            changes.append(format_setting_change("Font size", b_sz, a_sz, status))
+        if loc_fam != rep_fam and (loc_fam or rep_fam):
+            b_f, a_f = (loc_fam, rep_fam) if status in {"repo", "added-repo"} else (rep_fam, loc_fam)
+            changes.append(format_setting_change("Font", b_f, a_f, status))
+
+    # 4. hypr/looknfeel.lua
+    elif rel == "hypr/looknfeel.lua":
+        loc_v = parse_lua_simple_vars(local_text)
+        rep_v = parse_lua_simple_vars(repo_text)
+        before_v, after_v = (loc_v, rep_v) if status in {"repo", "added-repo"} else (rep_v, loc_v)
+
+        b_in = before_v.get("gaps_in")
+        a_in = after_v.get("gaps_in")
+        b_out = before_v.get("gaps_out")
+        a_out = after_v.get("gaps_out")
+        if (b_in != a_in or b_out != a_out) and (b_in or a_in or b_out or a_out):
+            changes.append(format_setting_change("Gaps", f"{b_in or 0}/{b_out or 0}", f"{a_in or 0}/{a_out or 0}", status))
+
+        b_b = before_v.get("border_size")
+        a_b = after_v.get("border_size")
+        if b_b != a_b and (b_b or a_b):
+            changes.append(format_setting_change("Border", f"{b_b or 0}px", f"{a_b or 0}px", status))
+
+        b_r = before_v.get("rounding")
+        a_r = after_v.get("rounding")
+        if b_r != a_r and (b_r or a_r):
+            changes.append(format_setting_change("Corners", f"{b_r or 0}px", f"{a_r or 0}px", status))
+
+        b_l = before_v.get("layout")
+        a_l = after_v.get("layout")
+        if b_l != a_l and (b_l or a_l):
+            changes.append(format_setting_change("Layout", b_l or "default", a_l or "default", status))
+
+    # 5. hypr/input.lua
+    elif rel == "hypr/input.lua":
+        loc_v = parse_lua_simple_vars(local_text)
+        rep_v = parse_lua_simple_vars(repo_text)
+        before_v, after_v = (loc_v, rep_v) if status in {"repo", "added-repo"} else (rep_v, loc_v)
+
+        b_kb = before_v.get("kb_layout")
+        a_kb = after_v.get("kb_layout")
+        if b_kb != a_kb and (b_kb or a_kb):
+            changes.append(format_setting_change("Keyboard", b_kb or "us", a_kb or "us", status))
+
+        b_tap = before_v.get("tap_to_click")
+        a_tap = after_v.get("tap_to_click")
+        if b_tap != a_tap and (b_tap or a_tap):
+            changes.append(format_setting_change("Tap-to-click", "on" if b_tap == "true" else "off", "on" if a_tap == "true" else "off", status))
+
+        b_nat = before_v.get("natural_scroll")
+        a_nat = after_v.get("natural_scroll")
+        if b_nat != a_nat and (b_nat or a_nat):
+            changes.append(format_setting_change("Natural scroll", "on" if b_nat == "true" else "off", "on" if a_nat == "true" else "off", status))
+
+        b_sens = before_v.get("sensitivity")
+        a_sens = after_v.get("sensitivity")
+        if b_sens != a_sens and (b_sens or a_sens):
+            changes.append(format_setting_change("Sensitivity", b_sens or "0", a_sens or "0", status))
+
+    # 6. hypr/hyprsunset.conf
+    elif rel == "hypr/hyprsunset.conf":
+        m_loc = re.search(r"temperature\s*=\s*(\d+)", local_text)
+        m_rep = re.search(r"temperature\s*=\s*(\d+)", repo_text)
+        loc_t = m_loc.group(1) if m_loc else None
+        rep_t = m_rep.group(1) if m_rep else None
+        if loc_t != rep_t and (loc_t or rep_t):
+            b_t, a_t = (loc_t, rep_t) if status in {"repo", "added-repo"} else (rep_t, loc_t)
+            changes.append(format_setting_change("Night light", f"{b_t}K" if b_t else "off", f"{a_t}K" if a_t else "off", status))
+
+    # 7. hypr/autostart.lua
+    elif rel == "hypr/autostart.lua":
+        loc_cmds = set(re.findall(r'o\.launch_on_start\(\s*"([^"]+)"\s*\)', local_text))
+        rep_cmds = set(re.findall(r'o\.launch_on_start\(\s*"([^"]+)"\s*\)', repo_text))
+        before_c, after_c = (loc_cmds, rep_cmds) if status in {"repo", "added-repo"} else (rep_cmds, loc_cmds)
+        added_c = [c.split()[0] for c in sorted(after_c - before_c)]
+        removed_c = [c.split()[0] for c in sorted(before_c - after_c)]
+        if added_c:
+            changes.append("+" + ", +".join(added_c[:2]))
+        if removed_c:
+            changes.append("-" + ", -".join(removed_c[:2]))
+
+    # Fallback diff if no specific keys matched
+    if not changes:
+        if status in {"added-repo", "added-local"}:
+            lines = (local_text if status == "added-local" else repo_text).splitlines()
+            changes.append(f"New file ({len(lines)} lines)")
+        else:
+            diff = list(difflib.unified_diff(local_text.splitlines(), repo_text.splitlines(), lineterm=""))
+            added_n = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+            removed_n = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+            if added_n or removed_n:
+                changes.append(f"+{added_n}, -{removed_n} lines")
+
+    summary_text = " · ".join(changes) if changes else summary_for(rel)
+    return (summary_text, changes)
 
 
 def strip_lua_comments(text: str) -> str:
@@ -2083,10 +2376,24 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
                 local_within=ctx.home,
                 repo_within=repo,
             )
+            sem_summary, changes = summarize_file_diff(
+                item["path"],
+                Path(item["local_path"]),
+                Path(item["repo_path"]),
+                status,
+                local_within=ctx.home,
+                repo_within=repo,
+            )
+            item["semantic_summary"] = sem_summary
+            item["changes"] = changes
+            if sem_summary:
+                item["summary"] = sem_summary
             if not item["hidden"]:
                 counts["changed"] += 1
         else:
             item["preview"] = ""
+            item["semantic_summary"] = ""
+            item["changes"] = []
         if not item["hidden"]:
             counts[status] = counts.get(status, 0) + 1
         elif status not in {"identical", "machine"}:
