@@ -71,6 +71,17 @@ Panel {
     { name: "Configs", icon: "󰒓" }
   ]
   readonly property var allReviewItems: incomingItems.concat(outgoingItems).concat(bothItems)
+  // Deletions are opt-in, so they are only ever a surprise if the confirm step stays silent.
+  function selectedRemovals(direction) {
+    var _ = root.picks
+    var items = direction === "apply" ? incomingItems : outgoingItems
+    var out = []
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i]
+      if (it.removal && root.isPicked(it.kind, it.itemId)) out.push(it.label)
+    }
+    return out
+  }
 
   readonly property var hiddenMap: {
     var map = {}
@@ -690,7 +701,7 @@ Panel {
     if (!data.ok) {
       lastError = String(data.error || "Sync failed.")
       if (data.both) activeTab = 1
-      if (data.conflicts) {
+      if (data.conflicts && data.conflicts.length > 0) {
         status = Object.assign({}, status, { conflicts: data.conflicts, sync_state: "conflicts", configured: true })
         activeTab = 1
       }
@@ -1166,6 +1177,23 @@ Panel {
               wrapMode: Text.WordWrap
             }
 
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              visible: root.confirmKind === "apply" || root.confirmKind === "publish"
+              text: {
+                var names = root.selectedRemovals(root.confirmKind)
+                if (names.length === 0) return ""
+                var where = root.confirmKind === "apply" ? "deleted from this machine" : "deleted from the repo"
+                var head = names.length + (names.length === 1 ? " item" : " items") + " will be " + where + ":\n"
+                return head + names.slice(0, 8).join(", ") + (names.length > 8 ? ", and " + (names.length - 8) + " more" : "")
+              }
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
+            }
+
             Row {
               spacing: Style.space(8)
               layoutDirection: Qt.RightToLeft
@@ -1291,8 +1319,10 @@ Panel {
           visible: root.status && Number(root.status.behind || 0) > 0
           text: "Pull"
           iconText: "󰁅"
+          tooltipText: "Merge the commits origin has into the local clone"
           foreground: root.foreground
           fontFamily: root.fontFamily
+          bordered: true
           enabled: !root.busy
           onClicked: root.pullRemote()
         }
@@ -1773,7 +1803,7 @@ Panel {
                   width: parent.width
                   textFormat: Text.PlainText
                   text: {
-                    var st = Model.fileStatusLabel(hiddenRowBox.modelData.status)
+                    var st = Model.fileStatusLabel(hiddenRowBox.modelData.status, hiddenRowBox.modelData.removal)
                     var sum = String(hiddenRowBox.modelData.summary || "")
                     return (st ? st + " · " : "") + sum + " · Ignored"
                   }
@@ -2483,9 +2513,10 @@ Panel {
                   width: parent.width
                   textFormat: Text.PlainText
                   text: {
-                    var st = Model.fileStatusLabel(catRowBox.modelData.status)
+                    var st = Model.fileStatusLabel(catRowBox.modelData.status, catRowBox.modelData.removal)
                     var sum = catRowBox.rowSummary
-                    return (st ? st + " · " : "") + sum + (catRowBox.included ? " · will sync" : " · skipped")
+                    var verb = catRowBox.modelData.removal ? " · will delete" : " · will sync"
+                    return Model.statusPrefix(st, sum) + sum + (catRowBox.included ? verb : " · skipped")
                   }
                   color: root.dim
                   font.family: root.fontFamily
@@ -2603,7 +2634,7 @@ Panel {
             localPath: modelData.local_path || ""
             repoPath: modelData.repo_path || ""
             summary: modelData.summary
-            statusLabel: Model.fileStatusLabel(modelData.status) + (modelData.portable ? "" : " · Machine-specific")
+            statusLabel: Model.fileStatusLabel(modelData.status, modelData.removal) + (modelData.portable ? "" : " · Machine-specific")
           }
         }
       }
@@ -2811,9 +2842,10 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               text: {
-                var st = Model.fileStatusLabel(rowBox.modelData.status)
+                var st = Model.fileStatusLabel(rowBox.modelData.status, rowBox.modelData.removal)
                 var sum = rowBox.rowSummary
-                return (st ? st + " · " : "") + sum + (rowBox.included ? " · will sync" : " · skipped")
+                var verb = rowBox.modelData.removal ? " · will delete" : " · will sync"
+                return Model.statusPrefix(st, sum) + sum + (rowBox.included ? verb : " · skipped")
               }
               color: root.dim
               font.family: root.fontFamily

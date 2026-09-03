@@ -62,7 +62,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.16"
+PLUGIN_VERSION = "1.2.19"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -1986,11 +1986,14 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "name": pid,
                 "files": [],
                 "statuses": [],
+                "all_removals": True,
                 "git_managed": bool(item.get("git_managed")),
             },
         )
         g["files"].append(item["path"])
         g["statuses"].append(item.get("status") or "identical")
+        if item.get("status") not in {"identical", "machine"} and not item.get("removal"):
+            g["all_removals"] = False
         if item.get("git_managed"):
             g["git_managed"] = True
     out = []
@@ -2001,18 +2004,20 @@ def plugin_groups(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
         status = _rollup_statuses(g["statuses"])
         if not status:
             continue
+        removal = bool(g["all_removals"])
         out.append(
             {
                 "id": pid,
                 "name": pid,
                 "status": status,
+                "removal": removal,
                 "files": g["files"],
                 "file_count": len(g["files"]),
                 "changed_count": len(statuses),
                 "git_managed": g["git_managed"],
                 # Plugins carry executable code; incoming ones require explicit opt-in, never a default-checked Apply.
                 "default_apply": False,
-                "default_publish": status in {"local", "added-local", "differs", "both"},
+                "default_publish": status in {"local", "added-local", "differs", "both"} and not removal,
             }
         )
     return out
@@ -2056,10 +2061,13 @@ def file_bundles(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "name": title,
                 "files": [],
                 "statuses": [],
+                "all_removals": True,
             },
         )
         b["files"].append(item["path"])
         b["statuses"].append(item.get("status") or "identical")
+        if item.get("status") not in {"identical", "machine"} and not item.get("removal"):
+            b["all_removals"] = False
 
     out = []
     for bid, b in sorted(buckets.items()):
@@ -2068,7 +2076,12 @@ def file_bundles(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         changed = [s for s in b["statuses"] if s not in {"identical", "machine"}]
         n = len(changed)
-        if b["kind"] == "plugin":
+        removal = bool(b["all_removals"])
+        plural = "s" if n != 1 else ""
+        if removal:
+            where = "here" if status in {"local", "added-local"} else "in the repo"
+            summary = f"Removed {where} · {n} file{plural}"
+        elif b["kind"] == "plugin":
             if status == "added-repo":
                 summary = f"New plugin · {n} file{'s' if n != 1 else ''}"
             elif status == "added-local":
@@ -2087,12 +2100,13 @@ def file_bundles(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "name": b["name"],
                 "summary": summary,
                 "status": status,
+                "removal": removal,
                 "files": [p for p, s in zip(b["files"], b["statuses"]) if s not in {"identical", "machine"}],
                 "changed_count": n,
                 # Hooks/agents/branding/extensions/bin run code or steer an agent;
                 # incoming bundles require explicit opt-in, never a default-checked Apply.
                 "default_apply": False,
-                "default_publish": status in {"local", "added-local", "differs"},
+                "default_publish": status in {"local", "added-local", "differs"} and not removal,
             }
         )
     return out
@@ -2112,9 +2126,10 @@ def expand_plugin_paths(files: list[dict[str, Any]], plugin_ids: list[str], dire
         pid = plugin_id_from_path(item["path"])
         if pid not in wanted:
             continue
-        if direction == "apply" and item.get("repo_exists"):
+        removal = bool(item.get("removal"))
+        if direction == "apply" and (item.get("repo_exists") or (removal and item.get("status") == "repo")):
             out.add(item["path"])
-        elif direction == "publish" and item.get("local_exists"):
+        elif direction == "publish" and (item.get("local_exists") or (removal and item.get("status") == "local")):
             out.add(item["path"])
     return out
 
@@ -2311,15 +2326,36 @@ def git_status_fields(repo: Path, fetch_error: str | None = None) -> dict[str, A
         "conflicts": conflicts,
         "origin_url": remotes,
         "fetch_error": fetch_error,
+        "merge_error": None,
     }
 
 
-def maybe_fast_forward(repo: Path, git_fields: dict[str, Any]) -> dict[str, Any]:
-    if git_fields["behind"] and not git_fields["ahead"] and not git_fields["dirty"] and not git_fields["conflicts"]:
-        result = run_git(repo, ["merge", "--ff-only", git_fields["upstream"] or "FETCH_HEAD"], timeout=40, disk_root=repo)
-        if result.returncode == 0:
-            return git_status_fields(repo, git_fields.get("fetch_error"))
-        git_fields["fetch_error"] = git_fields.get("fetch_error") or git_error_message(["merge", "--ff-only"], result)
+def integrate_remote(repo: Path, git_fields: dict[str, Any]) -> dict[str, Any]:
+    """Pull origin into the clone whenever git can do it without a decision.
+
+    Two machines publishing in turn leaves the clone both ahead and behind, but
+    they almost never touch the same lines, so the merge is mechanical. Only a
+    real content conflict is worth asking the user about; anything git can settle
+    on its own is settled here so Apply and Publish keep working.
+    """
+    if not git_fields["behind"] or git_fields["dirty"] or git_fields["conflicts"]:
+        return git_fields
+    target = git_fields["upstream"] or "FETCH_HEAD"
+    if git_fields["ahead"]:
+        ensure_git_identity(repo)
+        args = ["merge", "--no-edit", target]
+    else:
+        args = ["merge", "--ff-only", target]
+    result = run_git(repo, args, timeout=40, disk_root=repo)
+    if result.returncode == 0:
+        return git_status_fields(repo, git_fields.get("fetch_error"))
+    fresh = git_status_fields(repo, git_fields.get("fetch_error"))
+    if fresh["conflicts"]:
+        # Leave the merge in progress: the per-file resolve UI finishes it.
+        return fresh
+    run_git(repo, ["merge", "--abort"], timeout=20)
+    git_fields = git_status_fields(repo, git_fields.get("fetch_error"))
+    git_fields["merge_error"] = git_error_message(args, result)
     return git_fields
 
 
@@ -2369,6 +2405,12 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             and not is_executable_payload(item["path"])
         )
         item["default_publish"] = default_publish_status(status) and item["local_exists"] and not item["hidden"]
+        # A tracked file gone from one side is a removal, not a one-sided edit:
+        # publishing it deletes it from the repo, applying it deletes it here.
+        # Never default-checked above — a delete is always an explicit tick.
+        item["removal"] = (status == "local" and not item["local_exists"]) or (
+            status == "repo" and not item["repo_exists"]
+        )
         if status not in {"identical", "machine"}:
             item["preview"] = unified_preview(
                 Path(item["local_path"]),
@@ -2498,8 +2540,6 @@ def drop_bindings_file_without_shortcut_diffs(
 def rollup_sync_state(git_fields: dict[str, Any], counts: dict[str, int], has_baseline: bool) -> str:
     if git_fields.get("conflicts"):
         return "conflicts"
-    if git_fields.get("ahead") and git_fields.get("behind"):
-        return "conflicts"
     both = counts.get("both", 0)
     local_n = counts.get("local", 0) + counts.get("added-local", 0)
     repo_n = counts.get("repo", 0) + counts.get("added-repo", 0)
@@ -2546,7 +2586,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
     if fetch and state.get("repo_url") and not Path(state.get("repo_url", "")).exists():
         fetch_error = fetch_repo(repo)
     git_fields = git_status_fields(repo, fetch_error)
-    git_fields = maybe_fast_forward(repo, git_fields)
+    git_fields = integrate_remote(repo, git_fields)
     validation = validate_repo(repo)
     empty = is_seedable_empty(repo)
     inspect = inspect_repo(ctx, repo, prefer_local=empty)
@@ -2800,6 +2840,59 @@ def copy_mapped_file(
             os.close(dir_fd)
 
 
+def _prune_empty_parents(root: Path, rel_parent: Path) -> None:
+    """Drop directories left empty by a removal, up to but never including root,
+    so a removed plugin does not leave an empty plugins/<id>/ behind. Each rmdir
+    is dir_fd-relative to a containment-verified parent, and a non-empty or
+    vanished directory simply stops the walk."""
+    parts = list(rel_parent.parts)
+    while parts:
+        try:
+            dir_fd = _open_dir_bound(root, Path(*parts[:-1]), create=False)
+        except SyncError:
+            return
+        try:
+            os.rmdir(parts[-1], dir_fd=dir_fd)
+        except OSError:
+            return
+        finally:
+            os.close(dir_fd)
+        parts.pop()
+
+
+def remove_mapped_file(item: dict[str, Any], direction: str, dst_root: Path) -> bool:
+    """Delete the file this item stands for on the receiving side.
+
+    Anchored exactly like copy_mapped_file's destination: the parent is reached
+    by a descriptor-relative walk with containment verified at every hop and the
+    unlink is dir_fd-relative, so a symlinked parent swapped in concurrently
+    cannot redirect the delete. Returns False when there was nothing to remove.
+    """
+    dst = Path(item["local_path"] if direction == "apply" else item["repo_path"])
+    try:
+        rel = dst.relative_to(dst_root)
+    except ValueError as exc:
+        raise SyncError(f"Refusing to delete {dst}: outside {dst_root}") from exc
+    if not rel.parts:
+        raise SyncError(f"Refusing to delete {dst}")
+    try:
+        dir_fd = _open_dir_bound(dst_root, rel.parent, create=False)
+    except SyncError:
+        return False
+    try:
+        try:
+            st = os.lstat(rel.name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            raise SyncError(f"Refusing to delete non-regular file: {dst}")
+        os.unlink(rel.name, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    _prune_empty_parents(dst_root, rel.parent)
+    return True
+
+
 def backup_local(ctx: Context, files: list[dict[str, Any]], budget: ByteBudget | None = None) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = ctx.home / ".config" / f"omarchy-backup.{stamp}"
@@ -3009,7 +3102,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx, state)
     fetch_error = fetch_repo(repo)
     git_fields = git_status_fields(repo, fetch_error)
-    git_fields = maybe_fast_forward(repo, git_fields)
+    git_fields = integrate_remote(repo, git_fields)
     if git_fields["conflicts"]:
         raise SyncError(
             "The git clone has merge conflicts. Resolve them before applying.",
@@ -3017,7 +3110,8 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         )
     if git_fields["behind"]:
         raise SyncError(
-            "Remote is ahead and could not fast-forward. Pull/merge first, then Apply.",
+            git_fields.get("merge_error")
+            or "The clone has uncommitted changes, so origin could not be merged in. Open the clone and clean it up, then Apply.",
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
     diff = annotate_diff(ctx, repo, state)
@@ -3051,6 +3145,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     if not chosen and not shortcut_keys:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
+        snap["removed"] = []
         snap["message"] = "Nothing to apply."
         return snap
 
@@ -3070,11 +3165,21 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     # the per-file cap cannot be multiplied by the inventory cap. The upfront
     # estimate fails before anything is touched; the running budget is the
     # enforcement, decremented by bytes actually written.
-    _check_operation_size([i["repo_path"] for i in chosen] + [i["local_path"] for i in backup_targets], "Apply")
+    _check_operation_size(
+        [i["repo_path"] for i in chosen if not i.get("removal")] + [i["local_path"] for i in backup_targets],
+        "Apply",
+    )
     budget = ByteBudget(MAX_SYNC_TOTAL_BYTES, "Apply")
     backup_dir = backup_local(ctx, backup_targets, budget=budget)
     applied = []
+    removed = []
     for item in chosen:
+        if item.get("removal"):
+            # Backed up just above with the rest of the selection.
+            if remove_mapped_file(item, "apply", ctx.home):
+                removed.append(item["path"])
+                applied.append(item["path"])
+            continue
         if not Path(item["repo_path"]).is_file():
             continue
         copy_mapped_file(item, "apply", src_root=repo, dst_root=ctx.home, budget=budget)
@@ -3105,6 +3210,8 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 hashes[item["path"]] = item["local_hash"]
         elif item["local_exists"] and item["repo_exists"] and item["local_hash"] == item["repo_hash"] and item["local_hash"]:
             hashes[item["path"]] = item["local_hash"]
+    for rel in removed:
+        hashes.pop(rel, None)
     state["file_hashes"] = hashes
     state["last_apply_at"] = now_iso()
     state["last_applied_commit"] = git_fields.get("head_full") or git_out(repo, "rev-parse", "HEAD")
@@ -3127,8 +3234,11 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         if slug:
             theme_msg = f" Theme set to {theme_display_name(slug)}."
     snap["message"] = (
-        f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo.{theme_msg}"
+        f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo"
+        + (f" ({len(removed)} removed from this machine)" if removed else "")
+        + f".{theme_msg}"
     )
+    snap["removed"] = removed
     return snap
 
 
@@ -3148,7 +3258,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx, state)
     fetch_error = fetch_repo(repo)
     git_fields = git_status_fields(repo, fetch_error)
-    git_fields = maybe_fast_forward(repo, git_fields)
+    git_fields = integrate_remote(repo, git_fields)
     if git_fields["conflicts"]:
         raise SyncError(
             "The git clone has merge conflicts. Resolve them before publishing.",
@@ -3156,7 +3266,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         )
     if git_fields["behind"]:
         raise SyncError(
-            "Remote has commits this clone does not. Pull/merge first so you do not overwrite another machine.",
+            git_fields.get("merge_error")
+            or "The clone has uncommitted changes, so origin could not be merged in. Open the clone and clean it up, then Publish.",
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
     diff = annotate_diff(ctx, repo, state)
@@ -3198,17 +3309,26 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 snap["pushed"] = True
                 snap["published"] = []
                 snap["message"] = "Pushed existing local commits to origin."
+            snap["removed"] = []
             return snap
         snap = build_snapshot(ctx, fetch=False)
         snap["published"] = []
+        snap["removed"] = []
         snap["message"] = "Nothing to publish."
         return snap
 
-    _check_operation_size([i["local_path"] for i in chosen], "Publish")
+    _check_operation_size([i["local_path"] for i in chosen if not i.get("removal")], "Publish")
     budget = ByteBudget(MAX_SYNC_TOTAL_BYTES, "Publish")
     write_marker(repo)
     published = []
+    removed = []
     for item in chosen:
+        if item.get("removal"):
+            # git add -A below stages the deletion; history is the backup here.
+            if remove_mapped_file(item, "publish", repo):
+                removed.append(item["path"])
+                published.append(item["path"])
+            continue
         if not Path(item["local_path"]).is_file():
             continue
         copy_mapped_file(item, "publish", src_root=ctx.home, dst_root=repo, budget=budget)
@@ -3231,7 +3351,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     committed = False
     if porcelain:
         host = socket.gethostname()
-        listed = "\n".join(f"- {p}" for p in published[:30])
+        removed_set = set(removed)
+        listed = "\n".join(f"- {'removed ' if p in removed_set else ''}{p}" for p in published[:30])
         if len(published) > 30:
             listed += f"\n- … {len(published) - 30} more"
         message = args.message or f"Sync config from {host}\n\n{listed}\n"
@@ -3258,6 +3379,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             live = sha256_file(Path(item["repo_path"]), within=repo)
             if live:
                 hashes[item["path"]] = live
+    for rel in removed:
+        hashes.pop(rel, None)
     state["file_hashes"] = hashes
     state["last_publish_at"] = now_iso()
     save_state(ctx, state)
@@ -3274,8 +3397,10 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     else:
         snap["message"] = (
             f"Published {len(published)} file{'s' if len(published) != 1 else ''} to the repo"
+            + (f" ({len(removed)} removed)" if removed else "")
             + (" and pushed." if pushed else ". Commit is local until you push.")
         )
+    snap["removed"] = removed
     return snap
 
 
@@ -3290,9 +3415,10 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx)
     fetch_error = fetch_repo(repo)
     git_fields = git_status_fields(repo, fetch_error)
-    git_fields = maybe_fast_forward(repo, git_fields)
+    git_fields = integrate_remote(repo, git_fields)
     if git_fields["behind"] and side == "repo":
-        merge = run_git(repo, ["merge", git_fields["upstream"] or "origin/" + (git_fields["branch"] or "main")], timeout=40, disk_root=repo)
+        ensure_git_identity(repo)
+        merge = run_git(repo, ["merge", "--no-edit", git_fields["upstream"] or "origin/" + (git_fields["branch"] or "main")], timeout=40, disk_root=repo)
         if merge.returncode != 0:
             conflicts = git_status_fields(repo).get("conflicts") or []
             if conflicts:
@@ -3378,7 +3504,8 @@ def cmd_pull(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = "Already up to date with origin."
         snap["pulled"] = False
         return snap
-    result = run_git(repo, ["merge", git_fields["upstream"] or "origin/" + git_fields["branch"]], timeout=40, disk_root=repo)
+    ensure_git_identity(repo)
+    result = run_git(repo, ["merge", "--no-edit", git_fields["upstream"] or "origin/" + git_fields["branch"]], timeout=40, disk_root=repo)
     if result.returncode != 0:
         conflicts = git_status_fields(repo).get("conflicts") or []
         if conflicts:

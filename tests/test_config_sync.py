@@ -1774,5 +1774,211 @@ class SemanticDiffTests(unittest.TestCase):
         self.assertEqual(changes, ["+2, -0 lines"])
 
 
+class DivergedCloneTests(unittest.TestCase):
+    """Two machines publishing in turn leaves the clone ahead AND behind."""
+
+    def _connect_to_shared_origin(self, env: TempHome) -> tuple[Path, Path]:
+        source = make_config_repo(env.home / "source")
+        origin = env.home / "origin.git"
+        subprocess.run(["git", "clone", "--bare", str(source), str(origin)], check=True, capture_output=True)
+        snap = cs.cmd_connect(env.ctx, argparse_ns(args=[f"file://{origin}"]))
+        self.assertTrue(snap["ok"], snap)
+        clone = Path(snap["status"]["clone_path"])
+        return origin, clone
+
+    def _push_from_another_machine(self, env: TempHome, origin: Path, rel: str, content: str) -> None:
+        other = env.home / "other"
+        subprocess.run(["git", "clone", str(origin), str(other)], check=True, capture_output=True)
+        git(other, "config", "user.name", "Other")
+        git(other, "config", "user.email", "other@example.com")
+        write(other / rel, content)
+        commit_all(other, "Sync config from other machine")
+        git(other, "push", "origin", "main")
+
+    def test_snapshot_auto_merges_a_clean_divergence(self) -> None:
+        with TempHome() as env:
+            origin, clone = self._connect_to_shared_origin(env)
+            # This machine committed locally but never pushed.
+            write(clone / "hypr" / "looknfeel.lua", "hl.decoration({ rounding = 12 })\n")
+            commit_all(clone, "Sync config from this machine")
+            # The other machine pushed a change to a different file.
+            self._push_from_another_machine(env, origin, "terminals/kitty.conf", "font_size 14\n")
+
+            before = cs.git_status_fields(clone, cs.fetch_repo(clone))
+            self.assertEqual((before["ahead"], before["behind"]), (1, 1))
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=True))
+            self.assertTrue(snap["ok"], snap)
+            self.assertEqual(snap["status"]["behind"], 0)
+            self.assertEqual(snap["status"]["ahead"], 2)
+            self.assertEqual(snap["status"]["conflicts"], [])
+            self.assertNotEqual(snap["sync_state"], "conflicts")
+            # Both sides' work survived the merge.
+            self.assertIn("rounding = 12", (clone / "hypr" / "looknfeel.lua").read_text(encoding="utf-8"))
+            self.assertIn("font_size 14", (clone / "terminals" / "kitty.conf").read_text(encoding="utf-8"))
+
+    def test_apply_and_publish_are_not_blocked_by_a_clean_divergence(self) -> None:
+        with TempHome() as env:
+            origin, clone = self._connect_to_shared_origin(env)
+            write(clone / "hypr" / "looknfeel.lua", "hl.decoration({ rounding = 12 })\n")
+            commit_all(clone, "Sync config from this machine")
+            self._push_from_another_machine(env, origin, "terminals/kitty.conf", "font_size 14\n")
+
+            applied = cs.cmd_apply(env.ctx, argparse_ns(dry_run=True))
+            self.assertTrue(applied["ok"], applied)
+
+            published = cs.cmd_publish(env.ctx, argparse_ns(dry_run=True))
+            self.assertTrue(published["ok"], published)
+
+    def test_overlapping_edits_still_surface_per_file_conflicts(self) -> None:
+        with TempHome() as env:
+            origin, clone = self._connect_to_shared_origin(env)
+            write(clone / "terminals" / "kitty.conf", "font_size 20\n")
+            commit_all(clone, "Sync config from this machine")
+            self._push_from_another_machine(env, origin, "terminals/kitty.conf", "font_size 14\n")
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=True))
+            self.assertEqual(snap["sync_state"], "conflicts")
+            self.assertEqual(snap["status"]["conflicts"], ["terminals/kitty.conf"])
+
+            resolved = cs.cmd_resolve(env.ctx, argparse_ns(args=["terminals/kitty.conf"], side="ours"))
+            self.assertTrue(resolved["ok"], resolved)
+            self.assertEqual(resolved["remaining_conflicts"], [])
+            self.assertEqual(resolved["status"]["conflicts"], [])
+            self.assertNotEqual(resolved["status"]["sync_state"], "conflicts")
+            self.assertIn("font_size 20", (clone / "terminals" / "kitty.conf").read_text(encoding="utf-8"))
+
+    def test_dirty_clone_reports_why_the_merge_was_skipped(self) -> None:
+        with TempHome() as env:
+            origin, clone = self._connect_to_shared_origin(env)
+            self._push_from_another_machine(env, origin, "terminals/kitty.conf", "font_size 14\n")
+            write(clone / "hypr" / "looknfeel.lua", "hl.decoration({ rounding = 99 })\n")
+
+            with self.assertRaises(cs.SyncError) as caught:
+                cs.cmd_publish(env.ctx, argparse_ns(dry_run=True))
+            self.assertIn("uncommitted changes", str(caught.exception))
+
+
+class RemovalSyncTests(unittest.TestCase):
+    """Removing a plugin on one machine must reach the other machines."""
+
+    def _install_plugin(self, env: TempHome, pid: str = "demo.widget") -> Path:
+        lp = env.ctx.config_plugins / pid
+        write(
+            lp / "manifest.json",
+            json.dumps({"schemaVersion": 1, "id": pid, "name": "Demo", "version": "1", "kinds": ["bar-widget"], "entryPoints": {"barWidget": "Main.qml"}}),
+        )
+        write(lp / "Main.qml", "import QtQuick\nItem {}\n")
+        return lp
+
+    def _linked(self, env: TempHome) -> tuple[Path, Path]:
+        repo = make_config_repo(env.home / "cfg")
+        lp = self._install_plugin(env)
+        cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+        cs.cmd_publish(env.ctx, argparse_ns(dry_run=True))
+        self.assertTrue((repo / "plugins" / "demo.widget" / "Main.qml").is_file())
+        self.assertIn("plugins/demo.widget/Main.qml", cs.load_state(env.ctx).get("file_hashes") or {})
+        return repo, lp
+
+    def test_local_removal_is_labelled_as_a_removal_not_local_only(self) -> None:
+        with TempHome() as env:
+            repo, lp = self._linked(env)
+            shutil.rmtree(lp)
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            items = [f for f in snap["diff"]["files"] if f["path"].startswith("plugins/demo.widget")]
+            self.assertTrue(items)
+            for f in items:
+                self.assertEqual(f["status"], "local")
+                self.assertTrue(f["removal"])
+                # A delete is never checked for you.
+                self.assertFalse(f["default_publish"])
+            bundle = next(b for b in snap["diff"]["bundles"] if b.get("plugin_id") == "demo.widget")
+            self.assertTrue(bundle["removal"])
+            self.assertEqual(bundle["summary"], "Removed here · 2 files")
+            self.assertFalse(bundle["default_publish"])
+
+    def test_publishing_a_removal_deletes_it_from_the_repo(self) -> None:
+        with TempHome() as env:
+            repo, lp = self._linked(env)
+            shutil.rmtree(lp)
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, plugin=["demo.widget"], dry_run=True))
+            self.assertTrue(pub["ok"], pub)
+            self.assertEqual(sorted(pub["removed"]), ["plugins/demo.widget/Main.qml", "plugins/demo.widget/manifest.json"])
+            self.assertTrue(pub["committed"])
+            self.assertFalse((repo / "plugins" / "demo.widget").exists(), "empty plugin dir should be pruned")
+            self.assertIn("removed plugins/demo.widget", git(repo, "log", "-1", "--pretty=%B").stdout)
+            # The baseline is cleared, so the rows stop reappearing forever.
+            after = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertEqual([f for f in after["diff"]["files"] if f["path"].startswith("plugins/demo.widget")], [])
+            self.assertNotIn("plugins/demo.widget/Main.qml", cs.load_state(env.ctx).get("file_hashes") or {})
+
+    def test_applying_a_repo_removal_uninstalls_it_here(self) -> None:
+        with TempHome() as env:
+            repo, lp = self._linked(env)
+            shutil.rmtree(repo / "plugins" / "demo.widget")
+            commit_all(repo, "Remove demo.widget on the other machine")
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            bundle = next(b for b in snap["diff"]["bundles"] if b.get("plugin_id") == "demo.widget")
+            self.assertTrue(bundle["removal"])
+            self.assertEqual(bundle["summary"], "Removed in the repo · 2 files")
+            self.assertFalse(bundle["default_apply"])
+
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, plugin=["demo.widget"], dry_run=True))
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(len(ap["removed"]), 2)
+            self.assertFalse(lp.exists(), "empty plugin dir should be pruned")
+            # Backed up before deletion, so an accidental removal is recoverable.
+            backup = Path(ap["backup_dir"])
+            self.assertTrue((backup / "omarchy" / "plugins" / "demo.widget" / "Main.qml").is_file(), sorted(backup.rglob("*")))
+            after = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertEqual([f for f in after["diff"]["files"] if f["path"].startswith("plugins/demo.widget")], [])
+
+    def test_removals_are_never_swept_up_by_a_default_publish(self) -> None:
+        with TempHome() as env:
+            repo, lp = self._linked(env)
+            shutil.rmtree(lp)
+            # No explicit selection: Publish must leave the repo copy alone.
+            pub = cs.cmd_publish(env.ctx, argparse_ns(dry_run=True))
+            self.assertEqual(pub.get("removed"), [])
+            self.assertTrue((repo / "plugins" / "demo.widget" / "Main.qml").is_file())
+
+    def test_removals_are_never_swept_up_by_a_default_apply(self) -> None:
+        with TempHome() as env:
+            repo, lp = self._linked(env)
+            shutil.rmtree(repo / "plugins" / "demo.widget")
+            commit_all(repo, "Remove demo.widget on the other machine")
+            ap = cs.cmd_apply(env.ctx, argparse_ns(dry_run=True))
+            self.assertEqual(ap.get("removed"), [])
+            self.assertTrue((lp / "Main.qml").is_file())
+
+    def test_remove_mapped_file_refuses_to_escape_its_root(self) -> None:
+        with TempHome() as env:
+            outside = env.home / "outside.txt"
+            write(outside, "keep me\n")
+            root = env.home / "root"
+            root.mkdir()
+            item = {"path": "x", "local_path": str(outside), "repo_path": str(outside)}
+            with self.assertRaises(cs.SyncError):
+                cs.remove_mapped_file(item, "apply", root)
+            self.assertTrue(outside.is_file())
+
+    def test_prune_stops_at_the_root(self) -> None:
+        with TempHome() as env:
+            root = env.home / "root"
+            write(root / "a" / "b" / "f.txt", "x\n")
+            item = {"path": "a/b/f.txt", "local_path": str(root / "a" / "b" / "f.txt"), "repo_path": ""}
+            self.assertTrue(cs.remove_mapped_file(item, "apply", root))
+            self.assertFalse((root / "a").exists())
+            self.assertTrue(root.is_dir(), "the root itself must survive")
+
+    def test_removing_an_already_gone_file_is_a_no_op(self) -> None:
+        with TempHome() as env:
+            root = env.home / "root"
+            root.mkdir()
+            item = {"path": "nope.txt", "local_path": str(root / "nope.txt"), "repo_path": ""}
+            self.assertFalse(cs.remove_mapped_file(item, "apply", root))
+
+
 if __name__ == "__main__":
     unittest.main()

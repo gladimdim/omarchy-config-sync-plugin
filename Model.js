@@ -45,7 +45,7 @@ function stateHint(state, status) {
     case "remote-ahead":
       return "The repo has config this machine has not applied. Review the incoming files, then Apply."
     case "diverged":
-      return "This machine and the repo both moved. Resync from repo to make this machine match git (usual on a second machine). Or Review Changes and pick item by item."
+      return "This machine and the repo both moved. Review Changes to pick a side item by item, or Resync from repo to make this machine match git (usual on a second machine)."
     case "conflicts":
       return "Git could not merge automatically. Keep the local copy or take the incoming copy for each conflicted file."
     case "invalid":
@@ -55,7 +55,16 @@ function stateHint(state, status) {
   }
 }
 
-function fileStatusLabel(status) {
+function fileStatusLabel(status, removal) {
+  if (removal) {
+    // The file is gone from one side. Syncing it deletes, it does not copy.
+    switch (String(status || "")) {
+      case "local":
+      case "added-local": return "Removed here"
+      case "repo":
+      case "added-repo": return "Removed in repo"
+    }
+  }
   switch (String(status || "")) {
     case "local": return "Local only"
     case "added-local": return "New on this machine"
@@ -67,6 +76,22 @@ function fileStatusLabel(status) {
     case "machine": return "This machine"
     default: return String(status || "")
   }
+}
+
+// Join a row's status label to its summary without saying the same thing twice.
+// A bundle's summary comes from the backend already opening with its own status
+// ("Removed here · 11 files"), so prefixing the label again renders as
+// "Removed here · Removed here · 11 files". A loose file's summary does not, and
+// still wants the prefix.
+function statusPrefix(statusLabel, summary) {
+  var st = String(statusLabel || "")
+  if (!st) return ""
+  var sum = String(summary || "")
+  // Nothing to separate the label from: return it bare rather than leaving a
+  // dangling "Removed here · " on a row whose summary is empty.
+  if (!sum) return st
+  if (sum === st || sum.indexOf(st + " ") === 0) return ""
+  return st + " · "
 }
 
 function filesByStatus(files, statuses) {
@@ -101,6 +126,7 @@ function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCo
     both: !!both || String(status) === "both",
     changed_count: changedCount || 0,
     hidden: !!hidden,
+    removal: false,
     changes: changes || []
   }
 }
@@ -252,7 +278,9 @@ function appendBundles(out, list, both, hiddenMap) {
     var typeLabel = b.kind === "plugin" ? "Plugin" : "Folder"
     var n = Number(b.changed_count || (b.files ? b.files.length : 0) || 0)
     var sum = b.summary || (n + (n === 1 ? " file" : " files"))
-    out.push(reviewItem("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, both || b.status === "both", n, false))
+    var bundleRow = reviewItem("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, both || b.status === "both", n, false)
+    bundleRow.removal = !!b.removal
+    out.push(bundleRow)
   }
 }
 
@@ -264,7 +292,9 @@ function appendLooseFiles(out, files, both, hiddenMap) {
     if (!p || isBundledPath(p) || p.indexOf("plugins/gladimdim.config-sync") === 0) continue
     if (isItemHidden("f", p, hiddenMap, f)) continue
     var sum = f.semantic_summary || f.summary || ""
-    out.push(reviewItem("f", p, p, sum, f.status, "File", both || f.status === "both", 0, false, f.changes || []))
+    var fileRow = reviewItem("f", p, p, sum, f.status, "File", both || f.status === "both", 0, false, f.changes || [])
+    fileRow.removal = !!f.removal
+    out.push(fileRow)
   }
 }
 
@@ -300,11 +330,13 @@ function buildBothItems(theme, shortcuts, bundles, files, allFiles, hiddenMap) {
 function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap) {
   var out = []
   var seen = {}
-  function addHidden(kind, id, label, summary, status, typeLabel, both, count) {
+  function addHidden(kind, id, label, summary, status, typeLabel, both, count, removal) {
     var key = kind + ":" + id
     if (seen[key]) return
     seen[key] = true
-    out.push(reviewItem(kind, id, label, summary, status, typeLabel, both, count, true))
+    var row = reviewItem(kind, id, label, summary, status, typeLabel, both, count, true)
+    row.removal = !!removal
+    out.push(row)
   }
 
   var tList = theme || []
@@ -331,7 +363,7 @@ function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap)
       var typeLabel = b.kind === "plugin" ? "Plugin" : "Folder"
       var n = Number(b.changed_count || (b.files ? b.files.length : 0) || 0)
       var sum = b.summary || (n + (n === 1 ? " file" : " files"))
-      addHidden("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, b.status === "both", n)
+      addHidden("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, b.status === "both", n, b.removal)
     }
   }
 
@@ -349,7 +381,7 @@ function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap)
           parentHidden = true
       }
       if (!parentHidden) {
-        addHidden("f", p, p, f.summary || "", f.status, "File", f.status === "both", 0)
+        addHidden("f", p, p, f.summary || "", f.status, "File", f.status === "both", 0, f.removal)
       }
     }
   }
