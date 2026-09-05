@@ -673,11 +673,12 @@ Panel {
     busy = true
     lastError = ""
     pendingAction = args[0] || ""
+    // Close stdin after the URL is written. Python's connect --stdin does
+    // stdin.read() until EOF; leaving the pipe open hangs on "Connecting…".
+    syncProc.queuedStdin = stdinData ? (String(stdinData) + "\n") : ""
+    syncProc.stdinEnabled = !!stdinData
     syncProc.command = ["python3", "-u", root.scriptPath].concat(args)
     syncProc.running = true
-    if (stdinData) {
-      syncProc.write(String(stdinData) + "\n")
-    }
   }
 
   function handleOutput(text) {
@@ -744,7 +745,15 @@ Panel {
 
   Process {
     id: syncProc
-    stdinEnabled: true
+    property string queuedStdin: ""
+    stdinEnabled: false
+    onStarted: {
+      if (queuedStdin) {
+        write(queuedStdin)
+        queuedStdin = ""
+        stdinEnabled = false
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

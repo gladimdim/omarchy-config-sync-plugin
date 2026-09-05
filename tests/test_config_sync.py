@@ -798,6 +798,7 @@ def argparse_ns(**kwargs):
         delete_clone = False
         side = None
         url = None
+        stdin = False
         all = False
         dry_run = True
         args = []
@@ -1134,6 +1135,52 @@ class SecurityHardeningTests(unittest.TestCase):
         clean_ssh, cred_ssh = cs.prepare_git_credentials(ctx, ssh_url)
         self.assertEqual(clean_ssh, ssh_url)
         self.assertIsNone(cred_ssh)
+
+    def test_connect_stdin_uses_first_line_only(self) -> None:
+        # Quickshell writes URL + newline and leaves stdin open. read(64KiB)
+        # would consume extra bytes (or hang on a pipe); readline stops at \n.
+        ctx = self._ctx()
+        origin = self.tmp / "origin"
+        init_repo(origin)
+        write(origin / "README.md", "seed\n")
+        commit_all(origin, "init")
+        buf = io.StringIO(str(origin) + "\nthis-second-line-must-be-ignored\n")
+        with patch("sys.stdin", buf):
+            snap = cs.cmd_connect(ctx, argparse_ns(stdin=True, args=[], url=None))
+        self.assertTrue(snap["ok"], snap)
+        self.assertTrue(snap.get("connected") or snap["status"]["configured"])
+        self.assertEqual(buf.tell(), len(str(origin)) + 1)
+
+    def test_connect_stdin_does_not_wait_for_eof(self) -> None:
+        # Reproduce the bar hang: write one line, keep the pipe open.
+        with TempHome() as env:
+            origin = env.home / "origin"
+            init_repo(origin)
+            write(origin / "README.md", "seed\n")
+            commit_all(origin, "init")
+            child_env = os.environ.copy()
+            child_env["HOME"] = str(env.home)
+            child_env["XDG_DATA_HOME"] = str(env.data)
+            proc = subprocess.Popen(
+                [sys.executable, "-u", str(SCRIPTS / "config_sync.py"), "connect", "--stdin"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=child_env,
+            )
+            assert proc.stdin is not None
+            proc.stdin.write(str(origin) + "\n")
+            proc.stdin.flush()
+            try:
+                out, err = proc.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                self.fail("connect --stdin hung waiting for EOF after one line")
+            self.assertEqual(proc.returncode, 0, err)
+            data = json.loads(out)
+            self.assertTrue(data.get("ok"), data)
 
     def test_cmd_connect_never_passes_credentials_as_argv(self) -> None:
         ctx = self._ctx()

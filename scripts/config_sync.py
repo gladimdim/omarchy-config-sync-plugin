@@ -62,7 +62,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.19"
+PLUGIN_VERSION = "1.2.20"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -2641,7 +2641,7 @@ def cmd_snapshot(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     source_raw = ""
     if getattr(args, "stdin", False):
-        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
+        source_raw = sys.stdin.readline(MAX_URL_INPUT_BYTES).strip()
     if not source_raw:
         source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
@@ -3557,7 +3557,7 @@ def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx)
     source_raw = ""
     if getattr(args, "stdin", False):
-        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
+        source_raw = sys.stdin.readline(MAX_URL_INPUT_BYTES).strip()
     if not source_raw:
         source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
