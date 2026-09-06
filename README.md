@@ -103,6 +103,8 @@ omarchy plugin validate .
 
 Starter guide for end users: [GETTING-STARTED.md](GETTING-STARTED.md).
 
+After tagging a new release, re-verify the marketplace listing for the exact new commit. See [AGENTS.md](AGENTS.md).
+
 ## License
 
 MIT © 2026 Dmytro Gladkyi
