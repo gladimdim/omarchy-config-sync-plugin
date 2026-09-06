@@ -1096,7 +1096,7 @@ Panel {
           id: scrollArea
           visible: root.configured
           width: parent.width
-          height: Math.max(80, panel.contentHeight - mainCol.spacing * 6 - heroInfo.implicitHeight - tabRow.height - Style.space(70))
+          height: Math.max(80, parent.height - y - Style.space(16))
           contentWidth: width
           contentHeight: loader.implicitHeight
           clip: true
