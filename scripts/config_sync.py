@@ -2641,7 +2641,9 @@ def cmd_snapshot(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     source_raw = ""
     if getattr(args, "stdin", False):
-        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
+        source_raw = sys.stdin.readline(MAX_URL_INPUT_BYTES).strip()
+        if not source_raw:
+            source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
     if not source_raw:
         source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
@@ -3557,7 +3559,9 @@ def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx)
     source_raw = ""
     if getattr(args, "stdin", False):
-        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
+        source_raw = sys.stdin.readline(MAX_URL_INPUT_BYTES).strip()
+        if not source_raw:
+            source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
     if not source_raw:
         source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
