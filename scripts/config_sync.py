@@ -36,21 +36,32 @@ MARKER_NAME = ".omarchy-config.json"
 MARKER_FORMAT = "omarchy-config"
 MAX_DIFF_LINES = 48
 MAX_DIFF_BYTES = 12_000
-CLONE_TIMEOUT = 120
-FETCH_TIMEOUT = 25
-PUSH_TIMEOUT = 60
+CLONE_TIMEOUT = 600
+FETCH_TIMEOUT = 180
+PUSH_TIMEOUT = 600
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_SUBPROCESS_BYTES = 2 * 1024 * 1024
 MAX_INVENTORY_FILES = 20_000
 MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 MAX_SYNC_FILE_BYTES = 50 * 1024 * 1024
 MAX_URL_INPUT_BYTES = 64 * 1024
-# Hard on-disk budget for the managed clone while git (clone/fetch/pull/merge/
-# checkout) runs against an untrusted remote, and for the clone at rest.
-MAX_REPO_DISK_BYTES = 512 * 1024 * 1024
-# Aggregate bytes one apply/publish may copy (backup + installed files), so the
-# per-file cap cannot be multiplied by the inventory cap.
-MAX_SYNC_TOTAL_BYTES = 512 * 1024 * 1024
+# GitHub documents a 10 GiB on-disk repository guideline (the .git folder).
+# There is no 512 MiB GitHub Pro cap; that was only this plugin. Keep a ceiling
+# so a hostile remote cannot fill the disk, but allow a full plugin tree.
+MAX_REPO_DISK_BYTES = 10 * 1024 * 1024 * 1024
+# Aggregate bytes one apply/publish may copy (backup + installed files).
+MAX_SYNC_TOTAL_BYTES = 10 * 1024 * 1024 * 1024
+
+
+def format_byte_limit(n: int) -> str:
+    gib = 1024 * 1024 * 1024
+    if n >= gib:
+        whole = n // gib
+        if n % gib == 0:
+            return f"{whole} GiB"
+        return f"{n / gib:.1f} GiB"
+    return f"{max(0, n) // (1024 * 1024)} MiB"
+
 
 BIND_RE = re.compile(
     r"""o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"([^"]*)")""",
@@ -253,7 +264,7 @@ class ByteBudget:
         self.used += n
         if self.used > self.limit:
             raise SyncError(
-                f"{self.what} exceeded the {self.limit // (1024 * 1024)} MiB per-operation size limit; "
+                f"{self.what} exceeded the {format_byte_limit(self.limit)} per-operation size limit; "
                 "select fewer files at a time."
             )
 
@@ -691,8 +702,7 @@ def run_bounded(
     if truncated:
         err = (err + "\n[output truncated: process exceeded its output limit and was stopped]").strip()
     if disk_exceeded:
-        limit_mib = (max_disk_bytes or 0) // (1024 * 1024)
-        err = (err + f"\n[repository exceeded its {limit_mib} MiB on-disk budget and was stopped]").strip()
+        err = (err + f"\n[repository exceeded its {format_byte_limit(max_disk_bytes or 0)} on-disk budget and was stopped]").strip()
         if returncode == 0:
             returncode = 1
     return subprocess.CompletedProcess(cmd, returncode, out, err)
@@ -1269,7 +1279,7 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         # The clone is budgeted while git writes it; this catches a tree that
         # grew past the budget by any other route before we walk or hash it.
         raise SyncError(
-            f"Linked repo uses more than {MAX_REPO_DISK_BYTES // (1024 * 1024)} MiB on disk; "
+            f"Linked repo uses more than {format_byte_limit(MAX_REPO_DISK_BYTES)} on disk; "
             "refusing to inspect it. Remove large files from the config repo."
         )
     repo_resolved = repo.resolve()
@@ -2979,8 +2989,8 @@ def _check_operation_size(paths: list[str], what: str) -> None:
             total += st.st_size
     if total > MAX_SYNC_TOTAL_BYTES:
         raise SyncError(
-            f"{what} selection totals {total // (1024 * 1024)} MiB, above the "
-            f"{MAX_SYNC_TOTAL_BYTES // (1024 * 1024)} MiB per-operation size limit; select fewer files at a time."
+            f"{what} selection totals {format_byte_limit(total)}, above the "
+            f"{format_byte_limit(MAX_SYNC_TOTAL_BYTES)} per-operation size limit; select fewer files at a time."
         )
 
 

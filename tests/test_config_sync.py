@@ -1638,7 +1638,9 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("on-disk budget", result.stderr)
         # The child was stopped long before the timeout let it fill the disk.
-        self.assertLess(cs._tree_disk_usage(grow), 16 * 1024 * 1024)
+        # Watcher samples every 250ms, so a few extra 64KiB writes after the
+        # cap are expected; 32 MiB is still far under a runaway fill.
+        self.assertLess(cs._tree_disk_usage(grow), 32 * 1024 * 1024)
 
     def test_run_bounded_disk_budget_is_hard_even_after_fast_exit(self) -> None:
         # A child that finishes between two watcher samples is still caught by
