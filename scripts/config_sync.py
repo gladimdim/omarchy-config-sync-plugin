@@ -707,10 +707,17 @@ def run_git(
     disk_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """disk_root enables the on-disk budget for operations that can grow the
-    clone from untrusted data (clone, fetch, pull, merge, checkout)."""
+    clone from untrusted data (clone, fetch, pull, merge, checkout).
+
+    core.hooksPath is cleared on the invocation so a host-wide hook (a
+    pre-push that rejects unknown remotes, a commit-msg linter, …) cannot
+    intercept clone/fetch/commit/push of the linked config repo. Credential
+    helpers and the rest of git config still come from the environment.
+    """
     cmd = ["git"]
     if repo is not None:
         cmd += ["-C", str(repo)]
+    cmd += ["-c", "core.hooksPath="]
     cmd += args
     try:
         result = run_bounded(
@@ -3149,6 +3156,28 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = "Nothing to apply."
         return snap
 
+    if getattr(args, "dry_run", False):
+        applied = []
+        removed = []
+        for item in chosen:
+            if item.get("removal"):
+                removed.append(item["path"])
+                applied.append(item["path"])
+            elif Path(item["repo_path"]).is_file():
+                applied.append(item["path"])
+        if shortcut_keys:
+            applied.append("hypr/bindings.lua")
+        snap = build_snapshot(ctx, fetch=False)
+        snap["applied"] = applied
+        snap["removed"] = removed
+        snap["dry_run"] = True
+        snap["message"] = (
+            f"Dry run: would apply {len(applied)} file{'s' if len(applied) != 1 else ''}"
+            + (f" ({len(removed)} removed from this machine)" if removed else "")
+            + "."
+        )
+        return snap
+
     shell_path = ctx.config_omarchy / "shell.json"
     section, widget_entry, widget_index = extract_widget_entry(load_json(shell_path, default={}, within=ctx.home))
     backup_targets = [i for i in chosen if i["local_exists"]]
@@ -3299,6 +3328,13 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     if shortcut_keys:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
     if not chosen and not shortcut_keys:
+        if getattr(args, "dry_run", False):
+            snap = build_snapshot(ctx, fetch=False)
+            snap["published"] = []
+            snap["removed"] = []
+            snap["dry_run"] = True
+            snap["message"] = "Dry run: nothing to publish."
+            return snap
         if args.push and git_fields["ahead"] and not git_fields["behind"]:
             result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
             snap = build_snapshot(ctx, fetch=False)
@@ -3315,6 +3351,30 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["published"] = []
         snap["removed"] = []
         snap["message"] = "Nothing to publish."
+        return snap
+
+    if getattr(args, "dry_run", False):
+        published = []
+        removed = []
+        for item in chosen:
+            if item.get("removal"):
+                removed.append(item["path"])
+                published.append(item["path"])
+            elif Path(item["local_path"]).is_file():
+                published.append(item["path"])
+        if shortcut_keys:
+            published.append("hypr/bindings.lua")
+        snap = build_snapshot(ctx, fetch=False)
+        snap["published"] = published
+        snap["removed"] = removed
+        snap["committed"] = False
+        snap["pushed"] = False
+        snap["dry_run"] = True
+        snap["message"] = (
+            f"Dry run: would publish {len(published)} file{'s' if len(published) != 1 else ''}"
+            + (f" ({len(removed)} removed)" if removed else "")
+            + "."
+        )
         return snap
 
     _check_operation_size([i["local_path"] for i in chosen if not i.get("removal")], "Publish")
