@@ -75,7 +75,13 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `bin/*` | `~/.local/bin/` |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
 
-`hypr/monitors.lua` is tagged machine-specific and is **not** applied unless you enable **Include display layout**.
+Machine-local files are **not** applied unless you enable **Include machine-local files**:
+
+- `hypr/monitors.lua` (display layout)
+- `hypr/hyprsunset.conf` (generated sunrise/sunset schedule)
+- Extra paths listed in `.omarchy-config.json` under `machine_local`
+
+Per-machine overlay files (`*.local.lua`, `local.conf`, `input.local.lua`, …) are ignored entirely so they never show up as Incoming.
 
 ## Keyboard
 

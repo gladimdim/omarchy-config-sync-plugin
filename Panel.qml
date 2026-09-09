@@ -1605,8 +1605,8 @@ Panel {
       Toggle {
         visible: !root.showingHidden
         width: parent.width
-        label: "Include display layout"
-        description: "hypr/monitors.lua is machine-specific and skipped by default unless enabled here."
+        label: "Include machine-local files"
+        description: "Display layout, night-light schedule, and anything listed in .omarchy-config.json machine_local stay on this machine unless enabled here."
         checked: root.includeMachine
         foreground: root.foreground
         accent: root.accent

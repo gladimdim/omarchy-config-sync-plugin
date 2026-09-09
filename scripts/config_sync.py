@@ -90,7 +90,10 @@ FILE_SUMMARIES = {
     "omarchy/theme.name": "Selected Omarchy theme",
 }
 
-MACHINE_LOCAL_PATHS = {"hypr/monitors.lua"}
+# Always machine-local unless the user opts in with Include machine-local files.
+# Generated or hardware-specific files that would otherwise chatter on every Publish.
+DEFAULT_MACHINE_LOCAL_PATHS = frozenset({"hypr/monitors.lua", "hypr/hyprsunset.conf"})
+MACHINE_LOCAL_PATHS = set(DEFAULT_MACHINE_LOCAL_PATHS)
 THEME_REL = "omarchy/theme.name"
 THEME_SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 
@@ -519,8 +522,36 @@ def file_hash(path: Path, rel: str, within: Path | None = None) -> str | None:
     return sha256_file(path, within=within)
 
 
+def is_local_overlay_name(name: str) -> bool:
+    """True for per-machine overlay files next to a shared config.
+
+    Matches `local.conf`, `input.local.lua`, `foo.local`, and `local.toml`.
+    Does not match ordinary names like `hyprsunset.conf` or `shell.toml`.
+    """
+    parts = Path(name).name.split(".")
+    if not parts or parts == [""]:
+        return False
+    if parts[0].lower() == "local":
+        return True
+    return any(part.lower() == "local" for part in parts[1:])
+
+
 def is_skipped_file(name: str) -> bool:
-    return name in SKIP_FILE_NAMES or bool(SKIP_NAME_RE.search(name))
+    return name in SKIP_FILE_NAMES or bool(SKIP_NAME_RE.search(name)) or is_local_overlay_name(name)
+
+
+def machine_local_paths(repo: Path | None = None) -> set[str]:
+    paths = set(DEFAULT_MACHINE_LOCAL_PATHS)
+    if repo is None:
+        return paths
+    marker = load_json(repo / MARKER_NAME, default={}, within=repo)
+    extra = marker.get("machine_local") if isinstance(marker, dict) else None
+    if not isinstance(extra, list):
+        return paths
+    for item in extra:
+        if isinstance(item, str) and validate_safe_rel_path(item):
+            paths.add(item)
+    return paths
 
 
 def validate_safe_rel_path(rel: str) -> bool:
@@ -1153,8 +1184,9 @@ def summary_for(rel: str) -> str:
     return rel
 
 
-def is_machine_local(rel: str) -> bool:
-    return rel in MACHINE_LOCAL_PATHS
+def is_machine_local(rel: str, local_paths: set[str] | None = None) -> bool:
+    paths = DEFAULT_MACHINE_LOCAL_PATHS if local_paths is None else local_paths
+    return rel in paths
 
 
 def is_bundled_path(rel: str) -> bool:
@@ -1300,6 +1332,7 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         )
     repo_resolved = repo.resolve()
     home_resolved = ctx.home.resolve()
+    local_paths = machine_local_paths(repo)
 
     def add(rel: str, local: Path, repo_file: Path, group: str, extra: dict[str, Any] | None = None) -> None:
         if not validate_safe_rel_path(rel):
@@ -1332,7 +1365,7 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             "path": rel,
             "group": group,
             "summary": summary_for(rel),
-            "portable": not is_machine_local(rel),
+            "portable": not is_machine_local(rel, local_paths),
             "local_path": str(local),
             "repo_path": str(repo_file),
             "local_exists": local_regular,
