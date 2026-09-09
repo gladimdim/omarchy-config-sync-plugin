@@ -1711,6 +1711,29 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertFalse(data["ok"])
         self.assertIn("exceeded", data["error"])
 
+    def test_compact_snapshot_drops_bundled_files(self) -> None:
+        payload = {
+            "ok": True,
+            "diff": {
+                "files": [
+                    {"path": "hypr/looknfeel.lua", "status": "local"},
+                    {"path": "plugins/demo.widget/Main.qml", "status": "added-local"},
+                    {"path": "bin/tool", "status": "added-local"},
+                    {"path": "omarchy/hooks/post-update.d/x.hook", "status": "added-local"},
+                    {"path": "omarchy/shell.json", "status": "local"},
+                ],
+                "bundles": [{"id": "plugin:demo.widget", "files": ["plugins/demo.widget/Main.qml"]}],
+            },
+        }
+        out = cs.compact_snapshot_payload(payload)
+        self.assertEqual(
+            [f["path"] for f in out["diff"]["files"]],
+            ["hypr/looknfeel.lua", "omarchy/shell.json"],
+        )
+        self.assertEqual(out["diff"]["bundles"][0]["id"], "plugin:demo.widget")
+        # Original payload is not mutated, so Apply can still expand bundles.
+        self.assertEqual(len(payload["diff"]["files"]), 5)
+
     def test_run_git_ignores_configured_hooks_path(self) -> None:
         # A commit-msg hook that always fails must not intercept plugin git.
         hooks = self.tmp / "hooks"

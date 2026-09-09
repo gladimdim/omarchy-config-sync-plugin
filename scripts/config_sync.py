@@ -2419,24 +2419,32 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             status == "repo" and not item["repo_exists"]
         )
         if status not in {"identical", "machine"}:
-            item["preview"] = unified_preview(
-                Path(item["local_path"]),
-                Path(item["repo_path"]),
-                local_within=ctx.home,
-                repo_within=repo,
-            )
-            sem_summary, changes = summarize_file_diff(
-                item["path"],
-                Path(item["local_path"]),
-                Path(item["repo_path"]),
-                status,
-                local_within=ctx.home,
-                repo_within=repo,
-            )
-            item["semantic_summary"] = sem_summary
-            item["changes"] = changes
-            if sem_summary:
-                item["summary"] = sem_summary
+            # Plugin/hook/bin trees are one checkbox each in the panel. Building
+            # a unified preview per file on a machine with dozens of plugins
+            # blows the 5 MiB JSON cap and makes Connect look like it failed.
+            if is_bundled_path(item["path"]):
+                item["preview"] = ""
+                item["semantic_summary"] = ""
+                item["changes"] = []
+            else:
+                item["preview"] = unified_preview(
+                    Path(item["local_path"]),
+                    Path(item["repo_path"]),
+                    local_within=ctx.home,
+                    repo_within=repo,
+                )
+                sem_summary, changes = summarize_file_diff(
+                    item["path"],
+                    Path(item["local_path"]),
+                    Path(item["repo_path"]),
+                    status,
+                    local_within=ctx.home,
+                    repo_within=repo,
+                )
+                item["semantic_summary"] = sem_summary
+                item["changes"] = changes
+                if sem_summary:
+                    item["summary"] = sem_summary
             if not item["hidden"]:
                 counts["changed"] += 1
         else:
@@ -3948,6 +3956,27 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     raise SyncError(f"Unknown command: {command}")
 
 
+def compact_snapshot_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep plugin/hook/bin trees as bundles only in the panel JSON.
+
+    The in-memory diff still has every file so Apply/Publish can expand a
+    bundle. The panel never lists those files individually, and sending them
+    (thousands of rows on a well-loaded Omarchy box) exceeds MAX_RESPONSE_BYTES.
+    """
+    diff = result.get("diff")
+    if not isinstance(diff, dict):
+        return result
+    files = diff.get("files")
+    if not isinstance(files, list):
+        return result
+    kept = [item for item in files if isinstance(item, dict) and not is_bundled_path(str(item.get("path") or ""))]
+    out = dict(result)
+    new_diff = dict(diff)
+    new_diff["files"] = kept
+    out["diff"] = new_diff
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3958,6 +3987,8 @@ def main(argv: list[str] | None = None) -> int:
         result = fail(str(exc), **exc.extra)
     except Exception as exc:  # noqa: BLE001 — CLI must never print a traceback to QML
         result = fail(str(exc) or exc.__class__.__name__)
+    if result.get("ok") and isinstance(result.get("diff"), dict):
+        result = compact_snapshot_payload(result)
     payload = json.dumps(result, ensure_ascii=False)
     if len(payload.encode("utf-8")) > MAX_RESPONSE_BYTES:
         # Enforce the bound before writing, not after the panel has buffered it all.
