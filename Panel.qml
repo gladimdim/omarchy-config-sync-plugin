@@ -675,8 +675,11 @@ Panel {
     pendingAction = args[0] || ""
     syncProc.command = ["python3", "-u", root.scriptPath].concat(args)
     syncProc.running = true
-    if (stdinData) {
-      syncProc.write(String(stdinData) + "\n")
+    // The helper reads a line from stdin and we never close the pipe, so a
+    // --stdin command must always get its newline — otherwise it blocks on a
+    // read that never returns and the panel stays busy forever.
+    if (stdinData || args.indexOf("--stdin") >= 0) {
+      syncProc.write(String(stdinData || "") + "\n")
     }
   }
 
