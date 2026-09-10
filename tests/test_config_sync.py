@@ -2174,5 +2174,14 @@ class SourceArgumentTests(unittest.TestCase):
             self.assertEqual(cs.read_source_argument(args), "https://github.com/c/d.git")
 
 
+class PluginVersionTests(unittest.TestCase):
+    def test_plugin_version_matches_manifest(self) -> None:
+        """The helper reports its own version to the panel, so a release that
+        bumps manifest.json without bumping PLUGIN_VERSION ships a plugin that
+        misreports which version is installed."""
+        manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(cs.PLUGIN_VERSION, manifest["version"])
+
+
 if __name__ == "__main__":
     unittest.main()
