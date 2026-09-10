@@ -535,6 +535,22 @@ def validate_safe_rel_path(rel: str) -> bool:
     return not any(":" in p or "\0" in p or "\n" in p for p in parts)
 
 
+def read_source_argument(args: argparse.Namespace) -> str:
+    """Collect the repo URL/path for connect and set-url.
+
+    With --stdin, read a *line* rather than a sized read(): the panel writes
+    "<url>\\n" and keeps the pipe open, so read() would block for an EOF that
+    never arrives and the helper would sit in anon_pipe_read forever. Falling
+    back to argv keeps the CLI (`connect <url>`, `--url <url>`) working, and
+    never blocks a second time on a pipe nobody is going to close.
+    """
+    if getattr(args, "stdin", False):
+        source_raw = sys.stdin.readline(MAX_URL_INPUT_BYTES).strip()
+        if source_raw:
+            return source_raw
+    return " ".join(getattr(args, "args", None) or []).strip() or (getattr(args, "url", None) or "")
+
+
 def normalize_source(raw: str) -> tuple[str, str]:
     src = (raw or "").strip()
     if not src or src.startswith("-") or "\0" in src or "\n" in src:
@@ -2664,11 +2680,7 @@ def cmd_snapshot(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
-    source_raw = ""
-    if getattr(args, "stdin", False):
-        source_raw = sys.stdin.readline(MAX_URL_INPUT_BYTES).strip()
-    if not source_raw:
-        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
+    source_raw = read_source_argument(args)
     kind, value = normalize_source(source_raw)
     ctx.state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3633,11 +3645,7 @@ def cmd_resolve(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx)
-    source_raw = ""
-    if getattr(args, "stdin", False):
-        source_raw = sys.stdin.readline(MAX_URL_INPUT_BYTES).strip()
-    if not source_raw:
-        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
+    source_raw = read_source_argument(args)
     kind, value = normalize_source(source_raw)
     if kind != "url":
         raise SyncError("set-url expects a git remote URL.")

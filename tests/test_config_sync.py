@@ -2085,5 +2085,94 @@ class RemovalSyncTests(unittest.TestCase):
             self.assertFalse(cs.remove_mapped_file(item, "apply", root))
 
 
+class SourceArgumentTests(unittest.TestCase):
+    """Regression cover for issue #1 — Connect hanging forever on the panel.
+
+    Panel.qml writes "<url>\\n" into the helper's stdin and never closes the
+    pipe, so anything that waits for EOF hangs with no clone, no error and no
+    timeout. These tests pin both halves of the contract: --stdin must return
+    on the newline alone, and every non-stdin caller must still be able to pass
+    the source on argv.
+    """
+
+    def _cli(self, args: list[str], *, stdin_data: str | None, close_stdin: bool, timeout: int = 60):
+        """Run the helper with stdin held OPEN, exactly as the panel does.
+
+        Popen.communicate() closes stdin, which is precisely the condition that
+        masks this bug, so wait on the process directly instead.
+        """
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        home = tmp / "home"
+        (home / ".local" / "share").mkdir(parents=True)
+        env = git_test_env()
+        env["HOME"] = str(home)
+        env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+
+        with open(tmp / "out", "w+") as out, open(tmp / "err", "w+") as err:
+            proc = subprocess.Popen(
+                ["python3", "-u", str(SCRIPTS / "config_sync.py"), *args],
+                stdin=subprocess.PIPE, stdout=out, stderr=err, text=True, env=env,
+            )
+            try:
+                if stdin_data is not None:
+                    proc.stdin.write(stdin_data)
+                    proc.stdin.flush()
+                if close_stdin:
+                    proc.stdin.close()
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    self.fail(f"config_sync.py {' '.join(args)} never exited — stdin deadlock (issue #1)")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                if proc.stdin is not None and not proc.stdin.closed:
+                    proc.stdin.close()
+            out.seek(0)
+            return proc.returncode, json.loads(out.read().strip() or "{}")
+
+    def test_connect_stdin_returns_before_eof(self) -> None:
+        repo = make_config_repo(Path(tempfile.mkdtemp()) / "source")
+        self.addCleanup(shutil.rmtree, repo.parent, True)
+        code, payload = self._cli(["connect", "--stdin"], stdin_data=f"{repo}\n", close_stdin=False)
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload.get("ok"), payload)
+
+    def test_connect_reads_argv_without_stdin_flag(self) -> None:
+        repo = make_config_repo(Path(tempfile.mkdtemp()) / "source")
+        self.addCleanup(shutil.rmtree, repo.parent, True)
+        # stdin is an open, idle pipe — a terminal behaves the same way.
+        code, payload = self._cli(["connect", str(repo)], stdin_data=None, close_stdin=False)
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload.get("ok"), payload)
+
+    def test_connect_stdin_with_blank_line_fails_fast(self) -> None:
+        code, payload = self._cli(["connect", "--stdin"], stdin_data="\n", close_stdin=False)
+        self.assertEqual(code, 1)
+        self.assertIn("Paste a git URL", payload.get("error", ""))
+
+    def test_read_source_argument_prefers_stdin_line(self) -> None:
+        with patch("sys.stdin", io.StringIO("https://github.com/a/b.git\nignored\n")):
+            args = argparse_ns(stdin=True, args=["https://github.com/c/d.git"])
+            self.assertEqual(cs.read_source_argument(args), "https://github.com/a/b.git")
+
+    def test_read_source_argument_falls_back_to_argv(self) -> None:
+        args = argparse_ns(stdin=False, args=["https://github.com/c/d.git"])
+        self.assertEqual(cs.read_source_argument(args), "https://github.com/c/d.git")
+
+    def test_read_source_argument_falls_back_to_url_flag(self) -> None:
+        args = argparse_ns(stdin=False, args=[], url="https://github.com/e/f.git")
+        self.assertEqual(cs.read_source_argument(args), "https://github.com/e/f.git")
+
+    def test_read_source_argument_falls_back_to_argv_when_stdin_is_empty(self) -> None:
+        with patch("sys.stdin", io.StringIO("\n")):
+            args = argparse_ns(stdin=True, args=["https://github.com/c/d.git"])
+            self.assertEqual(cs.read_source_argument(args), "https://github.com/c/d.git")
+
+
 if __name__ == "__main__":
     unittest.main()
