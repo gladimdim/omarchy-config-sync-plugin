@@ -73,7 +73,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.20"
+PLUGIN_VERSION = "1.2.21"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -1569,6 +1569,54 @@ def extract_shell_widgets(data: Any) -> set[str]:
     return widgets
 
 
+def extra_shell_changes(before: dict[str, Any], after: dict[str, Any], status: str) -> list[str]:
+    """Describe settings beyond the shell fields with dedicated summaries."""
+    handled = {("bar", "position"), ("bar", "transparent"), ("idle", "lock"), ("idle", "screensaver")}
+    missing = object()
+    changes: list[str] = []
+
+    def value_text(value: Any) -> str | None:
+        if value is missing:
+            return None
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        return text if len(text) <= 240 else text[:237] + "…"
+
+    def label_for(path: tuple[str, ...]) -> str:
+        if path[:2] == ("bar", "layout") and len(path) >= 3:
+            return " · ".join((f"Bar {path[2]}", *path[3:]))
+        return " · ".join(path)
+
+    def walk(old: Any, new: Any, path: tuple[str, ...]) -> None:
+        if old == new or path in handled:
+            return
+        if isinstance(old, dict) and isinstance(new, dict):
+            for key in sorted(old.keys() | new.keys()):
+                walk(old.get(key, missing), new.get(key, missing), (*path, key))
+            return
+        # Match widgets by ID so reordering does not look like settings edits.
+        if path[:2] == ("bar", "layout") and len(path) == 3 and isinstance(old, list) and isinstance(new, list):
+            old_widgets = [{"id": w} if isinstance(w, str) else w for w in old]
+            new_widgets = [{"id": w} if isinstance(w, str) else w for w in new]
+            if all(isinstance(w, dict) and isinstance(w.get("id"), str) for w in old_widgets + new_widgets):
+                old_ids = [w["id"] for w in old_widgets]
+                new_ids = [w["id"] for w in new_widgets]
+                if len(set(old_ids)) == len(old_ids) and len(set(new_ids)) == len(new_ids):
+                    if old_ids != new_ids:
+                        changes.append(format_setting_change(
+                            label_for(path) + " widgets", ", ".join(old_ids) or "none", ", ".join(new_ids) or "none", status
+                        ))
+                    old_by_id = {w["id"]: w for w in old_widgets}
+                    for widget in new_widgets:
+                        widget_id = widget["id"]
+                        if widget_id in old_by_id:
+                            walk(old_by_id[widget_id], widget, (*path, widget_id))
+                    return
+        changes.append(format_setting_change(label_for(path), value_text(old), value_text(new), status))
+
+    walk(before, after, ())
+    return changes
+
+
 def parse_lua_simple_vars(text: str) -> dict[str, str]:
     vals: dict[str, str] = {}
     for line in text.splitlines():
@@ -1655,7 +1703,9 @@ def summarize_file_diff(
         except Exception:
             rep = {}
 
-        before, after = (loc, rep) if status in {"repo", "added-repo"} else (rep, loc)
+        loc = loc if isinstance(loc, dict) else {}
+        rep = rep if isinstance(rep, dict) else {}
+        before, after = (rep, loc) if status in {"local", "added-local"} else (loc, rep)
 
         # Bar position
         b_pos = (before.get("bar") or {}).get("position")
@@ -1698,6 +1748,15 @@ def summarize_file_diff(
             if len(removed) > 2:
                 s += f" (-{len(removed)-2} more)"
             changes.append(s)
+
+        changes.extend(extra_shell_changes(before, after, status))
+
+    elif rel == THEME_REL:
+        local_name = theme_display_name(read_theme_slug(local_path, within=local_within)) or None
+        repo_name = theme_display_name(read_theme_slug(repo_path, within=repo_within)) or None
+        if local_name != repo_name:
+            old_name, new_name = (repo_name, local_name) if status in {"local", "added-local"} else (local_name, repo_name)
+            changes.append(format_setting_change("Theme", old_name, new_name, status))
 
     # 2. omarchy/shell.toml
     elif rel == "omarchy/shell.toml":
@@ -1798,19 +1857,24 @@ def summarize_file_diff(
         if removed_c:
             changes.append("-" + ", -".join(removed_c[:2]))
 
+    before_text, after_text = (repo_text, local_text) if status in {"local", "added-local"} else (local_text, repo_text)
+    line_diff = difflib.SequenceMatcher(None, before_text.splitlines(), after_text.splitlines()).get_opcodes()
+    added_n = sum(j2 - j1 for tag, i1, i2, j1, j2 in line_diff if tag in {"insert", "replace"})
+    removed_n = sum(i2 - i1 for tag, i1, i2, j1, j2 in line_diff if tag in {"delete", "replace"})
+    line_summary = f"+{added_n}, -{removed_n} lines" if added_n or removed_n else ""
+
     # Fallback diff if no specific keys matched
     if not changes:
         if status in {"added-repo", "added-local"}:
             lines = (local_text if status == "added-local" else repo_text).splitlines()
             changes.append(f"New file ({len(lines)} lines)")
         else:
-            diff = list(difflib.unified_diff(local_text.splitlines(), repo_text.splitlines(), lineterm=""))
-            added_n = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
-            removed_n = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
-            if added_n or removed_n:
-                changes.append(f"+{added_n}, -{removed_n} lines")
+            if line_summary:
+                changes.append(line_summary)
 
     summary_text = " · ".join(changes) if changes else summary_for(rel)
+    if rel in {THEME_REL, "omarchy/shell.json"} and line_summary and line_summary not in changes:
+        summary_text += " · " + line_summary
     return (summary_text, changes)
 
 
@@ -2522,7 +2586,9 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             status = "differs"
         local_slug = read_theme_slug(ctx.theme_name_path, within=ctx.home)
         repo_slug = read_theme_slug(repo / THEME_REL, within=repo)
-        slug = repo_slug or local_slug
+        # Outgoing changes publish the local selection; the repo still has
+        # the previous theme until publish completes.
+        slug = (local_slug or repo_slug) if status in {"local", "added-local"} else (repo_slug or local_slug)
         theme_diff = {
             "id": "selected",
             "slug": slug,
@@ -2530,6 +2596,8 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             "local_slug": local_slug,
             "repo_slug": repo_slug,
             "status": status,
+            "semantic_summary": (name_item or {}).get("semantic_summary", ""),
+            "changes": (name_item or {}).get("changes", []),
             "files": [f["path"] for f in theme_files],
             "custom": any(f["path"].startswith("omarchy/themes/") for f in theme_files),
             "default_apply": (status in {"repo", "added-repo", "differs"} or (name_item or {}).get("default_apply")) and not is_hidden_item("t", "selected", hidden_keys),

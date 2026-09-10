@@ -711,6 +711,34 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertEqual(inspect["theme"]["slug"], "catppuccin")
             self.assertEqual(inspect["theme"]["display"], "Catppuccin")
 
+    def test_theme_change_label_matches_sync_direction(self) -> None:
+        for side, expected_status in (("local", "local"), ("repo", "repo")):
+            for with_overlay in (False, True):
+                with self.subTest(side=side, with_overlay=with_overlay), TempHome() as env:
+                    repo = make_config_repo(env.home / "cfg")
+                    write(env.ctx.theme_name_path, "catppuccin\n")
+                    cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+                    cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", theme=True))
+
+                    theme_path = env.ctx.theme_name_path if side == "local" else repo / cs.THEME_REL
+                    write(theme_path, "osaka-jade\n")
+                    if with_overlay:
+                        themes = env.ctx.user_themes if side == "local" else repo / "omarchy" / "themes"
+                        write(themes / "osaka-jade" / "colors.toml", 'background = "#111111"\n')
+
+                    theme = cs.cmd_snapshot(env.ctx, argparse_ns())["diff"]["theme"]
+                    self.assertEqual(theme["status"], "added-" + side if with_overlay else expected_status)
+                    self.assertEqual(theme["slug"], "osaka-jade")
+                    self.assertEqual(theme["display"], "Osaka Jade")
+                    self.assertEqual(theme[side + "_slug"], "osaka-jade")
+                    self.assertEqual(theme[("repo" if side == "local" else "local") + "_slug"], "catppuccin")
+
+                    if side == "local":
+                        result = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", theme=True))
+                        self.assertTrue(result["ok"], result)
+                        self.assertEqual((repo / cs.THEME_REL).read_text().strip(), "osaka-jade")
+                        self.assertIsNone(result["diff"]["theme"])
+
     def test_cherrypick_one_shortcut_and_one_plugin(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
@@ -1794,6 +1822,62 @@ class SemanticDiffTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_theme_name_describes_each_sync_direction(self) -> None:
+        loc, rep = self.tmp / "local-theme", self.tmp / "repo-theme"
+        write(loc, "hackerman\n")
+        write(rep, "rose-pine\n")
+        for status, expected in (
+            ("local", "Theme: Rose Pine → Hackerman"),
+            ("repo", "Theme: Hackerman → Rose Pine"),
+            ("both", "Theme: local Hackerman vs repo Rose Pine"),
+            ("differs", "Theme: local Hackerman vs repo Rose Pine"),
+        ):
+            with self.subTest(status=status):
+                summary, changes = cs.summarize_file_diff(cs.THEME_REL, loc, rep, status)
+                self.assertEqual(changes, [expected])
+                self.assertIn("+1, -1 lines", summary)
+        rep.unlink()
+        self.assertEqual(cs.summarize_file_diff(cs.THEME_REL, loc, rep, "added-local")[1], ["Theme: Hackerman"])
+        self.assertEqual(cs.summarize_file_diff(cs.THEME_REL, loc, rep, "repo")[1], ["Theme: Hackerman (removed)"])
+
+    def test_shell_widget_settings_describe_tracked_limits(self) -> None:
+        loc, rep = self.tmp / "local.json", self.tmp / "repo.json"
+        old = ["claude:fable-weekly", "claude:session-5-hour"]
+        new = ["claude:weekly-7-day", "codex:weekly-7-day"]
+        def shell(tracked):
+            return {"bar": {"layout": {"right": [{"id": "gladimdim.ai-limits", "tracked": tracked}]}}}
+        write(loc, json.dumps(shell(new), indent=2))
+        write(rep, json.dumps(shell(old), indent=2))
+        label = "Bar right · gladimdim.ai-limits · tracked"
+        for status, expected in (
+            ("local", f"{label}: {json.dumps(old)} → {json.dumps(new)}"),
+            ("repo", f"{label}: {json.dumps(new)} → {json.dumps(old)}"),
+            ("both", f"{label}: local {json.dumps(new)} vs repo {json.dumps(old)}"),
+        ):
+            with self.subTest(status=status):
+                summary, changes = cs.summarize_file_diff("omarchy/shell.json", loc, rep, status)
+                self.assertEqual(changes, [expected])
+                self.assertIn("+2, -2 lines", summary)
+
+    def test_shell_widget_reorder_does_not_misattribute_settings(self) -> None:
+        before = {"bar": {"layout": {"right": [{"id": "a", "size": 10}, {"id": "b", "size": 20}]}}}
+        after = {"bar": {"layout": {"right": [{"id": "b", "size": 20}, {"id": "a", "size": 12}]}}}
+        self.assertEqual(cs.extra_shell_changes(before, after, "local"), [
+            "Bar right widgets: a, b → b, a",
+            "Bar right · a · size: 10 → 12",
+        ])
+
+    def test_shell_additional_settings_are_not_hidden_by_known_changes(self) -> None:
+        loc, rep = self.tmp / "local.json", self.tmp / "repo.json"
+        write(rep, json.dumps({"bar": {"position": "top", "height": 30}, "notifications": {"enabled": True, "timeout": 5}}))
+        write(loc, json.dumps({"bar": {"position": "bottom", "height": 40}, "notifications": {"enabled": False, "sound": "bell"}}))
+        _, changes = cs.summarize_file_diff("omarchy/shell.json", loc, rep, "local")
+        self.assertEqual(changes, [
+            "Dock Bar: top → bottom", "bar · height: 30 → 40",
+            "notifications · enabled: true → false", "notifications · sound: bell",
+            "notifications · timeout: 5 (removed)",
+        ])
 
     def test_shell_json_semantic_diff(self) -> None:
         loc = self.tmp / "local.json"

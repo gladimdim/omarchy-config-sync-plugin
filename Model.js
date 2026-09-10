@@ -256,7 +256,7 @@ function appendThemes(out, list, hiddenMap) {
     var t = rows[i]
     var id = t.id || "selected"
     if (isItemHidden("t", id, hiddenMap, t)) continue
-    out.push(reviewItem("t", id, t.display || t.slug, t.slug, t.status, "Theme", t.status === "both", 0, false))
+    out.push(reviewItem("t", id, t.display || t.slug, t.semantic_summary || t.slug, t.status, "Theme", t.status === "both", 0, false, t.changes || []))
   }
 }
 

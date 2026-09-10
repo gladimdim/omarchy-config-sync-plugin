@@ -2538,11 +2538,13 @@ Panel {
                       color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
                       border.width: 1
                       border.color: root.accent
-                      implicitWidth: catChangeText.implicitWidth + Style.space(10)
+                      implicitWidth: Math.min(parent.width, catChangeText.implicitWidth + Style.space(10))
                       implicitHeight: catChangeText.implicitHeight + Style.space(4)
                       Text {
                         id: catChangeText
                         anchors.centerIn: parent
+                        width: Math.max(0, parent.width - Style.space(10))
+                        wrapMode: Text.Wrap
                         textFormat: Text.PlainText
                         text: String(modelData)
                         color: root.foreground
@@ -2867,11 +2869,13 @@ Panel {
                   color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
                   border.width: 1
                   border.color: root.accent
-                  implicitWidth: changeText.implicitWidth + Style.space(10)
+                  implicitWidth: Math.min(parent.width, changeText.implicitWidth + Style.space(10))
                   implicitHeight: changeText.implicitHeight + Style.space(4)
                   Text {
                     id: changeText
                     anchors.centerIn: parent
+                    width: Math.max(0, parent.width - Style.space(10))
+                    wrapMode: Text.Wrap
                     textFormat: Text.PlainText
                     text: String(modelData)
                     color: root.foreground
