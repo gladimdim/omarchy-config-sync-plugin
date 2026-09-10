@@ -222,6 +222,48 @@ class ValidateTests(unittest.TestCase):
 
 
 class ShortcutTests(unittest.TestCase):
+    def test_rebind_overrides_earlier_bind_and_can_be_unbound(self) -> None:
+        text = (
+            'o.bind("SUPER + DOWN", "Focus down", "old")\n'
+            'o.rebind("SUPER + DOWN", "Copy", "copy")\n'
+            '-- o.rebind("SUPER + UP", "Ignored", "ignored")\n'
+        )
+        self.assertEqual(cs.parse_shortcuts(text), [
+            {"keys": "SUPER + DOWN", "label": "Copy", "kind": "bind"},
+        ])
+        self.assertEqual(cs.parse_shortcuts(text + 'hl.unbind("SUPER + DOWN")\n'), [
+            {"keys": "SUPER + DOWN", "label": "Unbound default", "kind": "unbind"},
+        ])
+
+    def test_new_rebinds_are_outgoing_and_publish_preserves_rebind(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_apply(env.ctx, argparse_ns())
+            bindings = env.ctx.config_hypr / "bindings.lua"
+            original = bindings.read_text(encoding="utf-8")
+            copy = 'o.rebind("SUPER + DOWN", "Copy", "copy")\n'
+            paste = 'o.rebind("SUPER + UP", "Paste", "paste")\n'
+            write(bindings, original + copy + paste)
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            rows = {r["keys"]: r for r in snap["diff"]["shortcuts"]}
+            for key in ("SUPER + DOWN", "SUPER + UP"):
+                self.assertEqual(rows[key]["status"], "added-local")
+                self.assertTrue(rows[key]["default_publish"])
+            file = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/bindings.lua")
+            self.assertEqual(file["status"], "local")
+
+            result = cs.cmd_publish(env.ctx, argparse_ns(
+                explicit=True, files="", shortcut=["SUPER + DOWN"],
+            ))
+            self.assertTrue(result["ok"], result)
+            published = (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8")
+            self.assertIn(copy, published)
+            self.assertNotIn(paste, published)
+            remaining = cs.cmd_snapshot(env.ctx, argparse_ns())["diff"]["shortcuts"]
+            self.assertEqual([r["keys"] for r in remaining], ["SUPER + UP"])
+
     def test_parse_dedupes_and_labels(self) -> None:
         text = (
             'o.bind("SUPER + SHIFT + R", "Region screen recording", "x")\n'

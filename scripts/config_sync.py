@@ -64,7 +64,7 @@ def format_byte_limit(n: int) -> str:
 
 
 BIND_RE = re.compile(
-    r"""o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"([^"]*)")""",
+    r"""o\.(?:bind|rebind)\(\s*"([^"]+)"\s*,\s*(?:nil|"([^"]*)")""",
     re.MULTILINE,
 )
 UNBIND_RE = re.compile(r"""hl\.unbind\(\s*"([^"]+)"\s*\)""")
@@ -73,7 +73,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.21"
+PLUGIN_VERSION = "1.2.22"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -1895,7 +1895,7 @@ def parse_shortcuts(text: str) -> list[dict[str, str]]:
 
 
 def extract_bind_statements(text: str) -> list[dict[str, Any]]:
-    """One-line o.bind / hl.unbind entries. Last occurrence of each key wins.
+    """One-line o.bind / o.rebind / hl.unbind entries. Last key occurrence wins.
 
     Omarchy rebinds a default with `hl.unbind` then `o.bind` for the same key.
     Hyprland executes in order, so the later statement is the effective shortcut.
