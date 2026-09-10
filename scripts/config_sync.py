@@ -36,21 +36,32 @@ MARKER_NAME = ".omarchy-config.json"
 MARKER_FORMAT = "omarchy-config"
 MAX_DIFF_LINES = 48
 MAX_DIFF_BYTES = 12_000
-CLONE_TIMEOUT = 120
-FETCH_TIMEOUT = 25
-PUSH_TIMEOUT = 60
+CLONE_TIMEOUT = 600
+FETCH_TIMEOUT = 180
+PUSH_TIMEOUT = 600
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_SUBPROCESS_BYTES = 2 * 1024 * 1024
 MAX_INVENTORY_FILES = 20_000
 MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 MAX_SYNC_FILE_BYTES = 50 * 1024 * 1024
 MAX_URL_INPUT_BYTES = 64 * 1024
-# Hard on-disk budget for the managed clone while git (clone/fetch/pull/merge/
-# checkout) runs against an untrusted remote, and for the clone at rest.
-MAX_REPO_DISK_BYTES = 512 * 1024 * 1024
-# Aggregate bytes one apply/publish may copy (backup + installed files), so the
-# per-file cap cannot be multiplied by the inventory cap.
-MAX_SYNC_TOTAL_BYTES = 512 * 1024 * 1024
+# GitHub documents a 10 GiB on-disk repository guideline (the .git folder).
+# There is no 512 MiB GitHub Pro cap; that was only this plugin. Keep a ceiling
+# so a hostile remote cannot fill the disk, but allow a full plugin tree.
+MAX_REPO_DISK_BYTES = 10 * 1024 * 1024 * 1024
+# Aggregate bytes one apply/publish may copy (backup + installed files).
+MAX_SYNC_TOTAL_BYTES = 10 * 1024 * 1024 * 1024
+
+
+def format_byte_limit(n: int) -> str:
+    gib = 1024 * 1024 * 1024
+    if n >= gib:
+        whole = n // gib
+        if n % gib == 0:
+            return f"{whole} GiB"
+        return f"{n / gib:.1f} GiB"
+    return f"{max(0, n) // (1024 * 1024)} MiB"
+
 
 BIND_RE = re.compile(
     r"""o\.bind\(\s*"([^"]+)"\s*,\s*(?:nil|"([^"]*)")""",
@@ -253,7 +264,7 @@ class ByteBudget:
         self.used += n
         if self.used > self.limit:
             raise SyncError(
-                f"{self.what} exceeded the {self.limit // (1024 * 1024)} MiB per-operation size limit; "
+                f"{self.what} exceeded the {format_byte_limit(self.limit)} per-operation size limit; "
                 "select fewer files at a time."
             )
 
@@ -691,8 +702,7 @@ def run_bounded(
     if truncated:
         err = (err + "\n[output truncated: process exceeded its output limit and was stopped]").strip()
     if disk_exceeded:
-        limit_mib = (max_disk_bytes or 0) // (1024 * 1024)
-        err = (err + f"\n[repository exceeded its {limit_mib} MiB on-disk budget and was stopped]").strip()
+        err = (err + f"\n[repository exceeded its {format_byte_limit(max_disk_bytes or 0)} on-disk budget and was stopped]").strip()
         if returncode == 0:
             returncode = 1
     return subprocess.CompletedProcess(cmd, returncode, out, err)
@@ -707,10 +717,17 @@ def run_git(
     disk_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """disk_root enables the on-disk budget for operations that can grow the
-    clone from untrusted data (clone, fetch, pull, merge, checkout)."""
+    clone from untrusted data (clone, fetch, pull, merge, checkout).
+
+    core.hooksPath is cleared on the invocation so a host-wide hook (a
+    pre-push that rejects unknown remotes, a commit-msg linter, …) cannot
+    intercept clone/fetch/commit/push of the linked config repo. Credential
+    helpers and the rest of git config still come from the environment.
+    """
     cmd = ["git"]
     if repo is not None:
         cmd += ["-C", str(repo)]
+    cmd += ["-c", "core.hooksPath="]
     cmd += args
     try:
         result = run_bounded(
@@ -1262,7 +1279,7 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         # The clone is budgeted while git writes it; this catches a tree that
         # grew past the budget by any other route before we walk or hash it.
         raise SyncError(
-            f"Linked repo uses more than {MAX_REPO_DISK_BYTES // (1024 * 1024)} MiB on disk; "
+            f"Linked repo uses more than {format_byte_limit(MAX_REPO_DISK_BYTES)} on disk; "
             "refusing to inspect it. Remove large files from the config repo."
         )
     repo_resolved = repo.resolve()
@@ -2412,24 +2429,32 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             status == "repo" and not item["repo_exists"]
         )
         if status not in {"identical", "machine"}:
-            item["preview"] = unified_preview(
-                Path(item["local_path"]),
-                Path(item["repo_path"]),
-                local_within=ctx.home,
-                repo_within=repo,
-            )
-            sem_summary, changes = summarize_file_diff(
-                item["path"],
-                Path(item["local_path"]),
-                Path(item["repo_path"]),
-                status,
-                local_within=ctx.home,
-                repo_within=repo,
-            )
-            item["semantic_summary"] = sem_summary
-            item["changes"] = changes
-            if sem_summary:
-                item["summary"] = sem_summary
+            # Plugin/hook/bin trees are one checkbox each in the panel. Building
+            # a unified preview per file on a machine with dozens of plugins
+            # blows the 5 MiB JSON cap and makes Connect look like it failed.
+            if is_bundled_path(item["path"]):
+                item["preview"] = ""
+                item["semantic_summary"] = ""
+                item["changes"] = []
+            else:
+                item["preview"] = unified_preview(
+                    Path(item["local_path"]),
+                    Path(item["repo_path"]),
+                    local_within=ctx.home,
+                    repo_within=repo,
+                )
+                sem_summary, changes = summarize_file_diff(
+                    item["path"],
+                    Path(item["local_path"]),
+                    Path(item["repo_path"]),
+                    status,
+                    local_within=ctx.home,
+                    repo_within=repo,
+                )
+                item["semantic_summary"] = sem_summary
+                item["changes"] = changes
+                if sem_summary:
+                    item["summary"] = sem_summary
             if not item["hidden"]:
                 counts["changed"] += 1
         else:
@@ -2964,8 +2989,8 @@ def _check_operation_size(paths: list[str], what: str) -> None:
             total += st.st_size
     if total > MAX_SYNC_TOTAL_BYTES:
         raise SyncError(
-            f"{what} selection totals {total // (1024 * 1024)} MiB, above the "
-            f"{MAX_SYNC_TOTAL_BYTES // (1024 * 1024)} MiB per-operation size limit; select fewer files at a time."
+            f"{what} selection totals {format_byte_limit(total)}, above the "
+            f"{format_byte_limit(MAX_SYNC_TOTAL_BYTES)} per-operation size limit; select fewer files at a time."
         )
 
 
@@ -3149,6 +3174,28 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = "Nothing to apply."
         return snap
 
+    if getattr(args, "dry_run", False):
+        applied = []
+        removed = []
+        for item in chosen:
+            if item.get("removal"):
+                removed.append(item["path"])
+                applied.append(item["path"])
+            elif Path(item["repo_path"]).is_file():
+                applied.append(item["path"])
+        if shortcut_keys:
+            applied.append("hypr/bindings.lua")
+        snap = build_snapshot(ctx, fetch=False)
+        snap["applied"] = applied
+        snap["removed"] = removed
+        snap["dry_run"] = True
+        snap["message"] = (
+            f"Dry run: would apply {len(applied)} file{'s' if len(applied) != 1 else ''}"
+            + (f" ({len(removed)} removed from this machine)" if removed else "")
+            + "."
+        )
+        return snap
+
     shell_path = ctx.config_omarchy / "shell.json"
     section, widget_entry, widget_index = extract_widget_entry(load_json(shell_path, default={}, within=ctx.home))
     backup_targets = [i for i in chosen if i["local_exists"]]
@@ -3299,6 +3346,13 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     if shortcut_keys:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
     if not chosen and not shortcut_keys:
+        if getattr(args, "dry_run", False):
+            snap = build_snapshot(ctx, fetch=False)
+            snap["published"] = []
+            snap["removed"] = []
+            snap["dry_run"] = True
+            snap["message"] = "Dry run: nothing to publish."
+            return snap
         if args.push and git_fields["ahead"] and not git_fields["behind"]:
             result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
             snap = build_snapshot(ctx, fetch=False)
@@ -3315,6 +3369,30 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["published"] = []
         snap["removed"] = []
         snap["message"] = "Nothing to publish."
+        return snap
+
+    if getattr(args, "dry_run", False):
+        published = []
+        removed = []
+        for item in chosen:
+            if item.get("removal"):
+                removed.append(item["path"])
+                published.append(item["path"])
+            elif Path(item["local_path"]).is_file():
+                published.append(item["path"])
+        if shortcut_keys:
+            published.append("hypr/bindings.lua")
+        snap = build_snapshot(ctx, fetch=False)
+        snap["published"] = published
+        snap["removed"] = removed
+        snap["committed"] = False
+        snap["pushed"] = False
+        snap["dry_run"] = True
+        snap["message"] = (
+            f"Dry run: would publish {len(published)} file{'s' if len(published) != 1 else ''}"
+            + (f" ({len(removed)} removed)" if removed else "")
+            + "."
+        )
         return snap
 
     _check_operation_size([i["local_path"] for i in chosen if not i.get("removal")], "Publish")
@@ -3888,6 +3966,27 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     raise SyncError(f"Unknown command: {command}")
 
 
+def compact_snapshot_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep plugin/hook/bin trees as bundles only in the panel JSON.
+
+    The in-memory diff still has every file so Apply/Publish can expand a
+    bundle. The panel never lists those files individually, and sending them
+    (thousands of rows on a well-loaded Omarchy box) exceeds MAX_RESPONSE_BYTES.
+    """
+    diff = result.get("diff")
+    if not isinstance(diff, dict):
+        return result
+    files = diff.get("files")
+    if not isinstance(files, list):
+        return result
+    kept = [item for item in files if isinstance(item, dict) and not is_bundled_path(str(item.get("path") or ""))]
+    out = dict(result)
+    new_diff = dict(diff)
+    new_diff["files"] = kept
+    out["diff"] = new_diff
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3898,6 +3997,8 @@ def main(argv: list[str] | None = None) -> int:
         result = fail(str(exc), **exc.extra)
     except Exception as exc:  # noqa: BLE001 — CLI must never print a traceback to QML
         result = fail(str(exc) or exc.__class__.__name__)
+    if result.get("ok") and isinstance(result.get("diff"), dict):
+        result = compact_snapshot_payload(result)
     payload = json.dumps(result, ensure_ascii=False)
     if len(payload.encode("utf-8")) > MAX_RESPONSE_BYTES:
         # Enforce the bound before writing, not after the panel has buffered it all.

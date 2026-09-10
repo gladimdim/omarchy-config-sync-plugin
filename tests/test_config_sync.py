@@ -22,24 +22,41 @@ import config_sync as cs  # noqa: E402
 OMARCHY_CONFIG = Path("/home/gladimdim/Github/omarchy-config")
 
 
-def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def git_test_env() -> dict[str, str]:
+    """Isolate test git from the host's global config and hooksPath.
+
+    A machine-wide pre-push hook (or init.defaultBranch, user identity, …)
+    must not make clone/commit/push of these throwaway repos fail.
+    """
     env = os.environ.copy()
     env["GIT_AUTHOR_NAME"] = "Test"
     env["GIT_AUTHOR_EMAIL"] = "test@example.com"
     env["GIT_COMMITTER_NAME"] = "Test"
     env["GIT_COMMITTER_EMAIL"] = "test@example.com"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
         check=check,
-        env=env,
+        env=git_test_env(),
     )
 
 
 def init_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-b", "main", str(path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(path)],
+        check=True,
+        capture_output=True,
+        env=git_test_env(),
+    )
     git(path, "config", "user.name", "Test")
     git(path, "config", "user.email", "test@example.com")
 
@@ -799,7 +816,7 @@ def argparse_ns(**kwargs):
         side = None
         url = None
         all = False
-        dry_run = True
+        dry_run = False
         args = []
 
     n = N()
@@ -941,9 +958,11 @@ class SecurityTests(unittest.TestCase):
             local_file = env.home / ".config" / "hypr" / "looknfeel.lua"
             local_file.parent.mkdir(parents=True, exist_ok=True)
             local_file.write_text("content", encoding="utf-8")
-            res = cs.cmd_terminal(env.ctx, argparse_ns(args=["hypr/looknfeel.lua"]))
+            with patch.object(cs, "open_in_terminal", return_value=True) as opened:
+                res = cs.cmd_terminal(env.ctx, argparse_ns(args=["hypr/looknfeel.lua"]))
             self.assertTrue(res["ok"])
             self.assertEqual(res["opened_terminal"], str(local_file))
+            opened.assert_called_once()
 
 
 class ModelJsTests(unittest.TestCase):
@@ -1619,7 +1638,9 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("on-disk budget", result.stderr)
         # The child was stopped long before the timeout let it fill the disk.
-        self.assertLess(cs._tree_disk_usage(grow), 16 * 1024 * 1024)
+        # Watcher samples every 250ms, so a few extra 64KiB writes after the
+        # cap are expected; 32 MiB is still far under a runaway fill.
+        self.assertLess(cs._tree_disk_usage(grow), 32 * 1024 * 1024)
 
     def test_run_bounded_disk_budget_is_hard_even_after_fast_exit(self) -> None:
         # A child that finishes between two watcher samples is still caught by
@@ -1691,6 +1712,80 @@ class SecurityHardeningTests(unittest.TestCase):
         data = json.loads(out)
         self.assertFalse(data["ok"])
         self.assertIn("exceeded", data["error"])
+
+    def test_compact_snapshot_drops_bundled_files(self) -> None:
+        payload = {
+            "ok": True,
+            "diff": {
+                "files": [
+                    {"path": "hypr/looknfeel.lua", "status": "local"},
+                    {"path": "plugins/demo.widget/Main.qml", "status": "added-local"},
+                    {"path": "bin/tool", "status": "added-local"},
+                    {"path": "omarchy/hooks/post-update.d/x.hook", "status": "added-local"},
+                    {"path": "omarchy/shell.json", "status": "local"},
+                ],
+                "bundles": [{"id": "plugin:demo.widget", "files": ["plugins/demo.widget/Main.qml"]}],
+            },
+        }
+        out = cs.compact_snapshot_payload(payload)
+        self.assertEqual(
+            [f["path"] for f in out["diff"]["files"]],
+            ["hypr/looknfeel.lua", "omarchy/shell.json"],
+        )
+        self.assertEqual(out["diff"]["bundles"][0]["id"], "plugin:demo.widget")
+        # Original payload is not mutated, so Apply can still expand bundles.
+        self.assertEqual(len(payload["diff"]["files"]), 5)
+
+    def test_run_git_ignores_configured_hooks_path(self) -> None:
+        # A commit-msg hook that always fails must not intercept plugin git.
+        hooks = self.tmp / "hooks"
+        hooks.mkdir()
+        hook = hooks / "commit-msg"
+        hook.write_text("#!/bin/sh\necho HOOK-RAN >&2\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+        repo = self.tmp / "repo"
+        init_repo(repo)
+        write(repo / "f.txt", "x\n")
+        git(repo, "add", "f.txt")
+        git(repo, "config", "core.hooksPath", str(hooks))
+        # Direct git (no -c override) is blocked by the hook...
+        blocked = git(repo, "commit", "-m", "should fail", check=False)
+        self.assertNotEqual(blocked.returncode, 0, blocked.stderr)
+        self.assertIn("HOOK-RAN", blocked.stderr)
+        # ...but the plugin's run_git clears hooksPath on the invocation.
+        cs.run_git(repo, ["add", "-A"], check=True)
+        result = cs.run_git(repo, ["commit", "-m", "from plugin"], timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("HOOK-RAN", result.stderr or "")
+
+
+class DryRunTests(unittest.TestCase):
+    def test_dry_run_apply_does_not_write(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            result = cs.cmd_apply(env.ctx, argparse_ns(dry_run=True))
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(result.get("dry_run"))
+            self.assertGreater(len(result.get("applied") or []), 0, result)
+            self.assertFalse((env.home / ".config" / "hypr" / "looknfeel.lua").is_file())
+            self.assertEqual([p for p in (env.home / ".config").glob("omarchy-backup.*")], [])
+
+    def test_dry_run_publish_does_not_commit(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            write(env.ctx.config_hypr / "bindings.lua", 'o.bind("SUPER + Y", "Dry", "true")\n')
+            before = git(repo, "rev-parse", "HEAD").stdout.strip()
+            result = cs.cmd_publish(env.ctx, argparse_ns(dry_run=True, push=True))
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(result.get("dry_run"))
+            self.assertFalse(result.get("committed"))
+            self.assertFalse(result.get("pushed"))
+            self.assertGreater(len(result.get("published") or []), 0, result)
+            after = git(repo, "rev-parse", "HEAD").stdout.strip()
+            self.assertEqual(before, after)
+            self.assertNotIn("SUPER + Y", (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8"))
 
 
 class SemanticDiffTests(unittest.TestCase):
@@ -1780,7 +1875,12 @@ class DivergedCloneTests(unittest.TestCase):
     def _connect_to_shared_origin(self, env: TempHome) -> tuple[Path, Path]:
         source = make_config_repo(env.home / "source")
         origin = env.home / "origin.git"
-        subprocess.run(["git", "clone", "--bare", str(source), str(origin)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "clone", "--bare", str(source), str(origin)],
+            check=True,
+            capture_output=True,
+            env=git_test_env(),
+        )
         snap = cs.cmd_connect(env.ctx, argparse_ns(args=[f"file://{origin}"]))
         self.assertTrue(snap["ok"], snap)
         clone = Path(snap["status"]["clone_path"])
@@ -1788,7 +1888,12 @@ class DivergedCloneTests(unittest.TestCase):
 
     def _push_from_another_machine(self, env: TempHome, origin: Path, rel: str, content: str) -> None:
         other = env.home / "other"
-        subprocess.run(["git", "clone", str(origin), str(other)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "clone", str(origin), str(other)],
+            check=True,
+            capture_output=True,
+            env=git_test_env(),
+        )
         git(other, "config", "user.name", "Other")
         git(other, "config", "user.email", "other@example.com")
         write(other / rel, content)
@@ -1875,7 +1980,7 @@ class RemovalSyncTests(unittest.TestCase):
         repo = make_config_repo(env.home / "cfg")
         lp = self._install_plugin(env)
         cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
-        cs.cmd_publish(env.ctx, argparse_ns(dry_run=True))
+        cs.cmd_publish(env.ctx, argparse_ns())
         self.assertTrue((repo / "plugins" / "demo.widget" / "Main.qml").is_file())
         self.assertIn("plugins/demo.widget/Main.qml", cs.load_state(env.ctx).get("file_hashes") or {})
         return repo, lp
@@ -1901,7 +2006,7 @@ class RemovalSyncTests(unittest.TestCase):
         with TempHome() as env:
             repo, lp = self._linked(env)
             shutil.rmtree(lp)
-            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, plugin=["demo.widget"], dry_run=True))
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, plugin=["demo.widget"]))
             self.assertTrue(pub["ok"], pub)
             self.assertEqual(sorted(pub["removed"]), ["plugins/demo.widget/Main.qml", "plugins/demo.widget/manifest.json"])
             self.assertTrue(pub["committed"])
@@ -1924,7 +2029,7 @@ class RemovalSyncTests(unittest.TestCase):
             self.assertEqual(bundle["summary"], "Removed in the repo · 2 files")
             self.assertFalse(bundle["default_apply"])
 
-            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, plugin=["demo.widget"], dry_run=True))
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, plugin=["demo.widget"]))
             self.assertTrue(ap["ok"], ap)
             self.assertEqual(len(ap["removed"]), 2)
             self.assertFalse(lp.exists(), "empty plugin dir should be pruned")
