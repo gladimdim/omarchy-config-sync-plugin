@@ -524,6 +524,18 @@ def validate_safe_rel_path(rel: str) -> bool:
     return not any(":" in p or "\0" in p or "\n" in p for p in parts)
 
 
+def read_source_from_stdin() -> str:
+    """Read the pasted URL as a single line, never to EOF.
+
+    The panel writes the URL and keeps the pipe open, so read(n) would block
+    until n bytes arrive or the writer exits -- neither happens, and the panel
+    sits on "Fetching and checking the repo..." forever. A URL never contains a
+    newline, so one capped line is the whole input; readline() also returns at
+    EOF for a piped caller that closes stdin.
+    """
+    return sys.stdin.readline(MAX_URL_INPUT_BYTES).strip()
+
+
 def normalize_source(raw: str) -> tuple[str, str]:
     src = (raw or "").strip()
     if not src or src.startswith("-") or "\0" in src or "\n" in src:
@@ -2641,7 +2653,7 @@ def cmd_snapshot(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 def cmd_connect(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     source_raw = ""
     if getattr(args, "stdin", False):
-        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
+        source_raw = read_source_from_stdin()
     if not source_raw:
         source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)
@@ -3557,7 +3569,7 @@ def cmd_set_url(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     repo = configured_repo(ctx)
     source_raw = ""
     if getattr(args, "stdin", False):
-        source_raw = sys.stdin.read(MAX_URL_INPUT_BYTES).strip()
+        source_raw = read_source_from_stdin()
     if not source_raw:
         source_raw = " ".join(args.args).strip() or (args.url or "")
     kind, value = normalize_source(source_raw)

@@ -1980,5 +1980,73 @@ class RemovalSyncTests(unittest.TestCase):
             self.assertFalse(cs.remove_mapped_file(item, "apply", root))
 
 
+class StdinConnectTests(unittest.TestCase):
+    """The panel writes the pasted URL and leaves the pipe open. `connect
+    --stdin` must still finish, or the widget hangs on "Fetching and checking
+    the repo..." with no error and no timeout."""
+
+    def test_connect_stdin_finishes_while_the_writer_holds_the_pipe_open(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            child_env = os.environ.copy()
+            child_env["HOME"] = str(env.home)
+            child_env["XDG_DATA_HOME"] = str(env.data)
+            out = env.home / "out.json"
+            with out.open("w") as sink:
+                proc = subprocess.Popen(
+                    [sys.executable, "-u", str(SCRIPTS / "config_sync.py"), "connect", "--stdin"],
+                    stdin=subprocess.PIPE,
+                    stdout=sink,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    env=child_env,
+                )
+                try:
+                    assert proc.stdin is not None
+                    proc.stdin.write(str(repo) + "\n")
+                    proc.stdin.flush()
+                    # Deliberately no close(): this is what Process.write() does.
+                    try:
+                        code = proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                        self.fail("connect --stdin blocked on stdin instead of acting on the line it was given")
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except (BrokenPipeError, OSError):
+                        pass
+            self.assertEqual(code, 0)
+            payload = json.loads(out.read_text())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["connected"])
+
+    def test_read_source_from_stdin_takes_one_line(self) -> None:
+        with patch("sys.stdin", io.StringIO("https://example.com/a/b.git\ntrailing\n")):
+            self.assertEqual(cs.read_source_from_stdin(), "https://example.com/a/b.git")
+
+
+class PanelStdinWiringTests(unittest.TestCase):
+    """Guards the QML half of the same bug. Process.write() issued in the same
+    tick as running = true is dropped before the child exists, and stdin left
+    open never delivers EOF."""
+
+    def test_panel_writes_stdin_on_started_and_closes_it(self) -> None:
+        panel = (ROOT / "Panel.qml").read_text(encoding="utf-8")
+        self.assertIn("onStarted:", panel)
+        started = panel.split("onStarted:", 1)[1].split("stdout:", 1)[0]
+        self.assertIn("syncProc.write(", started)
+        self.assertIn("syncProc.stdinEnabled = false", started)
+
+    def test_panel_run_does_not_write_stdin_inline(self) -> None:
+        panel = (ROOT / "Panel.qml").read_text(encoding="utf-8")
+        run_body = panel.split("function run(args, stdinData) {", 1)[1].split("\n  }", 1)[0]
+        self.assertNotIn("syncProc.write(", run_body)
+        self.assertIn("syncProc.stdinData =", run_body)
+        # stdin must be re-opened, since the previous run closed it to send EOF.
+        self.assertIn("syncProc.stdinEnabled = true", run_body)
+
+
 if __name__ == "__main__":
     unittest.main()

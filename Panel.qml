@@ -673,11 +673,13 @@ Panel {
     busy = true
     lastError = ""
     pendingAction = args[0] || ""
+    // Stdin is written from syncProc.onStarted, not here: a write() issued in
+    // the same tick as running = true lands before the child exists and is
+    // silently dropped. A previous run closed stdin to send EOF, so re-open it.
+    syncProc.stdinData = String(stdinData || "")
+    syncProc.stdinEnabled = true
     syncProc.command = ["python3", "-u", root.scriptPath].concat(args)
     syncProc.running = true
-    if (stdinData) {
-      syncProc.write(String(stdinData) + "\n")
-    }
   }
 
   function handleOutput(text) {
@@ -744,7 +746,15 @@ Panel {
 
   Process {
     id: syncProc
+    property string stdinData: ""
     stdinEnabled: true
+    onStarted: {
+      if (syncProc.stdinData)
+        syncProc.write(syncProc.stdinData + "\n")
+      // Close stdin so the helper sees EOF. Without this the child blocks in
+      // read() until its byte cap and the panel never leaves "Fetching…".
+      syncProc.stdinEnabled = false
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
