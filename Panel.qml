@@ -175,7 +175,12 @@ Panel {
       if (isPicked("s", bothShortcuts[i].keys) && !bothPicks["s:" + bothShortcuts[i].keys]) n++
     }
     for (i = 0; i < bothPlugins.length; i++) {
-      if (isPicked("p", bothPlugins[i].id) && !bothPicks["p:" + bothPlugins[i].id]) n++
+      // A plugin is only ever rendered as its plugin:<id> bundle row, so that
+      // row's Keep local / Take repo pick is the one the user can actually
+      // make. Gating on the p: key alone leaves Apply permanently blocked.
+      if (isPicked("p", bothPlugins[i].id)
+          && !bothPicks["p:" + bothPlugins[i].id]
+          && !bothPicks["g:plugin:" + bothPlugins[i].id]) n++
     }
     for (i = 0; i < bothBundles.length; i++) {
       if (isPicked("g", bothBundles[i].id) && !bothPicks["g:" + bothBundles[i].id]) n++

@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2307,6 +2308,85 @@ class PluginVersionTests(unittest.TestCase):
         misreports which version is installed."""
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(cs.PLUGIN_VERSION, manifest["version"])
+
+
+class UnresolvedBothGateTests(unittest.TestCase):
+    """The Apply/Publish gate must be satisfiable from the UI.
+
+    Plugins are rendered as their ``plugin:<id>`` bundle row (kind "g"); no row
+    of kind "p" is ever built, so a gate that demands a ``bothPicks["p:<id>"]``
+    entry can never be cleared by clicking Keep local / Take repo.
+    """
+
+    def _unresolved_both(self, picks: dict, both_picks: dict) -> int:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+
+        panel = (ROOT / "Panel.qml").read_text(encoding="utf-8")
+        match = re.search(
+            r"readonly property int unresolvedBoth: \{\n(.*?)\n  \}\n", panel, re.S
+        )
+        self.assertIsNotNone(match, "unresolvedBoth block not found in Panel.qml")
+        body = match.group(1)
+
+        model_path = ROOT / "Model.js"
+        script = f"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync({json.dumps(str(model_path))}, 'utf8')
+  .replace(/^\\.pragma\\s+library\\s*/m, '');
+const ctx = {{}};
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+
+const plugins = [{{
+  id: 'demo.plugin', name: 'demo.plugin', status: 'both', removal: false,
+  files: ['plugins/demo.plugin/Main.qml'], changed_count: 1,
+  default_apply: false, default_publish: true
+}}];
+const bundles = [{{
+  id: 'plugin:demo.plugin', kind: 'plugin', plugin_id: 'demo.plugin',
+  name: 'demo.plugin', summary: 'Plugin updates · 1 file', status: 'both',
+  removal: false, files: ['plugins/demo.plugin/Main.qml'], changed_count: 1,
+  default_apply: false, default_publish: false
+}}];
+
+const bothFiles = [];
+const bothShortcuts = [];
+const bothPlugins = ctx.filesByStatus(plugins, ['both']);
+const bothBundles = ctx.filesByStatus(bundles, ['both']);
+const themeDiff = null;
+
+const picks = {json.dumps("PICKS")};
+const bothPicks = {json.dumps("BOTHPICKS")};
+function isPicked(kind, id) {{ return !!picks[kind + ':' + id]; }}
+
+const unresolvedBoth = (function () {{
+{body}
+}})();
+console.log(JSON.stringify({{ unresolvedBoth: unresolvedBoth }}));
+"""
+        script = script.replace(json.dumps("PICKS"), json.dumps(picks))
+        script = script.replace(json.dumps("BOTHPICKS"), json.dumps(both_picks))
+        result = subprocess.run(
+            [node, "-e", script], capture_output=True, text=True, timeout=30
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)["unresolvedBoth"]
+
+    def test_unpicked_both_plugin_still_blocks(self) -> None:
+        """seedPicks() checks a both-status plugin (default_publish is true);
+        with no side chosen anywhere, the gate must still hold."""
+        picks = {"p:demo.plugin": True, "g:plugin:demo.plugin": True}
+        self.assertGreater(self._unresolved_both(picks, {}), 0)
+
+    def test_picking_a_side_on_the_plugin_bundle_row_clears_the_gate(self) -> None:
+        """The bundle row is the only row the panel renders for a plugin, so its
+        Take repo pick has to satisfy the gate — otherwise Apply is unreachable."""
+        picks = {"p:demo.plugin": True, "g:plugin:demo.plugin": True}
+        both_picks = {"g:plugin:demo.plugin": "repo"}
+        self.assertEqual(self._unresolved_both(picks, both_picks), 0)
 
 
 if __name__ == "__main__":
