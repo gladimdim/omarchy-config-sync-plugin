@@ -2408,6 +2408,53 @@ def portable_shortcut_selection(
     return filter_portable_shortcuts(text, keys)
 
 
+def unloadable_bind_entries(text: str) -> list[dict[str, Any]]:
+    """Binds that would abort Hyprland if the file is copied as a whole.
+
+    A helper function defined in the same file is not cherry-pick portable, but
+    the file still loads. An identifier with no definition does not.
+    """
+    return [
+        e
+        for e in extract_bind_statements(text)
+        if not e.get("portable", True) and e.get("skip_reason") == "command is not self-contained"
+    ]
+
+
+def drop_unloadable_bindings_file(
+    chosen: list[dict[str, Any]],
+    source: Path,
+    source_within: Path | None,
+    shortcut_keys: list[str],
+    skipped_shortcuts: list[dict[str, str]],
+    diff_shortcuts: list[dict[str, Any]],
+    incoming_statuses: set[str],
+    portable_flag: str,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, str]]]:
+    """Refuse a whole-file bindings.lua copy that contains undefined names."""
+    if not any(item.get("path") == "hypr/bindings.lua" for item in chosen):
+        return chosen, shortcut_keys, skipped_shortcuts
+    text = read_text(source, within=source_within) if source.is_file() else ""
+    unloadable = unloadable_bind_entries(text)
+    if not unloadable:
+        return chosen, shortcut_keys, skipped_shortcuts
+    chosen = [item for item in chosen if item.get("path") != "hypr/bindings.lua"]
+    seen = {s["keys"] for s in skipped_shortcuts}
+    for entry in unloadable:
+        if entry["keys"] not in seen:
+            skipped_shortcuts.append({"keys": entry["keys"], "reason": str(entry.get("skip_reason") or "not a portable binding")})
+            seen.add(entry["keys"])
+    if not shortcut_keys:
+        shortcut_keys = [
+            row["keys"]
+            for row in diff_shortcuts
+            if not row.get("hidden")
+            and row.get(portable_flag, True)
+            and row.get("status") in incoming_statuses
+        ]
+    return chosen, shortcut_keys, skipped_shortcuts
+
+
 def _rollup_statuses(statuses: list[str]) -> str | None:
     unique = set(s for s in statuses if s not in {"identical", "machine"})
     if not unique:
@@ -3583,12 +3630,13 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         extra_theme = expand_theme_paths(diff["files"], "apply")
         wanted = set() if wanted is None else set(wanted)
         wanted |= extra_theme
+    requested_shortcuts = list(shortcut_keys)
     skipped_shortcuts: list[dict[str, str]] = []
     if shortcut_keys:
         shortcut_keys, skipped_shortcuts = portable_shortcut_selection(
             repo / "hypr" / "bindings.lua", shortcut_keys, source_within=repo
         )
-    if shortcut_keys and wanted is not None:
+    if requested_shortcuts and wanted is not None:
         wanted.discard("hypr/bindings.lua")
     unresolved_both = [
         i
@@ -3601,8 +3649,18 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"both": [i["path"] for i in unresolved_both]},
         )
     chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "apply")
-    if shortcut_keys:
+    if requested_shortcuts:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
+    chosen, shortcut_keys, skipped_shortcuts = drop_unloadable_bindings_file(
+        chosen,
+        repo / "hypr" / "bindings.lua",
+        repo,
+        shortcut_keys,
+        skipped_shortcuts,
+        diff.get("shortcuts") or [],
+        {"added-repo", "repo", "differs"},
+        "repo_portable",
+    )
     if not chosen and not shortcut_keys:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
@@ -3771,12 +3829,13 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         extra_theme = expand_theme_paths(diff["files"], "publish")
         wanted = set() if wanted is None else set(wanted)
         wanted |= extra_theme
+    requested_shortcuts = list(shortcut_keys)
     skipped_shortcuts: list[dict[str, str]] = []
     if shortcut_keys:
         shortcut_keys, skipped_shortcuts = portable_shortcut_selection(
             ctx.config_hypr / "bindings.lua", shortcut_keys, source_within=ctx.home
         )
-    if shortcut_keys and wanted is not None:
+    if requested_shortcuts and wanted is not None:
         wanted.discard("hypr/bindings.lua")
     unresolved_both = [
         i
@@ -3789,8 +3848,18 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"both": [i["path"] for i in unresolved_both]},
         )
     chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "publish")
-    if shortcut_keys:
+    if requested_shortcuts:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
+    chosen, shortcut_keys, skipped_shortcuts = drop_unloadable_bindings_file(
+        chosen,
+        ctx.config_hypr / "bindings.lua",
+        ctx.home,
+        shortcut_keys,
+        skipped_shortcuts,
+        diff.get("shortcuts") or [],
+        {"added-local", "local", "differs"},
+        "local_portable",
+    )
     if not chosen and not shortcut_keys:
         if getattr(args, "dry_run", False):
             snap = build_snapshot(ctx, fetch=False)

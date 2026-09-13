@@ -438,6 +438,18 @@ class ShortcutTests(unittest.TestCase):
         self.assertIn('os.getenv("HOME")', rows[0]["sync_raw"])
         self.assertNotIn("quarter_snap", rows[0]["sync_raw"])
 
+    def test_path_local_bind_with_options_table_is_portable(self) -> None:
+        text = (
+            'local voxclaude = os.getenv("HOME") .. "/.local/bin/voxclaude"\n'
+            'o.bind("SUPER + D", "Talk to Claude (release)", voxclaude .. " stop", { release = true })\n'
+        )
+        rows = cs.extract_bind_statements(text)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["portable"])
+        self.assertIn("{ release = true }", rows[0]["sync_raw"])
+        self.assertIn('os.getenv("HOME")', rows[0]["sync_raw"])
+        self.assertNotIn("voxclaude ..", rows[0]["sync_raw"])
+
     def test_function_bind_is_not_portable(self) -> None:
         text = (
             "local function send_shortcut_once(mods, key)\n"
@@ -474,6 +486,45 @@ class ShortcutTests(unittest.TestCase):
             )
             self.assertTrue(applied["ok"], applied)
             self.assertTrue(applied.get("skipped_shortcuts"))
+            text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
+            self.assertNotIn("quarter_snap", text)
+
+    def test_default_apply_does_not_copy_unloadable_binds(self) -> None:
+        """Whole-file Apply used to bypass cherry-pick and still break Hyprland."""
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(
+                repo / "hypr" / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n'
+                'o.bind("SUPER + Q", "Snap window: bottom-right", quarter_snap .. " br")\n',
+            )
+            write(
+                env.ctx.config_hypr / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n',
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            applied = cs.cmd_apply(env.ctx, argparse_ns())
+            self.assertTrue(applied["ok"], applied)
+            text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
+            self.assertNotIn("quarter_snap", text)
+            self.assertTrue(applied.get("skipped_shortcuts"))
+            self.assertIn("SUPER + SHIFT + R", text)
+
+    def test_resync_does_not_copy_unloadable_binds(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(
+                repo / "hypr" / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n'
+                'o.bind("SUPER + Q", "Snap", quarter_snap .. " br")\n',
+            )
+            write(
+                env.ctx.config_hypr / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n',
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            result = cs.cmd_resync(env.ctx, argparse_ns(side="repo"))
+            self.assertTrue(result["ok"], result)
             text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
             self.assertNotIn("quarter_snap", text)
 
