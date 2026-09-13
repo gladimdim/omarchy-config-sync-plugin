@@ -427,6 +427,177 @@ class ShortcutTests(unittest.TestCase):
         self.assertIn('o.bind("SUPER + SHIFT + C", "Screenshot", "new")', merged)
         self.assertNotIn('"old"', merged)
 
+    def test_path_local_bind_is_portable_after_inline(self) -> None:
+        text = (
+            'local quarter_snap = os.getenv("HOME") .. "/.local/bin/quarter-snap"\n'
+            'o.bind("SUPER + CTRL + ALT + DOWN", "Snap window: bottom-right", quarter_snap .. " br")\n'
+        )
+        rows = cs.extract_bind_statements(text)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["portable"])
+        self.assertIn('os.getenv("HOME")', rows[0]["sync_raw"])
+        self.assertNotIn("quarter_snap", rows[0]["sync_raw"])
+
+    def test_path_local_bind_with_options_table_is_portable(self) -> None:
+        text = (
+            'local voxclaude = os.getenv("HOME") .. "/.local/bin/voxclaude"\n'
+            'o.bind("SUPER + D", "Talk to Claude (release)", voxclaude .. " stop", { release = true })\n'
+        )
+        rows = cs.extract_bind_statements(text)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["portable"])
+        self.assertIn("{ release = true }", rows[0]["sync_raw"])
+        self.assertIn('os.getenv("HOME")', rows[0]["sync_raw"])
+        self.assertNotIn("voxclaude ..", rows[0]["sync_raw"])
+
+    def test_function_bind_is_not_portable(self) -> None:
+        text = (
+            "local function send_shortcut_once(mods, key)\n"
+            "  return function() end\n"
+            "end\n"
+            'o.bind("SUPER + X", "Cut", send_shortcut_once("CTRL", "X"))\n'
+        )
+        rows = cs.extract_bind_statements(text)
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["portable"])
+        self.assertIn("local", rows[0]["skip_reason"])
+
+    def test_poisoned_repo_bind_is_not_applied(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(
+                repo / "hypr" / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n'
+                'o.bind("SUPER + Q", "Snap window: bottom-right", quarter_snap .. " br")\n',
+            )
+            write(
+                env.ctx.config_hypr / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n',
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            rows = {r["keys"]: r for r in snap["diff"]["shortcuts"]}
+            self.assertIn("SUPER + Q", rows)
+            self.assertFalse(rows["SUPER + Q"]["default_apply"])
+            self.assertIn("skipped", rows["SUPER + Q"]["detail"])
+            applied = cs.cmd_apply(
+                env.ctx,
+                argparse_ns(explicit=True, files="", shortcut=["SUPER + Q"]),
+            )
+            self.assertTrue(applied["ok"], applied)
+            self.assertTrue(applied.get("skipped_shortcuts"))
+            text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
+            self.assertNotIn("quarter_snap", text)
+
+    def test_default_apply_does_not_copy_unloadable_binds(self) -> None:
+        """Whole-file Apply used to bypass cherry-pick and still break Hyprland."""
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(
+                repo / "hypr" / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n'
+                'o.bind("SUPER + Q", "Snap window: bottom-right", quarter_snap .. " br")\n',
+            )
+            write(
+                env.ctx.config_hypr / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n',
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            applied = cs.cmd_apply(env.ctx, argparse_ns())
+            self.assertTrue(applied["ok"], applied)
+            text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
+            self.assertNotIn("quarter_snap", text)
+            self.assertTrue(applied.get("skipped_shortcuts"))
+            self.assertIn("SUPER + SHIFT + R", text)
+
+    def test_resync_does_not_copy_unloadable_binds(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(
+                repo / "hypr" / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n'
+                'o.bind("SUPER + Q", "Snap", quarter_snap .. " br")\n',
+            )
+            write(
+                env.ctx.config_hypr / "bindings.lua",
+                'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n',
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            result = cs.cmd_resync(env.ctx, argparse_ns(side="repo"))
+            self.assertTrue(result["ok"], result)
+            text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
+            self.assertNotIn("quarter_snap", text)
+
+    def test_publish_inlines_path_local_and_does_not_rediff(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_apply(env.ctx, argparse_ns())
+            bindings = env.ctx.config_hypr / "bindings.lua"
+            original = bindings.read_text(encoding="utf-8")
+            write(
+                bindings,
+                original
+                + 'local quarter_snap = os.getenv("HOME") .. "/.local/bin/quarter-snap"\n'
+                + 'o.bind("SUPER + Q", "Snap window: bottom-right", quarter_snap .. " br")\n',
+            )
+            published = cs.cmd_publish(
+                env.ctx,
+                argparse_ns(explicit=True, files="", shortcut=["SUPER + Q"]),
+            )
+            self.assertTrue(published["ok"], published)
+            repo_text = (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8")
+            self.assertIn('os.getenv("HOME")', repo_text)
+            self.assertNotIn("quarter_snap ..", repo_text)
+            remaining = {r["keys"] for r in cs.cmd_snapshot(env.ctx, argparse_ns())["diff"]["shortcuts"]}
+            self.assertNotIn("SUPER + Q", remaining)
+
+
+class HelperScriptDiscoveryTests(unittest.TestCase):
+    def test_referenced_local_helper_is_offered_unrelated_bin_is_not(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(env.ctx.local_bin / "hypr-quarter-snap", "#!/bin/bash\necho snap\n")
+            write(env.ctx.local_bin / "pip", "#!/bin/bash\necho noise\n")
+            write(
+                env.ctx.config_hypr / "bindings.lua",
+                'local quarter_snap = os.getenv("HOME") .. "/.local/bin/hypr-quarter-snap"\n'
+                'o.bind("SUPER + Q", "Snap", quarter_snap .. " br")\n',
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            paths = [f["path"] for f in snap["diff"]["files"]]
+            self.assertIn("bin/hypr-quarter-snap", paths)
+            self.assertNotIn("bin/pip", paths)
+            item = next(f for f in snap["diff"]["files"] if f["path"] == "bin/hypr-quarter-snap")
+            self.assertEqual(item["status"], "added-local")
+            self.assertTrue(item["local_exists"])
+            self.assertFalse(item["repo_exists"])
+            bundle = next(b for b in snap["diff"]["bundles"] if b.get("kind") == "bin")
+            self.assertIn("bin/hypr-quarter-snap", bundle["files"])
+
+    def test_string_command_helper_is_offered_and_publishable(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(env.ctx.local_bin / "hypr-quarter-snap", "#!/bin/bash\necho snap\n")
+            write(
+                env.ctx.config_hypr / "bindings.lua",
+                'o.bind("SUPER + Q", "Snap", "hypr-quarter-snap br")\n',
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertIn(
+                "bin/hypr-quarter-snap",
+                [f["path"] for f in snap["diff"]["files"]],
+            )
+            published = cs.cmd_publish(
+                env.ctx,
+                argparse_ns(explicit=True, files="bin/hypr-quarter-snap"),
+            )
+            self.assertTrue(published["ok"], published)
+            self.assertTrue((repo / "bin" / "hypr-quarter-snap").is_file())
+            self.assertIn("echo snap", (repo / "bin" / "hypr-quarter-snap").read_text(encoding="utf-8"))
+
 
 def extract_map(text: str) -> dict:
     return {e["keys"]: e for e in cs.extract_bind_statements(text)}

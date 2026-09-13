@@ -378,12 +378,20 @@ Panel {
     return out
   }
 
+  function shortcutPortableFor(s, direction) {
+    if (!s) return true
+    if (s.status === "both")
+      return direction === "apply" ? s.repo_portable !== false : s.local_portable !== false
+    return s.portable !== false
+  }
+
   function selectedApplyShortcuts() {
     var out = []
     var i, s
     for (i = 0; i < shortcutDiffs.length; i++) {
       s = shortcutDiffs[i]
       if (!isPicked("s", s.keys)) continue
+      if (!shortcutPortableFor(s, "apply")) continue
       if (s.status === "both") {
         if (bothPicks["s:" + s.keys] === "repo") out.push(s.keys)
         continue
@@ -399,6 +407,7 @@ Panel {
     for (i = 0; i < shortcutDiffs.length; i++) {
       s = shortcutDiffs[i]
       if (!isPicked("s", s.keys)) continue
+      if (!shortcutPortableFor(s, "publish")) continue
       if (s.status === "both") {
         if (bothPicks["s:" + s.keys] === "local") out.push(s.keys)
         continue
