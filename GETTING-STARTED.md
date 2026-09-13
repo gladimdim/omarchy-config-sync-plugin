@@ -108,7 +108,7 @@ This is the last “are you sure?” before your desktop layout lives on GitHub.
 - **Plugins** — everything under `~/.config/omarchy/plugins/` except this plugin itself
 - **Configs** — Hyprland files, `shell.json`, hooks, terminals
 
-**Display layout** (`hypr/monitors.lua`) stays on this machine. A second machine usually has different screens. Turn on **Include display layout** on the Changes tab only if you mean it.
+**Machine-local files** stay on this machine: display layout (`hypr/monitors.lua`) and anything you list as `machine_local` in `.omarchy-config.json`. Overlay files named `*.local.lua` / `local.conf` under `hypr/` are not synced at all. Turn on **Include machine-local files** on the Changes tab only if you mean it.
 
 When it looks right, click **Publish this machine**. Confirm. The plugin copies those files into the private repo, commits, and pushes.
 

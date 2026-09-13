@@ -2472,6 +2472,64 @@ class SourceArgumentTests(unittest.TestCase):
             self.assertEqual(cs.read_source_argument(args), "https://github.com/c/d.git")
 
 
+class MachineLocalOverlayTests(unittest.TestCase):
+    def test_overlay_names_do_not_match_plugin_local_qml(self) -> None:
+        self.assertTrue(cs.is_local_overlay_name("input.local.lua"))
+        self.assertTrue(cs.is_local_overlay_name("local.conf"))
+        self.assertTrue(cs.is_local_overlay_name("local.toml"))
+        self.assertTrue(cs.is_local_overlay_name("ghostty.local"))
+        self.assertFalse(cs.is_local_overlay_name("Local.qml"))
+        self.assertFalse(cs.is_local_overlay_name("local.js"))
+        self.assertFalse(cs.is_local_overlay_name("local.json"))
+        self.assertFalse(cs.is_local_overlay_name("hyprsunset.conf"))
+        self.assertFalse(cs.is_local_overlay_name("shell.toml"))
+        self.assertFalse(cs.is_local_overlay_name("looknfeel.lua"))
+        self.assertFalse(cs.is_skipped_file("Local.qml"))
+        self.assertFalse(cs.is_skipped_file("hyprsunset.conf"))
+
+    def test_hypr_overlays_are_not_inventoried_plugin_local_qml_is(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "hypr" / "input.local.lua", "hl.config({ input = { touchpad = { natural_scroll = true } } })\n")
+            write(repo / "plugins" / "demo.widget" / "Local.qml", "import QtQuick\nItem {}\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "laptop overlay and plugin Local.qml")
+            write(env.ctx.config_hypr / "input.local.lua", "LOCAL overlay\n")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            paths = [f["path"] for f in snap["diff"]["files"]]
+            self.assertNotIn("hypr/input.local.lua", paths)
+            self.assertIn("plugins/demo.widget/Local.qml", paths)
+
+    def test_marker_machine_local_paths_reject_escapes(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(
+                repo / cs.MARKER_NAME,
+                json.dumps(
+                    {
+                        "format": "omarchy-config",
+                        "version": 1,
+                        "synced_by": cs.PLUGIN_ID,
+                        "machine_local": ["omarchy/shell.toml", "../etc/passwd", "omarchy/shell.toml"],
+                    }
+                )
+                + "\n",
+            )
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "marker")
+            paths = cs.machine_local_paths(repo)
+            self.assertIn("hypr/monitors.lua", paths)
+            self.assertIn("omarchy/shell.toml", paths)
+            self.assertNotIn("../etc/passwd", paths)
+            self.assertNotIn("hypr/hyprsunset.conf", paths)
+
+    def test_hyprsunset_stays_portable(self) -> None:
+        self.assertTrue(cs.is_machine_local("hypr/monitors.lua"))
+        self.assertFalse(cs.is_machine_local("hypr/hyprsunset.conf"))
+        self.assertFalse(cs.is_machine_local("hypr/input.lua"))
+
+
 class PluginVersionTests(unittest.TestCase):
     def test_plugin_version_matches_manifest(self) -> None:
         """The helper reports its own version to the panel, so a release that
