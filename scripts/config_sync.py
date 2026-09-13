@@ -68,12 +68,21 @@ BIND_RE = re.compile(
     re.MULTILINE,
 )
 UNBIND_RE = re.compile(r"""hl\.unbind\(\s*"([^"]+)"\s*\)""")
+LUA_CHAIN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\b")
+LUA_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+LUA_LOCAL_ASSIGN_RE = re.compile(r"^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
+LUA_LOCAL_FUNCTION_RE = re.compile(r"^\s*local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+LUA_LOCAL_NAME_RE = re.compile(r"^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+LOCAL_BIN_NAME_RE = re.compile(r"\.local/bin/([A-Za-z0-9][A-Za-z0-9._+-]*)")
+HELPER_BASENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+# Roots that stay valid after a bind is copied into another machine's file.
+SAFE_LUA_ROOTS = {"hl", "os", "true", "false", "nil", "and", "or", "not"}
 
 SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules"}
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.22"
+PLUGIN_VERSION = "1.2.23"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -1289,6 +1298,78 @@ def terminal_map(ctx: Context) -> dict[str, Path]:
     }
 
 
+def helper_scan_paths(ctx: Context, repo: Path) -> list[tuple[Path, Path]]:
+    """Hypr bindings/autostart and hook files that may name ~/.local/bin helpers."""
+    out: list[tuple[Path, Path]] = []
+    for root, within in ((ctx.config_hypr, ctx.home), (repo / "hypr", repo)):
+        if not root.is_dir():
+            continue
+        for name in ("bindings.lua", "autostart.lua", "hyprland.lua"):
+            path = root / name
+            if path.is_file() and not path.is_symlink():
+                out.append((path, within))
+    for root, within in (
+        (ctx.config_omarchy / "hooks", ctx.home),
+        (repo / "omarchy" / "hooks", repo),
+    ):
+        for path in iter_files(root):
+            out.append((path, within))
+    return out
+
+
+def helper_names_from_text(text: str) -> set[str]:
+    names = set(LOCAL_BIN_NAME_RE.findall(text))
+    for entry in extract_bind_statements(text):
+        for raw in (entry.get("raw"), entry.get("sync_raw")):
+            if not raw:
+                continue
+            names.update(LOCAL_BIN_NAME_RE.findall(raw))
+            command = bind_command_text(str(raw))
+            if command:
+                names.update(helper_names_from_command(command))
+    return names
+
+
+def helper_names_from_command(command: str) -> set[str]:
+    names = set(LOCAL_BIN_NAME_RE.findall(command))
+    stripped = command.strip()
+    if len(stripped) >= 2 and stripped[0] in "\"'" and stripped[-1] == stripped[0]:
+        inner = stripped[1:-1].strip()
+        token = inner.split(None, 1)[0] if inner else ""
+        if HELPER_BASENAME_RE.match(token):
+            names.add(token)
+    return names
+
+
+def referenced_local_helpers(ctx: Context, repo: Path) -> set[str]:
+    names: set[str] = set()
+    for path, within in helper_scan_paths(ctx, repo):
+        if file_too_large(path):
+            continue
+        names |= helper_names_from_text(read_text(path, within=within))
+    return names
+
+
+def collect_bin_names(ctx: Context, repo: Path) -> set[str]:
+    """Repo helpers plus local ~/.local/bin files the config actually names.
+
+    ~/.local/bin is not a curated tree (pip/npm shims live there), so local-only
+    files are offered only when bindings or hooks reference them.
+    """
+    names: set[str] = set()
+    repo_bin = repo / "bin"
+    if repo_bin.is_dir():
+        names.update(p.name for p in repo_bin.iterdir() if p.is_file() and not is_skipped_file(p.name))
+    if ctx.local_bin.is_dir():
+        for name in referenced_local_helpers(ctx, repo):
+            if is_skipped_file(name) or not validate_safe_rel_path(f"bin/{name}"):
+                continue
+            path = ctx.local_bin / name
+            if path.is_file() and not path.is_symlink() and not os.path.islink(path):
+                names.add(name)
+    return names
+
+
 def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     items: dict[str, dict[str, Any]] = {}
     if _tree_disk_usage(repo, MAX_REPO_DISK_BYTES) > MAX_REPO_DISK_BYTES:
@@ -1419,11 +1500,8 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         if local.is_file() or repo_file.is_file():
             add(rel, local, repo_file, "terminal")
 
-    bin_names: set[str] = set()
     repo_bin = repo / "bin"
-    if repo_bin.is_dir():
-        bin_names.update(p.name for p in repo_bin.iterdir() if p.is_file() and not is_skipped_file(p.name))
-    for name in sorted(bin_names):
+    for name in sorted(collect_bin_names(ctx, repo)):
         add(f"bin/{name}", ctx.local_bin / name, repo_bin / name, "bin")
 
     local_theme = ctx.theme_name_path
@@ -1887,6 +1965,209 @@ def strip_lua_comments(text: str) -> str:
     return "\n".join(lines)
 
 
+def _erase_lua_strings(expr: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch in "\"'":
+            quote = ch
+            j = i + 1
+            while j < n:
+                if expr[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if expr[j] == quote:
+                    j += 1
+                    break
+                j += 1
+            out.append(" " * (j - i))
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _erase_lua_tables(expr: str) -> str:
+    chars = list(_erase_lua_strings(expr))
+    depth = 0
+    start = -1
+    for i, ch in enumerate(chars):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                for k in range(start, i + 1):
+                    chars[k] = " "
+                start = -1
+    return "".join(chars)
+
+
+def _strip_trailing_lua_comment(expr: str) -> str:
+    masked = _erase_lua_strings(expr)
+    idx = masked.find("--")
+    if idx >= 0:
+        return expr[:idx].rstrip()
+    return expr.rstrip()
+
+
+def _lua_ident_chains(expr: str) -> list[str]:
+    return [m.group(1) for m in LUA_CHAIN_RE.finditer(_erase_lua_tables(expr))]
+
+
+def lua_expr_is_portable(expr: str) -> bool:
+    if not expr.strip():
+        return False
+    for chain in _lua_ident_chains(expr):
+        if chain.split(".", 1)[0] not in SAFE_LUA_ROOTS:
+            return False
+    return True
+
+
+def _replace_lua_idents(expr: str, mapping: dict[str, str]) -> str:
+    if not mapping:
+        return expr
+    out: list[str] = []
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch in "\"'":
+            quote = ch
+            j = i + 1
+            while j < n:
+                if expr[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if expr[j] == quote:
+                    j += 1
+                    break
+                j += 1
+            out.append(expr[i:j])
+            i = j
+            continue
+        match = LUA_IDENT_RE.match(expr, i)
+        if match:
+            name = match.group(0)
+            out.append(f"({mapping[name]})" if name in mapping else name)
+            i = match.end()
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def extract_portable_locals(text: str) -> tuple[dict[str, str], set[str]]:
+    """One-line `local name = <portable expr>` bindings, in definition order."""
+    portable: dict[str, str] = {}
+    names: set[str] = set()
+    for line in text.splitlines():
+        if line.strip().startswith("--"):
+            continue
+        fn = LUA_LOCAL_FUNCTION_RE.match(line)
+        if fn:
+            names.add(fn.group(1))
+            continue
+        assign = LUA_LOCAL_ASSIGN_RE.match(line)
+        if assign:
+            name = assign.group(1)
+            names.add(name)
+            expr = _strip_trailing_lua_comment(assign.group(2).strip())
+            rewritten = _replace_lua_idents(expr, portable)
+            if lua_expr_is_portable(rewritten):
+                portable[name] = rewritten
+            continue
+        named = LUA_LOCAL_NAME_RE.match(line)
+        if named:
+            names.add(named.group(1))
+    return portable, names
+
+
+def _extract_lua_arg(text: str, start: int) -> tuple[str, int, int] | None:
+    i = start
+    n = len(text)
+    while i < n and text[i] in " \t":
+        i += 1
+    if i >= n:
+        return None
+    begin = i
+    depth = 0
+    quote: str | None = None
+    escape = False
+    while i < n:
+        ch = text[i]
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+            i += 1
+            continue
+        if ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+            i += 1
+            continue
+        if ch == "," and depth == 0:
+            break
+        i += 1
+    expr = text[begin:i].rstrip()
+    if not expr:
+        return None
+    return expr, begin, begin + len(expr)
+
+
+def bind_command_span(line: str, bind: re.Match[str]) -> tuple[str, int, int] | None:
+    i = bind.end()
+    n = len(line)
+    while i < n and line[i] in " \t":
+        i += 1
+    if i >= n or line[i] != ",":
+        return None
+    return _extract_lua_arg(line, i + 1)
+
+
+def bind_command_text(line: str) -> str:
+    bind = BIND_RE.search(line)
+    if not bind:
+        return ""
+    span = bind_command_span(line, bind)
+    return span[0] if span else ""
+
+
+def bind_portability(
+    command: str, portable_locals: dict[str, str], local_names: set[str]
+) -> tuple[bool, str, str]:
+    rewritten = _replace_lua_idents(command, portable_locals)
+    leftover = [
+        chain.split(".", 1)[0]
+        for chain in _lua_ident_chains(rewritten)
+        if chain.split(".", 1)[0] not in SAFE_LUA_ROOTS
+    ]
+    if not leftover:
+        return True, rewritten, ""
+    used_local = next((name for name in leftover if name in local_names), None)
+    if used_local:
+        return False, command, "references a local defined elsewhere in the file"
+    return False, command, "command is not self-contained"
+
+
 def parse_shortcuts(text: str) -> list[dict[str, str]]:
     return [
         {"keys": e["keys"], "label": e["label"], "kind": e["kind"]}
@@ -1900,6 +2181,7 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
     Omarchy rebinds a default with `hl.unbind` then `o.bind` for the same key.
     Hyprland executes in order, so the later statement is the effective shortcut.
     """
+    portable_locals, local_names = extract_portable_locals(text)
     by_key: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for index, line in enumerate(text.splitlines()):
@@ -1918,6 +2200,17 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
             kind = "unbind"
         else:
             continue
+        raw = line.rstrip("\n")
+        sync_raw = raw
+        portable = True
+        skip_reason = ""
+        if bind:
+            span = bind_command_span(line, bind)
+            if span:
+                command, start, end = span
+                portable, rewritten, skip_reason = bind_portability(command, portable_locals, local_names)
+                if portable and rewritten != command:
+                    sync_raw = (line[:start] + rewritten + line[end:]).rstrip("\n")
         if keys not in by_key:
             order.append(keys)
         by_key[keys] = {
@@ -1925,7 +2218,10 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
             "label": label,
             "kind": kind,
             "line": index,
-            "raw": line.rstrip("\n"),
+            "raw": raw,
+            "sync_raw": sync_raw,
+            "portable": portable,
+            "skip_reason": skip_reason,
         }
     return [by_key[key] for key in order]
 
@@ -1951,7 +2247,9 @@ def shortcut_diff(
         repo_e = repo_map.get(keys)
         local_raw = local_e["raw"] if local_e else ""
         repo_raw = repo_e["raw"] if repo_e else ""
-        if local_e and repo_e and local_raw.strip() == repo_raw.strip():
+        local_sync = ((local_e or {}).get("sync_raw") or local_raw).strip()
+        repo_sync = ((repo_e or {}).get("sync_raw") or repo_raw).strip()
+        if local_e and repo_e and (local_sync == repo_sync or local_raw.strip() == repo_raw.strip()):
             continue
         if local_e and not repo_e:
             status = "added-local"
@@ -1975,15 +2273,32 @@ def shortcut_diff(
             change = "changed"
         local_label = (local_e or {}).get("label") or ""
         repo_label = (repo_e or {}).get("label") or ""
+        local_portable = bool((local_e or {}).get("portable", True)) if local_e else True
+        repo_portable = bool((repo_e or {}).get("portable", True)) if repo_e else True
+        skip_reason = ""
         if status in {"added-repo", "repo"}:
             label = repo_label or local_label or keys
-            detail = f"was: {local_label}" if change == "changed" and local_label else "new in repo"
+            skip_reason = str((repo_e or {}).get("skip_reason") or "") if not repo_portable else ""
+            if skip_reason:
+                detail = f"skipped — {skip_reason}"
+            else:
+                detail = f"was: {local_label}" if change == "changed" and local_label else "new in repo"
         elif status in {"added-local", "local"}:
             label = local_label or repo_label or keys
-            detail = f"repo has: {repo_label}" if change == "changed" and repo_label else "new on this machine"
+            skip_reason = str((local_e or {}).get("skip_reason") or "") if not local_portable else ""
+            if skip_reason:
+                detail = f"skipped — {skip_reason}"
+            else:
+                detail = f"repo has: {repo_label}" if change == "changed" and repo_label else "new on this machine"
         else:
             label = local_label or repo_label or keys
+            skip_reason = str((local_e or {}).get("skip_reason") or (repo_e or {}).get("skip_reason") or "")
             detail = f"this machine: {local_label} · repo: {repo_label}"
+            if skip_reason:
+                detail += f" · skipped — {skip_reason}"
+        source_portable = (
+            repo_portable if status in {"added-repo", "repo"} else local_portable if status in {"added-local", "local"} else (local_portable and repo_portable)
+        )
         rows.append(
             {
                 "keys": keys,
@@ -1996,8 +2311,12 @@ def shortcut_diff(
                 "repo_label": repo_label,
                 "local_raw": local_raw,
                 "repo_raw": repo_raw,
-                "default_apply": status in {"added-repo", "repo"},
-                "default_publish": status in {"added-local", "local"},
+                "portable": source_portable,
+                "local_portable": local_portable,
+                "repo_portable": repo_portable,
+                "skip_reason": skip_reason,
+                "default_apply": status in {"added-repo", "repo"} and repo_portable,
+                "default_publish": status in {"added-local", "local"} and local_portable,
             }
         )
     return rows
@@ -2010,9 +2329,9 @@ def upsert_shortcut_lines(dest_text: str, source_entries: dict[str, dict[str, An
     append: list[str] = []
     for key in selected_keys:
         src = source_entries.get(key)
-        if not src:
+        if not src or not src.get("portable", True):
             continue
-        raw = src["raw"].rstrip("\n") + "\n"
+        raw = str(src.get("sync_raw") or src["raw"]).rstrip("\n") + "\n"
         dest = dest_entries.get(key)
         if dest is not None and 0 <= dest["line"] < len(lines):
             replacements[dest["line"]] = raw
@@ -2052,6 +2371,41 @@ def merge_shortcuts_file(
         return False
     atomic_write_text(dest, merged, mode=0o600, within=dest_within)
     return True
+
+
+def filter_portable_shortcuts(source_text: str, keys: list[str]) -> tuple[list[str], list[dict[str, str]]]:
+    entries = {e["keys"]: e for e in extract_bind_statements(source_text)}
+    kept: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for key in keys:
+        entry = entries.get(key)
+        if entry and entry.get("portable", True):
+            kept.append(key)
+        else:
+            skipped.append(
+                {
+                    "keys": key,
+                    "reason": str((entry or {}).get("skip_reason") or "not a portable binding"),
+                }
+            )
+    return kept, skipped
+
+
+def skipped_shortcut_note(skipped: list[dict[str, str]]) -> str:
+    if not skipped:
+        return ""
+    n = len(skipped)
+    reason = skipped[0].get("reason") or "not a portable binding"
+    return f" Skipped {n} shortcut{'s' if n != 1 else ''} ({reason})."
+
+
+def portable_shortcut_selection(
+    source: Path, keys: list[str], source_within: Path | None = None
+) -> tuple[list[str], list[dict[str, str]]]:
+    if not keys:
+        return [], []
+    text = read_text(source, within=source_within) if source.is_file() else ""
+    return filter_portable_shortcuts(text, keys)
 
 
 def _rollup_statuses(statuses: list[str]) -> str | None:
@@ -2328,10 +2682,7 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
                         }
                     )
 
-    bins = []
-    repo_bin = repo / "bin"
-    if repo_bin.is_dir():
-        bins = [p.name for p in sorted(repo_bin.iterdir()) if p.is_file()]
+    bins = sorted(collect_bin_names(ctx, repo))
 
     terminals = []
     for rel, local in terminal_map(ctx).items():
@@ -3232,6 +3583,11 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         extra_theme = expand_theme_paths(diff["files"], "apply")
         wanted = set() if wanted is None else set(wanted)
         wanted |= extra_theme
+    skipped_shortcuts: list[dict[str, str]] = []
+    if shortcut_keys:
+        shortcut_keys, skipped_shortcuts = portable_shortcut_selection(
+            repo / "hypr" / "bindings.lua", shortcut_keys, source_within=repo
+        )
     if shortcut_keys and wanted is not None:
         wanted.discard("hypr/bindings.lua")
     unresolved_both = [
@@ -3251,7 +3607,8 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["removed"] = []
-        snap["message"] = "Nothing to apply."
+        snap["skipped_shortcuts"] = skipped_shortcuts
+        snap["message"] = "Nothing to apply." + skipped_shortcut_note(skipped_shortcuts)
         return snap
 
     if getattr(args, "dry_run", False):
@@ -3268,11 +3625,13 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = applied
         snap["removed"] = removed
+        snap["skipped_shortcuts"] = skipped_shortcuts
         snap["dry_run"] = True
         snap["message"] = (
             f"Dry run: would apply {len(applied)} file{'s' if len(applied) != 1 else ''}"
             + (f" ({len(removed)} removed from this machine)" if removed else "")
             + "."
+            + skipped_shortcut_note(skipped_shortcuts)
         )
         return snap
 
@@ -3364,7 +3723,9 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo"
         + (f" ({len(removed)} removed from this machine)" if removed else "")
         + f".{theme_msg}"
+        + skipped_shortcut_note(skipped_shortcuts)
     )
+    snap["skipped_shortcuts"] = skipped_shortcuts
     snap["removed"] = removed
     return snap
 
@@ -3410,6 +3771,11 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         extra_theme = expand_theme_paths(diff["files"], "publish")
         wanted = set() if wanted is None else set(wanted)
         wanted |= extra_theme
+    skipped_shortcuts: list[dict[str, str]] = []
+    if shortcut_keys:
+        shortcut_keys, skipped_shortcuts = portable_shortcut_selection(
+            ctx.config_hypr / "bindings.lua", shortcut_keys, source_within=ctx.home
+        )
     if shortcut_keys and wanted is not None:
         wanted.discard("hypr/bindings.lua")
     unresolved_both = [
@@ -3430,8 +3796,9 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             snap = build_snapshot(ctx, fetch=False)
             snap["published"] = []
             snap["removed"] = []
+            snap["skipped_shortcuts"] = skipped_shortcuts
             snap["dry_run"] = True
-            snap["message"] = "Dry run: nothing to publish."
+            snap["message"] = "Dry run: nothing to publish." + skipped_shortcut_note(skipped_shortcuts)
             return snap
         if args.push and git_fields["ahead"] and not git_fields["behind"]:
             result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
@@ -3444,11 +3811,13 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 snap["published"] = []
                 snap["message"] = "Pushed existing local commits to origin."
             snap["removed"] = []
+            snap["skipped_shortcuts"] = skipped_shortcuts
             return snap
         snap = build_snapshot(ctx, fetch=False)
         snap["published"] = []
         snap["removed"] = []
-        snap["message"] = "Nothing to publish."
+        snap["skipped_shortcuts"] = skipped_shortcuts
+        snap["message"] = "Nothing to publish." + skipped_shortcut_note(skipped_shortcuts)
         return snap
 
     if getattr(args, "dry_run", False):
@@ -3465,6 +3834,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap = build_snapshot(ctx, fetch=False)
         snap["published"] = published
         snap["removed"] = removed
+        snap["skipped_shortcuts"] = skipped_shortcuts
         snap["committed"] = False
         snap["pushed"] = False
         snap["dry_run"] = True
@@ -3472,6 +3842,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             f"Dry run: would publish {len(published)} file{'s' if len(published) != 1 else ''}"
             + (f" ({len(removed)} removed)" if removed else "")
             + "."
+            + skipped_shortcut_note(skipped_shortcuts)
         )
         return snap
 
@@ -3551,13 +3922,16 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["ok"] = True
         snap["message"] = (
             f"Saved {len(published)} file{'s' if len(published) != 1 else ''} in the repo, but push failed: {push_error}"
+            + skipped_shortcut_note(skipped_shortcuts)
         )
     else:
         snap["message"] = (
             f"Published {len(published)} file{'s' if len(published) != 1 else ''} to the repo"
             + (f" ({len(removed)} removed)" if removed else "")
             + (" and pushed." if pushed else ". Commit is local until you push.")
+            + skipped_shortcut_note(skipped_shortcuts)
         )
+    snap["skipped_shortcuts"] = skipped_shortcuts
     snap["removed"] = removed
     return snap
 

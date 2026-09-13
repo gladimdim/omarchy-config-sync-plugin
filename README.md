@@ -72,10 +72,12 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `omarchy/theme.name` | Selected theme (`omarchy theme set`); custom overlays under `omarchy/themes/<slug>/` (images skipped) |
 | `omarchy/{branding,extensions,hooks,agents}/` | same under `~/.config/omarchy/` |
 | `plugins/*` | `~/.config/omarchy/plugins/` (skips this plugin and other git-managed checkouts’ `.git`) |
-| `bin/*` | `~/.local/bin/` |
+| `bin/*` | `~/.local/bin/` (scripts already in the repo, plus local helpers named by bindings/hooks) |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
 
 `hypr/monitors.lua` is tagged machine-specific and is **not** applied unless you enable **Include display layout**.
+
+Shortcut cherry-pick copies one `o.bind` / `o.rebind` / `hl.unbind` line at a time. A command that is a string, a number, `os.getenv(...)`, or `hl.dsp.*` is portable. If the command only works because of a `local` defined elsewhere in `bindings.lua` (a helper function, an undefined name, …), that shortcut is listed with a skip reason and is **not** copied — applying it would abort Hyprland's `require("hypr.bindings")` on the other machine. Path locals such as `local snap = os.getenv("HOME") .. "/.local/bin/hypr-quarter-snap"` are inlined into a self-contained command when publishing. Helper scripts those bindings reference are offered under **Helper scripts** (the rest of `~/.local/bin` is left alone).
 
 ## Keyboard
 
