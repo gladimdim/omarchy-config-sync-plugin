@@ -82,7 +82,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.23"
+PLUGIN_VERSION = "1.2.24"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -99,7 +99,12 @@ FILE_SUMMARIES = {
     "omarchy/theme.name": "Selected Omarchy theme",
 }
 
-MACHINE_LOCAL_PATHS = {"hypr/monitors.lua"}
+# Always machine-local unless the user opts in with Include machine-local files.
+DEFAULT_MACHINE_LOCAL_PATHS = frozenset({"hypr/monitors.lua"})
+MACHINE_LOCAL_PATHS = set(DEFAULT_MACHINE_LOCAL_PATHS)
+# Hypr/terminal overlays only. Do not match plugin files named Local.qml / local.js.
+LOCAL_OVERLAY_EXACT = frozenset({"local.conf", "local.lua", "local.toml"})
+LOCAL_OVERLAY_SUFFIXES = frozenset({"lua", "conf", "toml", "config"})
 THEME_REL = "omarchy/theme.name"
 THEME_SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 
@@ -528,8 +533,45 @@ def file_hash(path: Path, rel: str, within: Path | None = None) -> str | None:
     return sha256_file(path, within=within)
 
 
+def is_local_overlay_name(name: str) -> bool:
+    """True for per-machine Hyprland/terminal overlays next to a shared config.
+
+    Matches `local.conf`, `input.local.lua`, and `ghostty.local`.
+    Does not match plugin files such as `Local.qml` or `local.js`.
+    """
+    base = Path(name).name.lower()
+    if not base or base in {".", ".."}:
+        return False
+    if base in LOCAL_OVERLAY_EXACT:
+        return True
+    parts = base.split(".")
+    if len(parts) >= 2 and parts[-1] == "local":
+        return True
+    return len(parts) >= 3 and parts[-2] == "local" and parts[-1] in LOCAL_OVERLAY_SUFFIXES
+
+
+def is_local_overlay_rel(rel: str) -> bool:
+    if not (rel.startswith("hypr/") or rel.startswith("terminals/")):
+        return False
+    return is_local_overlay_name(Path(rel).name)
+
+
 def is_skipped_file(name: str) -> bool:
     return name in SKIP_FILE_NAMES or bool(SKIP_NAME_RE.search(name))
+
+
+def machine_local_paths(repo: Path | None = None) -> set[str]:
+    paths = set(DEFAULT_MACHINE_LOCAL_PATHS)
+    if repo is None:
+        return paths
+    marker = load_json(repo / MARKER_NAME, default={}, within=repo)
+    extra = marker.get("machine_local") if isinstance(marker, dict) else None
+    if not isinstance(extra, list):
+        return paths
+    for item in extra:
+        if isinstance(item, str) and validate_safe_rel_path(item):
+            paths.add(item)
+    return paths
 
 
 def validate_safe_rel_path(rel: str) -> bool:
@@ -1162,8 +1204,9 @@ def summary_for(rel: str) -> str:
     return rel
 
 
-def is_machine_local(rel: str) -> bool:
-    return rel in MACHINE_LOCAL_PATHS
+def is_machine_local(rel: str, local_paths: set[str] | None = None) -> bool:
+    paths = DEFAULT_MACHINE_LOCAL_PATHS if local_paths is None else local_paths
+    return rel in paths
 
 
 def is_bundled_path(rel: str) -> bool:
@@ -1381,9 +1424,12 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
         )
     repo_resolved = repo.resolve()
     home_resolved = ctx.home.resolve()
+    local_paths = machine_local_paths(repo)
 
     def add(rel: str, local: Path, repo_file: Path, group: str, extra: dict[str, Any] | None = None) -> None:
         if not validate_safe_rel_path(rel):
+            return
+        if is_local_overlay_rel(rel):
             return
         if rel in items:
             return
@@ -1413,7 +1459,7 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             "path": rel,
             "group": group,
             "summary": summary_for(rel),
-            "portable": not is_machine_local(rel),
+            "portable": not is_machine_local(rel, local_paths),
             "local_path": str(local),
             "repo_path": str(repo_file),
             "local_exists": local_regular,
@@ -1429,12 +1475,12 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     repo_hypr = repo / "hypr"
     if repo_hypr.is_dir():
         for p in repo_hypr.iterdir():
-            if p.is_file() and p.suffix in {".lua", ".conf"} and not is_skipped_file(p.name):
+            if p.is_file() and p.suffix in {".lua", ".conf"} and not is_skipped_file(p.name) and not is_local_overlay_name(p.name):
                 hypr_names.add(p.name)
     local_hypr = ctx.config_hypr
     if local_hypr.is_dir():
         for p in local_hypr.iterdir():
-            if p.is_file() and p.suffix in {".lua", ".conf"} and not is_skipped_file(p.name):
+            if p.is_file() and p.suffix in {".lua", ".conf"} and not is_skipped_file(p.name) and not is_local_overlay_name(p.name):
                 hypr_names.add(p.name)
     for name in sorted(hypr_names):
         add(f"hypr/{name}", local_hypr / name, repo_hypr / name, "hypr")
