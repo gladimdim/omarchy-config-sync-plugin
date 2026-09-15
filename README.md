@@ -73,8 +73,8 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `omarchy/shell.json` | `~/.config/omarchy/shell.json` |
 | `omarchy/theme.name` | Selected theme (`omarchy theme set`); custom overlays under `omarchy/themes/<slug>/` (images skipped) |
 | `omarchy/{branding,extensions,hooks,agents}/` | same under `~/.config/omarchy/` |
-| `plugins/*` | `~/.config/omarchy/plugins/` (skips this plugin and other git-managed checkouts’ `.git`) |
-| `bin/*` | `~/.local/bin/` (scripts already in the repo, plus local helpers named by bindings/hooks) |
+| `plugins/*` | `~/.config/omarchy/plugins/` (skips this plugin and other git-managed checkouts’ `.git`; shebang/ELF helpers keep the execute bit) |
+| `bin/*` | `~/.local/bin/` (scripts already in the repo, plus local helpers named by bindings, hooks, or plugins) |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
 
 Machine-local files are **not** applied unless you enable **Include machine-local files**:
@@ -84,7 +84,7 @@ Machine-local files are **not** applied unless you enable **Include machine-loca
 
 Per-machine Hyprland overlays (`*.local.lua`, `local.conf`, `input.local.lua`, …) are ignored entirely so they never show up as Incoming. Plugin files such as `Local.qml` are still synced. Night-light (`hypr/hyprsunset.conf`) stays portable.
 
-Shortcut cherry-pick copies one `o.bind` / `o.rebind` / `hl.unbind` line at a time. A command that is a string, a number, `os.getenv(...)`, or `hl.dsp.*` is portable. If the command only works because of a `local` defined elsewhere in `bindings.lua` (a helper function, an undefined name, …), that shortcut is listed with a skip reason and is **not** copied — applying it would abort Hyprland's `require("hypr.bindings")` on the other machine. Path locals such as `local snap = os.getenv("HOME") .. "/.local/bin/hypr-quarter-snap"` are inlined into a self-contained command when publishing. Helper scripts those bindings reference are offered under **Helper scripts** (the rest of `~/.local/bin` is left alone).
+Shortcut cherry-pick copies one `o.bind` / `o.rebind` / `hl.unbind` line at a time. A command that is a string, a number, `os.getenv(...)`, or `hl.dsp.*` is portable. If the command only works because of a `local` defined elsewhere in `bindings.lua` (a helper function, an undefined name, …), that shortcut is listed with a skip reason and is **not** copied — applying it would abort Hyprland's `require("hypr.bindings")` on the other machine. Path locals such as `local snap = os.getenv("HOME") .. "/.local/bin/hypr-quarter-snap"` are inlined into a self-contained command when publishing. Helper scripts those bindings, hooks, or plugins reference are offered under **Helper scripts** (the rest of `~/.local/bin` is left alone). Apply restores the execute bit on plugin shebang scripts and ELF binaries (`radio-fetch`, `scripts/audio-*`, …) so Qt/QML `Process` can start them. Theme scripts still land non-executable.
 
 ## Keyboard
 
