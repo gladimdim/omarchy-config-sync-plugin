@@ -1570,6 +1570,85 @@ class SecurityHardeningTests(unittest.TestCase):
         cs.copy_mapped_file({"path": "bin/tool", "repo_path": str(src), "local_path": str(bin_dst)}, "apply")
         self.assertEqual(bin_dst.stat().st_mode & 0o777, 0o755)
 
+    def test_plugin_shebang_scripts_keep_exec_bit(self) -> None:
+        src = self.tmp / "radio-fetch"
+        src.write_text("#!/usr/bin/env bash\necho ok\n", encoding="utf-8")
+        src.chmod(0o644)
+        dst = self.tmp / "dst" / "radio-fetch"
+        cs.copy_mapped_file(
+            {
+                "path": "plugins/akshar.radio-atlas/radio-fetch",
+                "repo_path": str(src),
+                "local_path": str(dst),
+            },
+            "apply",
+        )
+        self.assertEqual(dst.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(dst.read_text(encoding="utf-8"), src.read_text(encoding="utf-8"))
+
+        qml_src = self.tmp / "BarWidget.qml"
+        qml_src.write_text("import QtQuick\n", encoding="utf-8")
+        qml_dst = self.tmp / "dst" / "BarWidget.qml"
+        cs.copy_mapped_file(
+            {
+                "path": "plugins/akshar.radio-atlas/BarWidget.qml",
+                "repo_path": str(qml_src),
+                "local_path": str(qml_dst),
+            },
+            "apply",
+        )
+        self.assertEqual(qml_dst.stat().st_mode & 0o777, 0o600)
+
+        elf_src = self.tmp / "helper-bin"
+        elf_src.write_bytes(b"\x7fELF" + b"\x00" * 16)
+        elf_dst = self.tmp / "dst" / "helper-bin"
+        cs.copy_mapped_file(
+            {
+                "path": "plugins/example.plugin/bin/helper-bin",
+                "repo_path": str(elf_src),
+                "local_path": str(elf_dst),
+            },
+            "apply",
+        )
+        self.assertEqual(elf_dst.stat().st_mode & 0o777, 0o755)
+
+        pub_src = self.tmp / "local-script"
+        pub_src.write_text("#!/bin/sh\n", encoding="utf-8")
+        pub_src.chmod(0o755)
+        pub_dst = self.tmp / "repo" / "radio-player"
+        cs.copy_mapped_file(
+            {
+                "path": "plugins/akshar.radio-atlas/radio-player",
+                "repo_path": str(pub_dst),
+                "local_path": str(pub_src),
+            },
+            "publish",
+        )
+        self.assertEqual(pub_dst.stat().st_mode & 0o777, 0o755)
+
+    def test_plugin_barwidget_helper_is_collected(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            widget = (
+                env.home
+                / ".config"
+                / "omarchy"
+                / "plugins"
+                / "jordan.gods-eye-view"
+                / "BarWidget.qml"
+            )
+            write(
+                widget,
+                'readonly property string launcher: "/home/u/.local/bin/gods-eye-view"\n',
+            )
+            helper = env.ctx.local_bin / "gods-eye-view"
+            helper.parent.mkdir(parents=True, exist_ok=True)
+            helper.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+            helper.chmod(0o755)
+            names = cs.referenced_local_helpers(env.ctx, repo)
+            self.assertIn("gods-eye-view", names)
+            self.assertIn("gods-eye-view", cs.collect_bin_names(env.ctx, repo))
+
     def test_merge_shortcuts_refuses_oversized_bindings(self) -> None:
         source = self.tmp / "src.lua"
         dest = self.tmp / "dest.lua"

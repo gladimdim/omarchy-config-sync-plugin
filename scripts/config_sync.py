@@ -82,7 +82,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.24"
+PLUGIN_VERSION = "1.2.25"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -1227,6 +1227,37 @@ def is_executable_payload(rel: str) -> bool:
     return rel.endswith((".sh", ".py", ".hook"))
 
 
+def _source_looks_runnable(fd: int, mode: int) -> bool:
+    """True when the opened source inode is a script or binary meant to run.
+
+    Git may have stored the file as 100644 after an earlier publish stripped
+    the execute bit, so a shebang or ELF header is enough even without IXUSR.
+    """
+    if mode & stat.S_IXUSR:
+        return True
+    try:
+        head = os.pread(fd, 4, 0)
+    except OSError:
+        return False
+    return head.startswith(b"#!") or head == b"\x7fELF"
+
+
+def copy_destination_mode(rel: str, src_mode: int, src_fd: int) -> int:
+    """Mode for the destination inode of a synced file.
+
+    `bin/` and `omarchy/hooks/` are explicit helper trees and always land
+    executable. Plugin trees include helpers such as `radio-fetch` and
+    `scripts/audio-*`; those keep (or regain) the execute bit when the
+    source is executable, a shebang script, or an ELF binary. A script
+    smuggled anywhere else, including themes, stays 0600.
+    """
+    helper_tree = rel.startswith("bin/") or rel.startswith("omarchy/hooks/")
+    plugin_tree = rel.startswith("plugins/")
+    if helper_tree or (plugin_tree and _source_looks_runnable(src_fd, src_mode)):
+        return 0o755
+    return 0o600
+
+
 def is_hidden_item(kind: str, item_id: str, hidden_keys: set[str]) -> bool:
     if not hidden_keys:
         return False
@@ -1341,8 +1372,22 @@ def terminal_map(ctx: Context) -> dict[str, Path]:
     }
 
 
+PLUGIN_HELPER_SCAN_SUFFIXES = {
+    ".qml",
+    ".js",
+    ".ts",
+    ".lua",
+    ".sh",
+    ".py",
+    ".json",
+    ".toml",
+    ".md",
+    ".conf",
+}
+
+
 def helper_scan_paths(ctx: Context, repo: Path) -> list[tuple[Path, Path]]:
-    """Hypr bindings/autostart and hook files that may name ~/.local/bin helpers."""
+    """Hypr bindings/autostart, hooks, and plugin files that may name ~/.local/bin helpers."""
     out: list[tuple[Path, Path]] = []
     for root, within in ((ctx.config_hypr, ctx.home), (repo / "hypr", repo)):
         if not root.is_dir():
@@ -1356,6 +1401,17 @@ def helper_scan_paths(ctx: Context, repo: Path) -> list[tuple[Path, Path]]:
         (repo / "omarchy" / "hooks", repo),
     ):
         for path in iter_files(root):
+            out.append((path, within))
+    for root, within in (
+        (ctx.config_plugins, ctx.home),
+        (repo / "plugins", repo),
+    ):
+        if not root.is_dir():
+            continue
+        for path in iter_files(root):
+            suffix = path.suffix.lower()
+            if suffix and suffix not in PLUGIN_HELPER_SCAN_SUFFIXES:
+                continue
             out.append((path, within))
     return out
 
@@ -1397,7 +1453,7 @@ def collect_bin_names(ctx: Context, repo: Path) -> set[str]:
     """Repo helpers plus local ~/.local/bin files the config actually names.
 
     ~/.local/bin is not a curated tree (pip/npm shims live there), so local-only
-    files are offered only when bindings or hooks reference them.
+    files are offered only when bindings, hooks, or plugins reference them.
     """
     names: set[str] = set()
     repo_bin = repo / "bin"
@@ -3347,16 +3403,9 @@ def copy_mapped_file(
             actual = Path(os.path.realpath(proc_link))
             if not actual.is_relative_to(src_root.resolve()):
                 raise SyncError(f"Refusing to copy {src}: it resolves outside {src_root}")
-        # Only helper-script and hook trees — both explicit opt-in — ever get the
-        # executable bit; a script smuggled anywhere else lands non-executable.
-        target_mode = (
-            0o755
-            if (
-                direction == "apply"
-                and (item["path"].startswith("bin/") or item["path"].startswith("omarchy/hooks/"))
-            )
-            else 0o600
-        )
+        # Plugin helpers, bin/, and hooks keep the execute bit. A script
+        # smuggled anywhere else (themes, hypr, …) lands non-executable.
+        target_mode = copy_destination_mode(item["path"], st.st_mode, src_fd)
         if dst_root is not None:
             try:
                 rel = dst.relative_to(dst_root)
