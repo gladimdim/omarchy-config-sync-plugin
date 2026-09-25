@@ -2852,6 +2852,89 @@ class PluginListTests(unittest.TestCase):
             self.assertEqual(launched, [f"omarchy-plugin-add {self.SOURCE}"])
             self.assertFalse((env.ctx.config_plugins / self.PID).exists())
 
+    def _plain_copy(self, root: Path) -> Path:
+        plugin = root / self.PID
+        plugin.mkdir(parents=True)
+        (plugin / "manifest.json").write_text(json.dumps({"id": self.PID, "version": "1.0.0"}), encoding="utf-8")
+        (plugin / "Main.qml").write_text("// old copy\n", encoding="utf-8")
+        return plugin
+
+    def test_plain_copy_of_listed_plugin_offers_reinstall(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(repo, [{"id": self.PID, "name": "Weather", "version": "1.1.0", "source": self.SOURCE}])
+            commit_all(repo, "list weather")
+            plugin = self._plain_copy(env.ctx.config_plugins)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual((row["status"], row["action"]), ("repo", "reinstall"))
+            self.assertFalse(row["default_publish"])
+
+            launched: list[str] = []
+            with patch.object(cs, "launch_omarchy_terminal", side_effect=lambda cmd: launched.append(cmd) or True):
+                result = cs.cmd_reinstall_plugin(env.ctx, argparse_ns(args=[self.PID]))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(len(launched), 1)
+            self.assertIn(f"omarchy-plugin-add {self.SOURCE}", launched[0])
+            # Nothing moves until the terminal runs the command.
+            self.assertTrue((plugin / "Main.qml").is_file())
+
+    def test_listed_plugin_linked_from_elsewhere_is_left_alone(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(repo, [{"id": self.PID, "source": self.SOURCE}])
+            commit_all(repo, "list")
+            real = self._plain_copy(env.home / "dev")
+            env.ctx.config_plugins.mkdir(parents=True, exist_ok=True)
+            (env.ctx.config_plugins / self.PID).symlink_to(real)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            self.assertNotIn(self.PID, self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns())))
+            with patch.object(cs, "launch_omarchy_terminal") as launch:
+                with self.assertRaises(cs.SyncError):
+                    cs.cmd_reinstall_plugin(env.ctx, argparse_ns(args=[self.PID]))
+                launch.assert_not_called()
+
+    def test_reinstall_refuses_git_missing_or_sourceless_plugins(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(repo, [{"id": self.PID, "source": self.SOURCE}, {"id": "no.source"}, {"id": "gone.plugin", "source": self.SOURCE}])
+            commit_all(repo, "list")
+            make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.0.0", self.SOURCE)
+            (env.ctx.config_plugins / "no.source").mkdir()
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            with patch.object(cs, "launch_omarchy_terminal") as launch:
+                for pid in (self.PID, "no.source", "gone.plugin", "missing.plugin", "../escape"):
+                    with self.assertRaises(cs.SyncError, msg=pid):
+                        cs.cmd_reinstall_plugin(env.ctx, argparse_ns(args=[pid]))
+                launch.assert_not_called()
+
+    def test_reinstall_command_restores_on_failure_and_keeps_backup_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_add = bin_dir / "omarchy-plugin-add"
+            env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+            plugins = root / "plugins"
+            plugin = self._plain_copy(plugins)
+            backup = root / "backup.1" / "plugins" / self.PID
+
+            # Declined or failed: the old copy is put back.
+            fake_add.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fake_add.chmod(0o755)
+            cmd = cs.reinstall_plugin_command(plugin, backup, self.SOURCE)
+            subprocess.run(["bash", "-c", cmd], env=env, check=False)
+            self.assertEqual((plugin / "Main.qml").read_text(encoding="utf-8"), "// old copy\n")
+            self.assertFalse(backup.exists())
+
+            # Installed: the git checkout stays, the old copy is in the backup.
+            fake_add.write_text(f"#!/bin/sh\nmkdir -p {plugin}/.git\n", encoding="utf-8")
+            subprocess.run(["bash", "-c", cmd], env=env, check=True)
+            self.assertTrue((plugin / ".git").is_dir())
+            self.assertFalse((plugin / "Main.qml").exists())
+            self.assertEqual((backup / "Main.qml").read_text(encoding="utf-8"), "// old copy\n")
+
     def test_install_refuses_unlisted_installed_or_sourceless_plugins(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
