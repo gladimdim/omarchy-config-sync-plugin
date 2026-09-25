@@ -705,6 +705,49 @@ class InspectAndSyncTests(unittest.TestCase):
             self.assertTrue((env.ctx.local_bin / "useful-tool").is_file())
             self.assertTrue(os.access(env.ctx.local_bin / "useful-tool", os.X_OK))
 
+    def test_mirror_apply_takes_everything_and_opens_plugin_installs(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(repo, [{"id": "listed.one", "name": "Listed", "version": "1.0.0", "source": "https://github.com/a/listed.git"}])
+            commit_all(repo, "list")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            launched: list[str] = []
+            with patch.object(cs, "launch_omarchy_terminal", side_effect=lambda cmd: launched.append(cmd) or True):
+                applied = cs.cmd_apply(env.ctx, argparse_ns(mirror=True))
+            self.assertTrue(applied["ok"], applied)
+            # Code-running items and machine-local files arrive in the same pass.
+            self.assertTrue((env.ctx.config_plugins / "demo.widget" / "manifest.json").is_file())
+            self.assertTrue((env.ctx.local_bin / "useful-tool").is_file())
+            self.assertTrue((env.ctx.config_hypr / "monitors.lua").is_file())
+            self.assertEqual(launched, ["omarchy-plugin-add https://github.com/a/listed.git"])
+            self.assertIn("1 plugin", applied["message"])
+
+    def test_mirror_publish_sends_whole_bindings_and_machine_files(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            with patch.object(cs, "launch_omarchy_terminal", return_value=True):
+                cs.cmd_apply(env.ctx, argparse_ns(mirror=True))
+            bindings = env.ctx.config_hypr / "bindings.lua"
+            inline = 'o.bind("SUPER + J", "Split", function()\n  local w = pick()\n  hl.dispatch("x", w)\nend)\n'
+            bindings.write_text(bindings.read_text(encoding="utf-8") + inline, encoding="utf-8")
+            (env.ctx.config_hypr / "monitors.lua").write_text('hl.monitor({ output = "DP-2" })\n', encoding="utf-8")
+
+            # The normal flow will not ship this bindings.lua as a whole file.
+            normal = cs.cmd_publish(env.ctx, argparse_ns(dry_run=True))
+            self.assertNotIn("hypr/bindings.lua", normal.get("published", []))
+
+            via_resync = cs.cmd_resync(env.ctx, argparse_ns(side="local", mirror=True, dry_run=True))
+            self.assertEqual(sorted(via_resync["published"]), ["hypr/bindings.lua", "hypr/monitors.lua"])
+
+            published = cs.cmd_publish(env.ctx, argparse_ns(mirror=True))
+            self.assertTrue(published["ok"], published)
+            self.assertEqual(
+                (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8"), bindings.read_text(encoding="utf-8")
+            )
+            self.assertIn("DP-2", (repo / "hypr" / "monitors.lua").read_text(encoding="utf-8"))
+
     def test_publish_local_shortcut_and_ignores_config_sync_plugin(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
@@ -1059,6 +1102,7 @@ def argparse_ns(**kwargs):
         url = None
         all = False
         dry_run = False
+        mirror = False
         args = []
 
     n = N()
@@ -1162,6 +1206,17 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(cs.apply_omarchy_theme("--help", dry_run=False), "Invalid theme slug")
         self.assertEqual(cs.apply_omarchy_theme("cat; rm -rf /", dry_run=False), "Invalid theme slug")
         self.assertEqual(cs.apply_omarchy_theme("-v", dry_run=False), "Invalid theme slug")
+
+    def test_theme_video_wallpapers_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            theme = Path(tmp)
+            (theme / "backgrounds").mkdir()
+            (theme / "backgrounds" / "cafe.3840x2160.mp4").write_bytes(b"\0" * 16)
+            (theme / "backgrounds" / "loop.WEBM").write_bytes(b"\0" * 16)
+            (theme / "backgrounds" / "beans.jpg").write_bytes(b"\0" * 16)
+            (theme / "colors.toml").write_text("accent = '#fff'\n", encoding="utf-8")
+            names = sorted(p.name for p in cs.iter_theme_files(theme))
+            self.assertEqual(names, ["colors.toml"])
 
     def test_parse_files_arg_filters_unsafe(self) -> None:
         parsed = cs.parse_files_arg("hypr/looknfeel.lua, ../../../etc/passwd, bin/tool")
@@ -2488,7 +2543,7 @@ class SourceArgumentTests(unittest.TestCase):
 
         with open(tmp / "out", "w+") as out, open(tmp / "err", "w+") as err:
             proc = subprocess.Popen(
-                ["python3", "-u", str(SCRIPTS / "config_sync.py"), *args],
+                [sys.executable, "-u", str(SCRIPTS / "config_sync.py"), *args],
                 stdin=subprocess.PIPE, stdout=out, stderr=err, text=True, env=env,
             )
             try:
