@@ -318,6 +318,17 @@ Panel {
     return null
   }
 
+  // Tick or untick every pickable row of one Change section.
+  function pickItems(items, on) {
+    var next = cloneMap(picks)
+    for (var i = 0; i < (items || []).length; i++) {
+      var row = items[i]
+      if (row.pickable === false) continue
+      next[pickId(row.kind, row.itemId)] = on
+    }
+    picks = next
+  }
+
   function bulkPick(mode) {
     var next = cloneMap(picks)
     var keys = Object.keys(next)
@@ -1611,6 +1622,7 @@ Panel {
           subtitle: "Pick Keep local or Take repo on each row"
           mixed: true
           files: root.bothItems
+          bulkPickable: false
         }
       }
     }
@@ -1794,6 +1806,7 @@ Panel {
         subtitle: "Pick Keep local or Take repo on each row"
         mixed: true
         files: root.bothItems
+        bulkPickable: false
       }
 
       Column {
@@ -2816,6 +2829,7 @@ Panel {
     property string labelField: "path"
     property string summaryField: "summary"
     property bool expanded: false
+    property bool bulkPickable: true
     readonly property int includedCount: {
       var _ = root.picks
       return Model.pickedInItems(sectionRoot.mixed ? files : [], root.picks)
@@ -2918,6 +2932,33 @@ Panel {
         cursorShape: Qt.PointingHandCursor
         hoverEnabled: true
         onClicked: sectionRoot.expanded = !sectionRoot.expanded
+      }
+    }
+
+    Row {
+      visible: sectionRoot.expanded && sectionRoot.mixed && sectionRoot.bulkPickable
+      spacing: Style.space(6)
+      Button {
+        text: "Select all"
+        iconText: "󰒆"
+        tooltipText: "Tick every item in " + sectionRoot.title
+        fontSize: Style.font.caption
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        bordered: true
+        enabled: sectionRoot.includedCount < sectionRoot.files.length
+        onClicked: root.pickItems(sectionRoot.files, true)
+      }
+      Button {
+        text: "Select none"
+        iconText: "󰒇"
+        tooltipText: "Untick every item in " + sectionRoot.title
+        fontSize: Style.font.caption
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        bordered: true
+        enabled: sectionRoot.includedCount > 0
+        onClicked: root.pickItems(sectionRoot.files, false)
       }
     }
 
