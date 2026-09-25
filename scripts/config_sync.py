@@ -107,7 +107,11 @@ MACHINE_LOCAL_PATHS = set(DEFAULT_MACHINE_LOCAL_PATHS)
 LOCAL_OVERLAY_EXACT = frozenset({"local.conf", "local.lua", "local.toml"})
 LOCAL_OVERLAY_SUFFIXES = frozenset({"lua", "conf", "toml", "config"})
 THEME_REL = "omarchy/theme.name"
-THEME_SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+THEME_SKIP_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".heic",
+    # Video wallpapers are often tens of MB. Keep them out of the repo like images.
+    ".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi",
+}
 # Git-installed plugins travel as entries in this list, not as copied files.
 PLUGIN_LIST_REL = "plugins.json"
 PLUGIN_LIST_FORMAT = "omarchy-config-plugins"

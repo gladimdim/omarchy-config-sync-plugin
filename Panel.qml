@@ -318,6 +318,17 @@ Panel {
     return null
   }
 
+  // Tick or untick every pickable row of one Change section.
+  function pickItems(items, on) {
+    var next = cloneMap(picks)
+    for (var i = 0; i < (items || []).length; i++) {
+      var row = items[i]
+      if (row.pickable === false) continue
+      next[pickId(row.kind, row.itemId)] = on
+    }
+    picks = next
+  }
+
   function bulkPick(mode) {
     var next = cloneMap(picks)
     var keys = Object.keys(next)
@@ -699,7 +710,11 @@ Panel {
       repoUrlInput = String(status.repo_url)
     Qt.callLater(function() {
       root.seedPicks()
-      if (root.openOnChanges && root.hasReviewable) {
+      // An empty repo opens on Overview: the first-push card is the guide there.
+      if (root.openOnChanges && root.syncState === "empty") {
+        root.activeTab = 0
+        root.openOnChanges = false
+      } else if (root.openOnChanges && root.hasReviewable) {
         root.activeTab = 1
         root.openOnChanges = false
       } else {
@@ -1127,8 +1142,8 @@ Panel {
 
             GuideStep {
               step: "3"
-              title: "Review, then Publish this machine"
-              body: "Empty repo: the tabs show this machine. Publish seeds GitHub (still private). Next machine: Connect the same URL and press Apply. Display layout is skipped unless you opt in."
+              title: "Review, then Seed repo"
+              body: "Empty repo: the tabs show this machine. Seed repo pushes it to GitHub (still private). Next machine: Connect the same URL and press Apply. Display layout is skipped unless you opt in."
             }
           }
         }
@@ -1331,7 +1346,54 @@ Panel {
         }
       }
 
+      // First push. The generic action row below is hidden in this state so
+      // there is exactly one obvious thing to press.
+      CardBox {
+        visible: root.syncState === "empty"
+        border.width: 2
+        border.color: root.accent
+
+        GuideStep {
+          step: "✓"
+          title: "Repo linked"
+          body: Model.repoName(root.status && root.status.repo_url) + " is connected and empty. Nothing has been pushed yet."
+        }
+        GuideStep {
+          step: "2"
+          title: "Check what goes up"
+          body: root.outgoingPicked + " of " + root.outgoingCount + " items from this machine are ticked. Review list shows them. Display layout stays local unless you opt in."
+        }
+        GuideStep {
+          step: "3"
+          title: "Seed the repo"
+          body: "Pushes the ticked items as the first commit. The repo stays private. On your next machine: Connect the same URL, then Apply."
+        }
+        Row {
+          spacing: Style.space(8)
+          Button {
+            text: "Seed repo (" + root.outgoingPicked + " items)"
+            iconText: "󰓂"
+            tooltipText: "Push this machine's ticked items as the repo's first commit (p)"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            selected: true
+            enabled: !root.busy
+            onClicked: root.requestPublish()
+          }
+          Button {
+            text: "Review list"
+            iconText: "󰦓"
+            tooltipText: "Tick or untick items before seeding (c)"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.reviewChanges()
+          }
+        }
+      }
+
       Row {
+        visible: root.syncState !== "empty"
         spacing: Style.space(8)
 
         Button {
@@ -1367,11 +1429,9 @@ Panel {
           onClicked: root.requestApply()
         }
         Button {
-          text: root.syncState === "empty" ? "Publish this machine" : "Publish"
+          text: "Publish"
           iconText: "󰓂"
-          tooltipText: root.syncState === "empty"
-            ? "Seed the empty private repo from this machine, then push"
-            : "Publish checked local items (p)"
+          tooltipText: "Publish checked local items (p)"
           foreground: root.foreground
           fontFamily: root.fontFamily
           bordered: true
@@ -1562,6 +1622,7 @@ Panel {
           subtitle: "Pick Keep local or Take repo on each row"
           mixed: true
           files: root.bothItems
+          bulkPickable: false
         }
       }
     }
@@ -1638,6 +1699,17 @@ Panel {
         }
       }
 
+      Text {
+        visible: !root.showingHidden && root.syncState === "empty"
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "First push: every ticked item under Outgoing becomes the repo's first commit. Untick anything you do not want on GitHub, then Seed repo."
+        color: root.accent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+
       Row {
         visible: !root.showingHidden
         spacing: Style.space(8)
@@ -1652,7 +1724,7 @@ Panel {
           onClicked: root.requestApply()
         }
         Button {
-          text: root.syncState === "empty" ? "Publish selected" : "Publish selected"
+          text: root.syncState === "empty" ? ("Seed repo (" + root.outgoingPicked + " items)") : "Publish selected"
           iconText: "󰓂"
           foreground: root.foreground
           fontFamily: root.fontFamily
@@ -1734,6 +1806,7 @@ Panel {
         subtitle: "Pick Keep local or Take repo on each row"
         mixed: true
         files: root.bothItems
+        bulkPickable: false
       }
 
       Column {
@@ -2756,6 +2829,7 @@ Panel {
     property string labelField: "path"
     property string summaryField: "summary"
     property bool expanded: false
+    property bool bulkPickable: true
     readonly property int includedCount: {
       var _ = root.picks
       return Model.pickedInItems(sectionRoot.mixed ? files : [], root.picks)
@@ -2858,6 +2932,33 @@ Panel {
         cursorShape: Qt.PointingHandCursor
         hoverEnabled: true
         onClicked: sectionRoot.expanded = !sectionRoot.expanded
+      }
+    }
+
+    Row {
+      visible: sectionRoot.expanded && sectionRoot.mixed && sectionRoot.bulkPickable
+      spacing: Style.space(6)
+      Button {
+        text: "Select all"
+        iconText: "󰒆"
+        tooltipText: "Tick every item in " + sectionRoot.title
+        fontSize: Style.font.caption
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        bordered: true
+        enabled: sectionRoot.includedCount < sectionRoot.files.length
+        onClicked: root.pickItems(sectionRoot.files, true)
+      }
+      Button {
+        text: "Select none"
+        iconText: "󰒇"
+        tooltipText: "Untick every item in " + sectionRoot.title
+        fontSize: Style.font.caption
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        bordered: true
+        enabled: sectionRoot.includedCount > 0
+        onClicked: root.pickItems(sectionRoot.files, false)
       }
     }
 

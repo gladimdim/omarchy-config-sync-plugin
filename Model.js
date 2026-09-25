@@ -15,7 +15,7 @@ function stateTitle(state) {
   switch (String(state || "")) {
     case "in-sync": return "In sync"
     case "ready": return "Ready to apply"
-    case "empty": return "Empty repo — seed from this machine"
+    case "empty": return "Linked · ready for first push"
     case "local-ahead": return "Local changes"
     case "remote-ahead": return "Incoming updates"
     case "diverged": return "Both sides changed"
@@ -35,7 +35,7 @@ function stateHint(state, status) {
     case "in-sync":
       return "This machine matches the linked config repo."
     case "empty":
-      return "This GitHub repo is empty (or only has a README). The tabs show this machine. Press Publish this machine to seed the private repo, then use Apply on your other machines."
+      return "Connected. The repo is empty (or only has a README), so one step is left: seed it from this machine. The tabs show what this machine would push."
     case "ready":
       return "The repo looks like Omarchy config. Review shortcuts, plugins, and files, then Apply to this machine — or Publish if this machine is the source of truth."
     case "local-ahead":

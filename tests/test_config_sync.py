@@ -1163,6 +1163,17 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(cs.apply_omarchy_theme("cat; rm -rf /", dry_run=False), "Invalid theme slug")
         self.assertEqual(cs.apply_omarchy_theme("-v", dry_run=False), "Invalid theme slug")
 
+    def test_theme_video_wallpapers_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            theme = Path(tmp)
+            (theme / "backgrounds").mkdir()
+            (theme / "backgrounds" / "cafe.3840x2160.mp4").write_bytes(b"\0" * 16)
+            (theme / "backgrounds" / "loop.WEBM").write_bytes(b"\0" * 16)
+            (theme / "backgrounds" / "beans.jpg").write_bytes(b"\0" * 16)
+            (theme / "colors.toml").write_text("accent = '#fff'\n", encoding="utf-8")
+            names = sorted(p.name for p in cs.iter_theme_files(theme))
+            self.assertEqual(names, ["colors.toml"])
+
     def test_parse_files_arg_filters_unsafe(self) -> None:
         parsed = cs.parse_files_arg("hypr/looknfeel.lua, ../../../etc/passwd, bin/tool")
         self.assertEqual(parsed, {"hypr/looknfeel.lua", "bin/tool"})
@@ -2488,7 +2499,7 @@ class SourceArgumentTests(unittest.TestCase):
 
         with open(tmp / "out", "w+") as out, open(tmp / "err", "w+") as err:
             proc = subprocess.Popen(
-                ["python3", "-u", str(SCRIPTS / "config_sync.py"), *args],
+                [sys.executable, "-u", str(SCRIPTS / "config_sync.py"), *args],
                 stdin=subprocess.PIPE, stdout=out, stderr=err, text=True, env=env,
             )
             try:
