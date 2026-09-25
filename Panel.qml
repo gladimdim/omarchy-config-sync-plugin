@@ -44,6 +44,7 @@ Panel {
   property var shortcutDiffs: []
   property var pluginDiffs: []
   property var bundleDiffs: []
+  property var pluginListDiffs: []
   property var themeDiff: null
   property bool openOnChanges: false
   property bool showingHidden: false
@@ -127,6 +128,8 @@ Panel {
   readonly property var incomingBundles: Model.filesByStatus(bundleDiffs, ["repo", "added-repo", "differs"])
   readonly property var localBundles: Model.filesByStatus(bundleDiffs, ["local", "added-local"])
   readonly property var bothBundles: Model.filesByStatus(bundleDiffs, ["both"])
+  readonly property var incomingPluginList: Model.filesByStatus(pluginListDiffs, ["repo", "added-repo"])
+  readonly property var outgoingPluginList: Model.filesByStatus(pluginListDiffs, ["local", "added-local"])
   readonly property var incomingTheme: {
     if (!themeDiff) return []
     var st = String(themeDiff.status)
@@ -144,10 +147,10 @@ Panel {
     if (String(themeDiff.status) === "both") return [themeDiff]
     return []
   }
-  readonly property var incomingItems: Model.buildIncomingItems(incomingTheme, incomingAddedShortcuts, incomingChangedShortcuts, incomingBundles, incomingFiles.concat(differsFiles), diffFiles, hiddenMap)
-  readonly property var outgoingItems: Model.buildOutgoingItems(outgoingTheme, localAddedShortcuts, localChangedShortcuts, localBundles, localFiles, diffFiles, hiddenMap)
+  readonly property var incomingItems: Model.buildIncomingItems(incomingTheme, incomingAddedShortcuts, incomingChangedShortcuts, incomingBundles, incomingFiles.concat(differsFiles), diffFiles, hiddenMap, incomingPluginList)
+  readonly property var outgoingItems: Model.buildOutgoingItems(outgoingTheme, localAddedShortcuts, localChangedShortcuts, localBundles, localFiles, diffFiles, hiddenMap, outgoingPluginList)
   readonly property var bothItems: Model.buildBothItems(bothTheme, bothShortcuts, bothBundles, bothFiles, diffFiles, hiddenMap)
-  readonly property var hiddenItems: Model.buildHiddenItems((themeDiff ? [themeDiff] : []), shortcutDiffs, bundleDiffs, diffFiles, diffFiles, hiddenMap)
+  readonly property var hiddenItems: Model.buildHiddenItems((themeDiff ? [themeDiff] : []), shortcutDiffs, bundleDiffs, diffFiles, diffFiles, hiddenMap, pluginListDiffs)
   readonly property int incomingCount: incomingItems.length
   readonly property int outgoingCount: outgoingItems.length
   readonly property int bothCount: bothItems.length
@@ -266,6 +269,11 @@ Panel {
       // Hooks/agents/branding/extensions/bin run code or steer an agent: same rule as plugins.
       next[key] = (key in picks) ? picks[key] : !!item.default_publish
     }
+    for (i = 0; i < outgoingPluginList.length; i++) {
+      item = outgoingPluginList[i]
+      key = pickId("l", item.id)
+      next[key] = (key in picks) ? picks[key] : !!item.default_publish
+    }
     if (themeDiff) {
       key = pickId("t", "selected")
       next[key] = (key in picks) ? picks[key] : !!(themeDiff.default_apply || themeDiff.default_publish || themeDiff.status === "differs")
@@ -276,7 +284,7 @@ Panel {
       for (ri = 0; ri < rows.length; ri++) {
         row = rows[ri]
         rkey = pickId(row.kind, row.itemId)
-        if (rkey in next) continue
+        if (rkey in next || row.pickable === false) continue
         st = String(row.status || "")
         next[rkey] = st === "repo" || st === "added-repo" || st === "differs" || st === "local" || st === "added-local" || st === "both"
       }
@@ -331,6 +339,10 @@ Panel {
         for (i = 0; i < bundleDiffs.length; i++)
           if (pickId("g", bundleDiffs[i].id) === key)
             return bundleDiffs[i].status
+      } else if (key.indexOf("l:") === 0) {
+        for (i = 0; i < outgoingPluginList.length; i++)
+          if (pickId("l", outgoingPluginList[i].id) === key)
+            return outgoingPluginList[i].status
       } else if (key === pickId("t", "selected") && themeDiff) {
         return themeDiff.status
       }
@@ -502,6 +514,21 @@ Panel {
     return out
   }
 
+  // Only outgoing rows are picks; installs and updates go through Omarchy.
+  function selectedPublishListPlugins() {
+    var out = []
+    for (var i = 0; i < outgoingItems.length; i++) {
+      var row = outgoingItems[i]
+      if (row.kind === "l" && row.pickable !== false && isPicked("l", row.itemId)) out.push(row.itemId)
+    }
+    return out
+  }
+
+  function runPluginAction(action, id) {
+    if (action === "install") run(["install-plugin", id])
+    else if (action === "update") run(["update-plugin", id])
+  }
+
   function selectSide(kind, id, side) {
     setPick(kind === "f" ? id : (kind + ":" + id), side)
     setPicked(kind, id, true)
@@ -537,7 +564,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedPublishFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length + selectedBundleFiles("publish").length === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
+    if (selectedPublishFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length + selectedPublishListPlugins().length + selectedBundleFiles("publish").length === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
       lastError = "Check the local shortcuts, plugins, or files you want to publish."
       activeTab = 1
       return
@@ -568,6 +595,8 @@ Panel {
       var pi
       for (pi = 0; pi < pshort.length; pi++) pargs.push("--shortcut", pshort[pi])
       for (pi = 0; pi < pplugs.length; pi++) pargs.push("--plugin", pplugs[pi])
+      var plist = selectedPublishListPlugins()
+      for (pi = 0; pi < plist.length; pi++) pargs.push("--list-plugin", plist[pi])
       if (selectedPublishTheme()) pargs.push("--theme")
       run(pargs)
     } else if (kind === "disconnect") {
@@ -662,6 +691,7 @@ Panel {
     shortcutDiffs = (data.diff && data.diff.shortcuts) ? data.diff.shortcuts : []
     pluginDiffs = (data.diff && data.diff.plugins) ? data.diff.plugins : []
     bundleDiffs = (data.diff && data.diff.bundles) ? data.diff.bundles : []
+    pluginListDiffs = (data.diff && data.diff.plugin_list) ? data.diff.plugin_list : []
     themeDiff = (data.diff && data.diff.theme) ? data.diff.theme : null
     if (data.sync_state && status)
       status = Object.assign({}, status, { sync_state: data.sync_state })
@@ -732,7 +762,7 @@ Panel {
     if (data.push_error)
       lastError = String(data.push_error)
     if (data.disconnected) {
-      status = { configured: false, sync_state: "not-configured" }
+      status = { configured: false, sync_state: "not-configured", plugin_version: (status && status.plugin_version) || "" }
       inspect = null
       diffFiles = []
       bothPicks = ({})
@@ -880,15 +910,31 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(2)
 
-            Text {
-              textFormat: Text.PlainText
-              text: root.configured ? Model.repoName(root.status.repo_url) : "Config Sync"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              elide: Text.ElideRight
+            Row {
               width: parent.width
+              spacing: Style.space(6)
+
+              Text {
+                id: heroTitle
+                textFormat: Text.PlainText
+                text: root.configured ? Model.repoName(root.status.repo_url) : "Config Sync"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                elide: Text.ElideRight
+                width: Math.min(implicitWidth, parent.width - heroVersion.implicitWidth - parent.spacing)
+              }
+
+              Text {
+                id: heroVersion
+                textFormat: Text.PlainText
+                text: root.status && root.status.plugin_version ? "v" + root.status.plugin_version : ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.baseline: heroTitle.baseline
+              }
             }
 
             Text {
@@ -2051,11 +2097,26 @@ Panel {
               wrapMode: Text.WordWrap
             }
             Text {
+              width: parent.width
               textFormat: Text.PlainText
-              text: modelData.id
+              text: modelData.id + (modelData.git && modelData.source ? "  ·  git: " + modelData.source : "")
+                + (modelData.git && !modelData.installed ? "  ·  not installed here" : "")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+              wrapMode: Text.WrapAnywhere
+            }
+            Button {
+              visible: !!modelData.git && !modelData.installed && String(modelData.source || "") !== ""
+              text: "Install"
+              iconText: "󰏗"
+              tooltipText: "Open Omarchy's plugin installer in a terminal"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              enabled: !root.busy
+              onClicked: root.runPluginAction("install", String(modelData.id))
             }
           }
         }
@@ -2468,6 +2529,8 @@ Panel {
             readonly property bool included: !!(root.picks[root.pickId(rowKind, rowId)])
             readonly property string bothKey: rowKind === "f" ? rowId : (rowKind + ":" + rowId)
             readonly property string typeLabel: String(modelData.typeLabel || "")
+            readonly property bool pickable: modelData.pickable !== false
+            readonly property string rowAction: String(modelData.action || "")
 
             width: catRoot.width
             implicitHeight: catRowInner.implicitHeight + Style.space(16)
@@ -2490,6 +2553,7 @@ Panel {
                 height: 28
                 radius: 4
                 anchors.verticalCenter: parent.verticalCenter
+                visible: catRowBox.pickable
                 color: catRowBox.included ? root.accent : Color.background
                 border.width: 2
                 border.color: root.foreground
@@ -2512,7 +2576,7 @@ Panel {
               }
 
               Column {
-                width: parent.width - 28 - catIncludeBtn.width - catHideBtn.width - (catRowBox.rowBoth ? 168 : 0) - parent.spacing * (catRowBox.rowBoth ? 4 : 3)
+                width: parent.width - (catRowBox.pickable ? 28 + catIncludeBtn.width : 0) - (catActionBtn.visible ? catActionBtn.width : 0) - catHideBtn.width - (catRowBox.rowBoth ? 168 : 0) - parent.spacing * (1 + (catRowBox.pickable ? 2 : 0) + (catActionBtn.visible ? 1 : 0) + (catRowBox.rowBoth ? 1 : 0))
                 spacing: 2
                 anchors.verticalCenter: parent.verticalCenter
 
@@ -2533,6 +2597,7 @@ Panel {
                     var st = Model.fileStatusLabel(catRowBox.modelData.status, catRowBox.modelData.removal)
                     var sum = catRowBox.rowSummary
                     var verb = catRowBox.modelData.removal ? " · will delete" : " · will sync"
+                    if (!catRowBox.pickable) return Model.statusPrefix(st, sum) + sum
                     return Model.statusPrefix(st, sum) + sum + (catRowBox.included ? verb : " · skipped")
                   }
                   color: root.dim
@@ -2596,7 +2661,25 @@ Panel {
               }
 
               Button {
+                id: catActionBtn
+                visible: catRowBox.rowAction !== ""
+                text: catRowBox.rowAction === "update" ? "Update" : "Install"
+                iconText: catRowBox.rowAction === "update" ? "󰚰" : "󰏗"
+                tooltipText: catRowBox.rowAction === "update"
+                  ? "Open Omarchy's plugin updater in a terminal"
+                  : "Open Omarchy's plugin installer in a terminal"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+                enabled: !root.busy
+                onClicked: root.runPluginAction(catRowBox.rowAction, catRowBox.rowId)
+              }
+
+              Button {
                 id: catIncludeBtn
+                visible: catRowBox.pickable
                 text: catRowBox.included ? "Included" : "Skip"
                 selected: catRowBox.included
                 bordered: true
@@ -2625,6 +2708,7 @@ Panel {
             MouseArea {
               z: -1
               anchors.fill: parent
+              enabled: catRowBox.pickable
               cursorShape: Qt.PointingHandCursor
               onClicked: root.togglePick(catRowBox.rowKind, catRowBox.rowId)
             }
@@ -2799,6 +2883,8 @@ Panel {
         readonly property bool included: !!(root.picks[root.pickId(rowKind, rowId)])
         readonly property string bothKey: rowKind === "f" ? rowId : (rowKind + ":" + rowId)
         readonly property string typeLabel: sectionRoot.mixed ? String(modelData.typeLabel || "") : ""
+        readonly property bool pickable: modelData.pickable !== false
+        readonly property string rowAction: String(modelData.action || "")
 
         width: sectionRoot.width
         implicitHeight: rowInner.implicitHeight + Style.space(16)
@@ -2821,6 +2907,7 @@ Panel {
             height: 28
             radius: 4
             anchors.verticalCenter: parent.verticalCenter
+            visible: rowBox.pickable
             color: rowBox.included ? root.accent : Color.background
             border.width: 2
             border.color: root.foreground
@@ -2843,7 +2930,7 @@ Panel {
           }
 
           Column {
-            width: parent.width - 28 - includeBtn.width - hideBtn.width - (rowBox.rowBoth ? 168 : 0) - parent.spacing * (rowBox.rowBoth ? 4 : 3)
+            width: parent.width - (rowBox.pickable ? 28 + includeBtn.width : 0) - (actionBtn.visible ? actionBtn.width : 0) - hideBtn.width - (rowBox.rowBoth ? 168 : 0) - parent.spacing * (1 + (rowBox.pickable ? 2 : 0) + (actionBtn.visible ? 1 : 0) + (rowBox.rowBoth ? 1 : 0))
             spacing: 2
             anchors.verticalCenter: parent.verticalCenter
 
@@ -2864,6 +2951,7 @@ Panel {
                 var st = Model.fileStatusLabel(rowBox.modelData.status, rowBox.modelData.removal)
                 var sum = rowBox.rowSummary
                 var verb = rowBox.modelData.removal ? " · will delete" : " · will sync"
+                if (!rowBox.pickable) return Model.statusPrefix(st, sum) + sum
                 return Model.statusPrefix(st, sum) + sum + (rowBox.included ? verb : " · skipped")
               }
               color: root.dim
@@ -2927,7 +3015,25 @@ Panel {
           }
 
           Button {
+            id: actionBtn
+            visible: rowBox.rowAction !== ""
+            text: rowBox.rowAction === "update" ? "Update" : "Install"
+            iconText: rowBox.rowAction === "update" ? "󰚰" : "󰏗"
+            tooltipText: rowBox.rowAction === "update"
+              ? "Open Omarchy's plugin updater in a terminal"
+              : "Open Omarchy's plugin installer in a terminal"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            anchors.verticalCenter: parent.verticalCenter
+            enabled: !root.busy
+            onClicked: root.runPluginAction(rowBox.rowAction, rowBox.rowId)
+          }
+
+          Button {
             id: includeBtn
+            visible: rowBox.pickable
             text: rowBox.included ? "Included" : "Skip"
             selected: rowBox.included
             bordered: true
@@ -2956,6 +3062,7 @@ Panel {
         MouseArea {
           z: -1
           anchors.fill: parent
+          enabled: rowBox.pickable
           cursorShape: Qt.PointingHandCursor
           onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
         }

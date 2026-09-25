@@ -73,9 +73,20 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `omarchy/shell.json` | `~/.config/omarchy/shell.json` |
 | `omarchy/theme.name` | Selected theme (`omarchy theme set`); custom overlays under `omarchy/themes/<slug>/` (images skipped) |
 | `omarchy/{branding,extensions,hooks,agents}/` | same under `~/.config/omarchy/` |
-| `plugins/*` | `~/.config/omarchy/plugins/` (skips this plugin and other git-managed checkouts’ `.git`; shebang/ELF helpers keep the execute bit) |
+| `plugins.json` | Plugins installed with git (`omarchy plugin add`): id, version, commit, and source URL. Never copied as files; see below. |
+| `plugins/*` | `~/.config/omarchy/plugins/` for plugins that are **not** git checkouts, file by file (skips this plugin; shebang/ELF helpers keep the execute bit) |
 | `bin/*` | `~/.local/bin/` (scripts already in the repo, plus local helpers named by bindings, hooks, or plugins) |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
+
+### Git-installed plugins
+
+A plugin folder with a `.git` checkout is never copied in either direction, so Apply cannot downgrade it or leave `omarchy plugin update` refusing to fast-forward. Instead, Publish records it in `plugins.json` (credentials are stripped from the source URL), and on the other machine the Changes tab shows:
+
+- **Install** when a listed plugin is missing. It opens Omarchy's own plugin installer (`omarchy plugin add <source>`) in a floating terminal, so you see Omarchy's warning and confirm there.
+- **Update** when the repo lists a newer version or a commit this checkout has not seen. It opens `omarchy plugin update <id>`, which pulls the plugin's upstream, not the repo.
+- An outgoing row when this machine is ahead, or when you uninstalled a listed plugin (unticked by default).
+
+Repos that already hold copied files for a git plugin under `plugins/<id>/` stop applying them. Publishing that plugin's list entry removes the copy from the repo. Plugins without `.git` (your own, or a clone of a built-in) keep syncing file by file.
 
 Machine-local files are **not** applied unless you enable **Include machine-local files**:
 
