@@ -1684,6 +1684,21 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
             else:
                 status = "added-repo"
                 summary = "Not installed here · the list has no git source, so install it by hand"
+        elif there and not here:
+            # Listed, and a folder is here, but not a git checkout (an older
+            # full-copy sync or a hand copy). The list covers it, so its files
+            # are not offered either: without this row it would vanish from sync.
+            if (ctx.config_plugins / pid).is_symlink():
+                continue  # a deliberate dev link: leave it alone
+            status = "repo"
+            if there["source"]:
+                action = "reinstall"
+                summary = (
+                    f"Installed here as plain files, not from git · reinstall {describe_plugin_version(there)}"
+                    f" from {there['source']} to track updates"
+                )
+            else:
+                summary = "Installed here as plain files · the list has no git source, so reinstall it by hand"
         elif here and there:
             side = plugin_newer_side(ctx.config_plugins / pid, here, there)
             if side == "repo":
@@ -4938,6 +4953,47 @@ def cmd_install_plugin(ctx: Context, args: argparse.Namespace) -> dict[str, Any]
     return snap
 
 
+def reinstall_plugin_command(plugin_dir: Path, backup: Path, source: str) -> str:
+    """Shell for Omarchy's terminal: move the plain copy aside, then `plugin add`.
+
+    The trap puts the old copy back whenever no plugin ended up in its place:
+    the user declined Omarchy's prompt, the clone failed, or the window closed.
+    The copy is moved, never deleted, so a successful reinstall leaves it in
+    the backup folder.
+    """
+    d, b, s = shlex.quote(str(plugin_dir)), shlex.quote(str(backup)), shlex.quote(source)
+    return (
+        f"( trap '[ -e {d} ] || mv {b} {d}' EXIT HUP INT TERM; "
+        f"mkdir -p {shlex.quote(str(backup.parent))} && mv {d} {b} && omarchy-plugin-add {s} )"
+    )
+
+
+def cmd_reinstall_plugin(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Replace a plain-file copy of a listed plugin with Omarchy's git install."""
+    pid = listed_plugin_arg(args)
+    repo = configured_repo(ctx)
+    entry = repo_plugin_list(repo).get(pid)
+    if not entry:
+        raise SyncError(f"{pid} is not in the repo's plugin list.")
+    if not entry["source"]:
+        raise SyncError(f"The repo's plugin list has no git source for {pid}. Reinstall it by hand.")
+    plugin_dir = ctx.config_plugins / pid
+    if plugin_dir.is_symlink() or not plugin_dir.is_dir():
+        raise SyncError(f"{pid} is not installed here as a plain folder.")
+    if is_git_plugin_dir(plugin_dir):
+        raise SyncError(f"{pid} is already a git install. Use Update instead.")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = ctx.home / ".config" / f"omarchy-backup.{stamp}" / "plugins" / pid
+    if not launch_omarchy_terminal(reinstall_plugin_command(plugin_dir, backup, entry["source"])):
+        raise SyncError(f"Could not open Omarchy's plugin installer. Run: omarchy plugin add {entry['source']}")
+    snap = build_snapshot(ctx, fetch=False)
+    snap["message"] = (
+        f"Opened Omarchy's installer for {entry['name']}. The old copy moves to {backup.parent.parent}. "
+        "Refresh this panel when it finishes."
+    )
+    return snap
+
+
 def cmd_update_plugin(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     """Open Omarchy's own `plugin update` flow for a git-installed plugin."""
     pid = listed_plugin_arg(args)
@@ -4973,6 +5029,7 @@ def build_parser() -> argparse.ArgumentParser:
             "terminal",
             "install-plugin",
             "update-plugin",
+            "reinstall-plugin",
         ],
     )
     parser.add_argument("args", nargs="*")
@@ -5027,6 +5084,8 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_install_plugin(ctx, args)
     if command == "update-plugin":
         return cmd_update_plugin(ctx, args)
+    if command == "reinstall-plugin":
+        return cmd_reinstall_plugin(ctx, args)
     raise SyncError(f"Unknown command: {command}")
 
 
