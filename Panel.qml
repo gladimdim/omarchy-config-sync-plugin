@@ -624,6 +624,10 @@ Panel {
       run(["resync", "--side", "repo"])
     } else if (kind === "resync-local") {
       run(["resync", "--side", "local"])
+    } else if (kind === "mirror-local") {
+      run(["resync", "--side", "local", "--mirror"])
+    } else if (kind === "mirror-repo") {
+      run(["resync", "--side", "repo", "--mirror"])
     }
   }
 
@@ -1248,7 +1252,11 @@ Panel {
                       ? "Make this machine match the git repo? Incoming plugins, shortcuts, theme, and configs overwrite local copies. A timestamped backup is written first. Extra files that exist only on this machine are left in place."
                       : root.confirmKind === "resync-local"
                         ? "Overwrite the git repo with this machine's config, then push?"
-                        : "Unlink the config repo on this machine? Local files are left as they are."
+                        : root.confirmKind === "mirror-local"
+                          ? "Mirror this machine into the repo, then push? Everything goes up: bindings.lua as a whole file, every plugin, hook and bin tool, the theme, and machine-local files such as the display layout. Keep the repo private."
+                          : root.confirmKind === "mirror-repo"
+                            ? "Make this machine an exact copy of the repo? Everything is applied: bindings.lua as a whole file, every plugin, hook and bin tool, the theme, and machine-local files such as the display layout. A backup is written first, then Omarchy's installer opens for listed plugins. Files that exist only here are left alone."
+                            : "Unlink the config repo on this machine? Local files are left as they are."
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -1278,7 +1286,18 @@ Panel {
               width: parent.width
 
               Button {
-                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "switch-repo" ? "Switch repo" : (root.confirmKind === "resync-repo" ? "Take repo" : (root.confirmKind === "resync-local" ? "Take this machine" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply"))))
+                text: {
+                  switch (root.confirmKind) {
+                    case "disconnect": return "Unlink"
+                    case "switch-repo": return "Switch repo"
+                    case "resync-repo": return "Take repo"
+                    case "resync-local": return "Take this machine"
+                    case "mirror-local": return "Mirror & push"
+                    case "mirror-repo": return "Mirror onto this machine"
+                    case "publish": return root.syncState === "empty" ? "Seed & push" : "Publish"
+                    default: return "Apply"
+                  }
+                }
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
@@ -1388,6 +1407,49 @@ Panel {
             foreground: root.foreground
             fontFamily: root.fontFamily
             onClicked: root.reviewChanges()
+          }
+        }
+        Button {
+          text: "Seed everything (exact mirror)"
+          iconText: "󰆏"
+          tooltipText: "Everything, ticked or not: whole bindings.lua, plugins, hooks, bin, theme, display layout"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: !root.busy
+          onClicked: root.confirmKind = "mirror-local"
+        }
+      }
+
+      // Recreate a machine exactly: everything from one side, one press.
+      CardBox {
+        visible: root.syncState !== "empty"
+
+        GuideStep {
+          step: "󰆏"
+          title: "Mirror (recreate exactly)"
+          body: "Everything, not just the ticked items: bindings.lua as a whole file, every plugin, hook and bin tool, the theme, and machine-local files like the display layout. Files that exist only on the receiving side are left alone."
+        }
+        Row {
+          spacing: Style.space(8)
+          Button {
+            text: "Mirror onto this machine"
+            iconText: "󰁨"
+            tooltipText: "Make this machine an exact copy of the repo. A backup is written first."
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            enabled: !root.busy
+            onClicked: root.confirmKind = "mirror-repo"
+          }
+          Button {
+            text: "Mirror this machine to repo"
+            iconText: "󰓂"
+            tooltipText: "Push everything on this machine into the repo"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            enabled: !root.busy
+            onClicked: root.confirmKind = "mirror-local"
           }
         }
       }

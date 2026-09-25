@@ -143,6 +143,22 @@ Both machines need the **same Config Sync plugin version** (Overview shows `Plug
 
 ---
 
+## Recreate a machine exactly (Mirror)
+
+Normal Apply/Publish is careful: plugins, hooks and `~/.local/bin` tools are never ticked by default, the display layout stays machine-local, and shortcuts that call helper functions are skipped one by one. When you want a **carbon copy** instead, use Mirror on the Overview tab:
+
+| Button | Does |
+| --- | --- |
+| **Seed everything (exact mirror)** | First push of an empty repo with everything, ticked or not |
+| **Mirror this machine to repo** | Pushes everything on this machine into the repo |
+| **Mirror onto this machine** | Applies everything from the repo, then opens Omarchy's installer once for every listed plugin not installed here |
+
+"Everything" means `hypr/bindings.lua` as a whole file (so binds with inline functions and `[[...]]` strings survive), every plugin, hook and bin tool, the theme, and machine-local files such as `hypr/monitors.lua`. Hidden items stay hidden. Mirror never deletes files that exist only on the receiving side, and Apply writes a timestamped backup first.
+
+From a terminal: `config_sync.py resync --side local --mirror` or `--side repo --mirror` (add `--dry-run` to preview).
+
+---
+
 ## If something goes wrong
 
 **“Git could not authenticate”**  

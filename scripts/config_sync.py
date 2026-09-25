@@ -4004,6 +4004,54 @@ def parse_files_arg(raw: str | None, explicit: bool = False) -> set[str] | None:
     return set(parts)
 
 
+# Mirror takes every change coming from one side, including the code-running
+# items (plugins, hooks, bin) that are never ticked by default. Files that only
+# exist on the receiving side are left alone: mirroring never deletes extras.
+MIRROR_STATUSES = {
+    "apply": {"repo", "added-repo", "differs", "both"},
+    "publish": {"local", "added-local", "differs", "both"},
+}
+
+
+def mirror_paths(diff_files: list[dict[str, Any]], direction: str) -> set[str]:
+    wanted_statuses = MIRROR_STATUSES[direction]
+    # Machine-local files (display layout, machine_local paths) carry no
+    # direction; a mirror sends them whenever the sending side has one.
+    source_key = "repo_exists" if direction == "apply" else "local_exists"
+    return {
+        i["path"]
+        for i in diff_files
+        if not i.get("hidden")
+        and (i["status"] in wanted_statuses or (i["status"] == "machine" and i.get(source_key)))
+    }
+
+
+def launch_mirror_plugins(commands: list[str], dry_run: bool) -> str:
+    """One Omarchy terminal that installs/updates each plugin in turn; a message note."""
+    if not commands:
+        return ""
+    n = len(commands)
+    label = f"{n} plugin{'s' if n != 1 else ''}"
+    if dry_run:
+        return f" Would open Omarchy's installer for {label}."
+    if not launch_omarchy_terminal("; ".join(commands)):
+        return f" Could not open Omarchy's installer for {label}: run them from Changes."
+    return f" Opened Omarchy's installer for {label}; confirm each there."
+
+
+def mirror_plugin_commands(rows: list[dict[str, Any]]) -> list[str]:
+    """Omarchy's own install/update commands for every listed plugin this machine lacks."""
+    commands = []
+    for row in rows:
+        if row.get("hidden"):
+            continue
+        if row.get("action") == "install" and row.get("source"):
+            commands.append("omarchy-plugin-add " + shlex.quote(row["source"]))
+        elif row.get("action") == "update":
+            commands.append("omarchy-plugin-update " + shlex.quote(row["id"]))
+    return commands
+
+
 def extract_widget_entry(shell_data: Any) -> tuple[str | None, dict[str, Any] | None, int]:
     if not isinstance(shell_data, dict):
         return None, None, -1
@@ -4087,6 +4135,11 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
     plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
     wanted = parse_files_arg(args.files, explicit=explicit)
+    mirror = bool(getattr(args, "mirror", False))
+    if mirror:
+        args.include_machine = True
+        wanted = mirror_paths(diff["files"], "apply")
+    plugin_cmds = mirror_plugin_commands(diff.get("plugin_list") or []) if mirror else []
     if plugin_ids:
         extra = expand_plugin_paths(diff["files"], plugin_ids, "apply")
         wanted = set() if wanted is None else set(wanted)
@@ -4116,22 +4169,25 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "apply")
     if requested_shortcuts:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
-    chosen, shortcut_keys, skipped_shortcuts = drop_unloadable_bindings_file(
-        chosen,
-        repo / "hypr" / "bindings.lua",
-        repo,
-        shortcut_keys,
-        skipped_shortcuts,
-        diff.get("shortcuts") or [],
-        {"added-repo", "repo", "differs"},
-        "repo_portable",
-    )
+    # A mirror copies bindings.lua exactly, with the rest of hypr/ beside it.
+    if not mirror:
+        chosen, shortcut_keys, skipped_shortcuts = drop_unloadable_bindings_file(
+            chosen,
+            repo / "hypr" / "bindings.lua",
+            repo,
+            shortcut_keys,
+            skipped_shortcuts,
+            diff.get("shortcuts") or [],
+            {"added-repo", "repo", "differs"},
+            "repo_portable",
+        )
     if not chosen and not shortcut_keys:
+        plugin_note = launch_mirror_plugins(plugin_cmds, bool(getattr(args, "dry_run", False)))
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["removed"] = []
         snap["skipped_shortcuts"] = skipped_shortcuts
-        snap["message"] = "Nothing to apply." + skipped_shortcut_note(skipped_shortcuts)
+        snap["message"] = ("Nothing to apply." if not plugin_note else "No files to apply.") + plugin_note + skipped_shortcut_note(skipped_shortcuts)
         return snap
 
     if getattr(args, "dry_run", False):
@@ -4154,6 +4210,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             f"Dry run: would apply {len(applied)} file{'s' if len(applied) != 1 else ''}"
             + (f" ({len(removed)} removed from this machine)" if removed else "")
             + "."
+            + launch_mirror_plugins(plugin_cmds, True)
             + skipped_shortcut_note(skipped_shortcuts)
         )
         return snap
@@ -4247,6 +4304,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo"
         + (f" ({len(removed)} removed from this machine)" if removed else "")
         + f".{theme_msg}"
+        + launch_mirror_plugins(plugin_cmds, bool(args.dry_run))
         + skipped_shortcut_note(skipped_shortcuts)
     )
     snap["skipped_shortcuts"] = skipped_shortcuts
@@ -4303,6 +4361,15 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         if row["id"] in list_ids and row["status"] in {"local", "added-local"}
     ]
     wanted = parse_files_arg(args.files, explicit=explicit)
+    mirror = bool(getattr(args, "mirror", False))
+    if mirror:
+        args.include_machine = True
+        wanted = mirror_paths(diff["files"], "publish")
+        list_rows = [
+            row
+            for row in diff.get("plugin_list") or []
+            if not row.get("hidden") and row["status"] in {"local", "added-local"}
+        ]
     if plugin_ids:
         extra = expand_plugin_paths(diff["files"], plugin_ids, "publish")
         wanted = set() if wanted is None else set(wanted)
@@ -4332,16 +4399,18 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "publish")
     if requested_shortcuts:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
-    chosen, shortcut_keys, skipped_shortcuts = drop_unloadable_bindings_file(
-        chosen,
-        ctx.config_hypr / "bindings.lua",
-        ctx.home,
-        shortcut_keys,
-        skipped_shortcuts,
-        diff.get("shortcuts") or [],
-        {"added-local", "local", "differs"},
-        "local_portable",
-    )
+    # A mirror copies bindings.lua exactly, with the rest of hypr/ beside it.
+    if not mirror:
+        chosen, shortcut_keys, skipped_shortcuts = drop_unloadable_bindings_file(
+            chosen,
+            ctx.config_hypr / "bindings.lua",
+            ctx.home,
+            shortcut_keys,
+            skipped_shortcuts,
+            diff.get("shortcuts") or [],
+            {"added-local", "local", "differs"},
+            "local_portable",
+        )
     if not chosen and not shortcut_keys and not list_rows:
         if getattr(args, "dry_run", False):
             snap = build_snapshot(ctx, fetch=False)
@@ -4550,6 +4619,37 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         for row in (diff.get("plugin_list") or [])
         if side == "local" and not row.get("hidden") and row.get("status") in {"local", "added-local"}
     ]
+
+    if getattr(args, "mirror", False):
+        # Mirror: everything from one side, bindings.lua as a whole file,
+        # machine-local files included, listed plugins installed on arrival.
+        mirror_args = argparse.Namespace(
+            explicit=False,
+            files=None,
+            shortcut=[],
+            plugin=[],
+            list_plugin=[],
+            theme=False,
+            mirror=True,
+            fetch=False,
+            push=side == "local",
+            include_machine=True,
+            dry_run=bool(getattr(args, "dry_run", False)),
+            message=getattr(args, "message", None),
+            delete_clone=False,
+            side=side,
+            args=[],
+            command="apply" if side == "repo" else "publish",
+            url=None,
+        )
+        if side == "repo":
+            result = cmd_apply(ctx, mirror_args)
+            result["message"] = "Mirrored the repo onto this machine. " + str(result.get("message") or "")
+        else:
+            result = cmd_publish(ctx, mirror_args)
+            result["message"] = "Mirrored this machine into the repo. " + str(result.get("message") or "")
+        result["resync"] = side
+        return result
 
     nested = argparse.Namespace(
         explicit=True,
@@ -4983,6 +5083,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fetch", action="store_true")
     parser.add_argument("--push", action="store_true")
     parser.add_argument("--include-machine", action="store_true")
+    parser.add_argument("--mirror", action="store_true")
     parser.add_argument("--files", default=None)
     parser.add_argument("--explicit", action="store_true")
     parser.add_argument("--shortcut", action="append", default=None)
