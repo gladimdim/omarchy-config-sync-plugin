@@ -437,3 +437,21 @@ function relativeAgo(iso) {
   if (seconds < 86400) return Math.floor(seconds / 3600) + "h ago"
   return Math.floor(seconds / 86400) + "d ago"
 }
+
+function pluginActionLabel(action) {
+  if (action === "update") return "Update"
+  if (action === "reinstall") return "Reinstall"
+  return "Install"
+}
+
+function pluginActionIcon(action) {
+  if (action === "update") return "󰚰"
+  if (action === "reinstall") return "󰑐"
+  return "󰏗"
+}
+
+function pluginActionTip(action) {
+  if (action === "update") return "Open Omarchy's plugin updater in a terminal"
+  if (action === "reinstall") return "Move this plain copy to a backup and install it from git in a terminal"
+  return "Open Omarchy's plugin installer in a terminal"
+}

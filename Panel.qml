@@ -538,6 +538,7 @@ Panel {
   function runPluginAction(action, id) {
     if (action === "install") run(["install-plugin", id])
     else if (action === "update") run(["update-plugin", id])
+    else if (action === "reinstall") run(["reinstall-plugin", id])
   }
 
   function selectSide(kind, id, side) {
@@ -2736,11 +2737,9 @@ Panel {
               Button {
                 id: catActionBtn
                 visible: catRowBox.rowAction !== ""
-                text: catRowBox.rowAction === "update" ? "Update" : "Install"
-                iconText: catRowBox.rowAction === "update" ? "󰚰" : "󰏗"
-                tooltipText: catRowBox.rowAction === "update"
-                  ? "Open Omarchy's plugin updater in a terminal"
-                  : "Open Omarchy's plugin installer in a terminal"
+                text: Model.pluginActionLabel(catRowBox.rowAction)
+                iconText: Model.pluginActionIcon(catRowBox.rowAction)
+                tooltipText: Model.pluginActionTip(catRowBox.rowAction)
                 bordered: true
                 foreground: root.foreground
                 fontFamily: root.fontFamily
@@ -3118,11 +3117,9 @@ Panel {
           Button {
             id: actionBtn
             visible: rowBox.rowAction !== ""
-            text: rowBox.rowAction === "update" ? "Update" : "Install"
-            iconText: rowBox.rowAction === "update" ? "󰚰" : "󰏗"
-            tooltipText: rowBox.rowAction === "update"
-              ? "Open Omarchy's plugin updater in a terminal"
-              : "Open Omarchy's plugin installer in a terminal"
+            text: Model.pluginActionLabel(rowBox.rowAction)
+            iconText: Model.pluginActionIcon(rowBox.rowAction)
+            tooltipText: Model.pluginActionTip(rowBox.rowAction)
             bordered: true
             foreground: root.foreground
             fontFamily: root.fontFamily
