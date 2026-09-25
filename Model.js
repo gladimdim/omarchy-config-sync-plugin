@@ -127,6 +127,9 @@ function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCo
     changed_count: changedCount || 0,
     hidden: !!hidden,
     removal: false,
+    // Rows with an action (Install/Update) are buttons, not Apply/Publish picks.
+    pickable: true,
+    action: "",
     changes: changes || []
   }
 }
@@ -167,7 +170,7 @@ function itemCategory(item) {
   if (!item) return "other"
   if (item.kind === "s") return "shortcuts"
   if (item.kind === "t") return "theme"
-  if (item.kind === "p") return "plugins"
+  if (item.kind === "p" || item.kind === "l") return "plugins"
   if (item.kind === "g") {
     var id = String(item.itemId || "")
     if (id.indexOf("plugin:") === 0) return "plugins"
@@ -201,6 +204,7 @@ function pickedInItems(items, picks) {
   var list = items || []
   var map = picks || {}
   for (var i = 0; i < list.length; i++) {
+    if (list[i].pickable === false) continue
     if (map[list[i].kind + ":" + list[i].itemId]) n++
   }
   return n
@@ -284,6 +288,25 @@ function appendBundles(out, list, both, hiddenMap) {
   }
 }
 
+// Git plugins from plugins.json. Outgoing rows publish list entries; incoming
+// rows are never copied and only offer Omarchy's Install/Update flow.
+function pluginListItem(p, hidden) {
+  var row = reviewItem("l", p.id, p.name || p.id, p.summary || "", p.status, "Plugin", false, 0, hidden)
+  row.removal = !!p.removal
+  row.action = String(p.action || "")
+  row.pickable = p.status === "local" || p.status === "added-local"
+  return row
+}
+
+function appendPluginList(out, list, hiddenMap) {
+  var rows = list || []
+  for (var i = 0; i < rows.length; i++) {
+    var p = rows[i]
+    if (isItemHidden("l", p.id, hiddenMap, p)) continue
+    out.push(pluginListItem(p, false))
+  }
+}
+
 function appendLooseFiles(out, files, both, hiddenMap) {
   var rows = files || []
   for (var i = 0; i < rows.length; i++) {
@@ -298,22 +321,24 @@ function appendLooseFiles(out, files, both, hiddenMap) {
   }
 }
 
-function buildIncomingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles, hiddenMap) {
+function buildIncomingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles, hiddenMap, pluginList) {
   var out = []
   appendThemes(out, theme, hiddenMap)
   appendShortcuts(out, addedShortcuts, "label", false, hiddenMap)
   appendShortcuts(out, changedShortcuts, "detail", false, hiddenMap)
   appendBundles(out, bundles, false, hiddenMap)
+  appendPluginList(out, pluginList, hiddenMap)
   appendLooseFiles(out, files, false, hiddenMap)
   return out
 }
 
-function buildOutgoingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles, hiddenMap) {
+function buildOutgoingItems(theme, addedShortcuts, changedShortcuts, bundles, files, allFiles, hiddenMap, pluginList) {
   var out = []
   appendThemes(out, theme, hiddenMap)
   appendShortcuts(out, addedShortcuts, "label", false, hiddenMap)
   appendShortcuts(out, changedShortcuts, "detail", false, hiddenMap)
   appendBundles(out, bundles, false, hiddenMap)
+  appendPluginList(out, pluginList, hiddenMap)
   appendLooseFiles(out, files, false, hiddenMap)
   return out
 }
@@ -327,7 +352,7 @@ function buildBothItems(theme, shortcuts, bundles, files, allFiles, hiddenMap) {
   return out
 }
 
-function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap) {
+function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap, pluginList) {
   var out = []
   var seen = {}
   function addHidden(kind, id, label, summary, status, typeLabel, both, count, removal) {
@@ -365,6 +390,15 @@ function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap)
       var sum = b.summary || (n + (n === 1 ? " file" : " files"))
       addHidden("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, b.status === "both", n, b.removal)
     }
+  }
+
+  var lList = pluginList || []
+  for (var li = 0; li < lList.length; li++) {
+    var lp = lList[li]
+    var lkey = "l:" + lp.id
+    if (seen[lkey] || !isItemHidden("l", lp.id, hiddenMap, lp)) continue
+    seen[lkey] = true
+    out.push(pluginListItem(lp, true))
   }
 
   var fList = files || []

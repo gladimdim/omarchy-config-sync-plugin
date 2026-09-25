@@ -2617,6 +2617,15 @@ class PluginVersionTests(unittest.TestCase):
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(cs.PLUGIN_VERSION, manifest["version"])
 
+    def test_snapshot_reports_version_before_and_after_linking(self) -> None:
+        """The panel title shows the version, including before a repo is linked."""
+        with TempHome() as env:
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertEqual(snap["status"]["plugin_version"], cs.PLUGIN_VERSION)
+            repo = make_config_repo(env.home / "cfg")
+            snap = cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            self.assertEqual(snap["status"]["plugin_version"], cs.PLUGIN_VERSION)
+
 
 class UnresolvedBothGateTests(unittest.TestCase):
     """The Apply/Publish gate must be satisfiable from the UI.
@@ -2695,6 +2704,297 @@ console.log(JSON.stringify({{ unresolvedBoth: unresolvedBoth }}));
         picks = {"p:demo.plugin": True, "g:plugin:demo.plugin": True}
         both_picks = {"g:plugin:demo.plugin": "repo"}
         self.assertEqual(self._unresolved_both(picks, both_picks), 0)
+
+
+def make_git_plugin(root: Path, pid: str, version: str, origin: str | None = None) -> Path:
+    """A plugin checkout as `omarchy plugin add` leaves it."""
+    init_repo(root)
+    write(
+        root / "manifest.json",
+        json.dumps({"schemaVersion": 1, "id": pid, "name": pid.title(), "version": version, "kinds": ["bar-widget"]}),
+    )
+    write(root / "Main.qml", f"import QtQuick\nItem {{ /* {version} */ }}\n")
+    commit_all(root, f"v{version}")
+    if origin:
+        git(root, "remote", "add", "origin", origin)
+    return root
+
+
+def write_plugin_list(repo: Path, entries: list[dict[str, str]]) -> None:
+    write(repo / cs.PLUGIN_LIST_REL, json.dumps({"format": cs.PLUGIN_LIST_FORMAT, "version": 1, "plugins": entries}))
+
+
+class PluginListTests(unittest.TestCase):
+    """Git plugins sync as plugins.json entries, never as copied files (#18)."""
+
+    PID = "acme.weather"
+    SOURCE = "https://github.com/acme/omarchy-weather.git"
+
+    def _vendor_old_copy(self, repo: Path) -> None:
+        write(repo / "plugins" / self.PID / "manifest.json", json.dumps({"id": self.PID, "name": "Weather", "version": "1.0.0"}))
+        write(repo / "plugins" / self.PID / "Main.qml", "import QtQuick\nItem { /* 1.0.0 */ }\n")
+        commit_all(repo, "vendored weather 1.0.0")
+
+    def _plugin_rows(self, snap: dict) -> dict[str, dict]:
+        return {row["id"]: row for row in snap["diff"]["plugin_list"]}
+
+    def test_clean_plugin_source(self) -> None:
+        clean = cs.clean_plugin_source
+        self.assertEqual(clean("https://github.com/a/b.git"), "https://github.com/a/b.git")
+        self.assertEqual(clean("https://user:ghp_secret@github.com/a/b.git"), "https://github.com/a/b.git")
+        self.assertEqual(clean("git@github.com:a/b.git"), "git@github.com:a/b.git")
+        self.assertEqual(clean("ssh://git:pw@example.com:2222/a/b"), "ssh://git@example.com:2222/a/b")
+        for bad in (
+            "",
+            "/home/me/plugins/b",
+            "file:///tmp/b",
+            "ext::sh -c touch% /tmp/pwned",
+            "http://github.com/a/b.git",
+            "-uhttps://github.com/a/b",
+            "https://github.com/a/b.git?x=1",
+            "https://github.com/a/b c",
+            "https://github.com/a/$(id)",
+            None,
+            42,
+        ):
+            self.assertIsNone(clean(bad), bad)
+
+    def test_git_plugin_files_are_never_copied_over_a_checkout(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            self._vendor_old_copy(repo)
+            plugin = make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.1.0", self.SOURCE)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertFalse([f for f in snap["diff"]["files"] if f["path"].startswith(f"plugins/{self.PID}/")])
+            self.assertFalse([b for b in snap["diff"]["bundles"] if b.get("plugin_id") == self.PID])
+
+            # Neither an explicit tick nor Resync from repo may touch the checkout.
+            cs.cmd_apply(
+                env.ctx,
+                argparse_ns(explicit=True, files=f"plugins/{self.PID}/Main.qml", plugin=[self.PID]),
+            )
+            cs.cmd_resync(env.ctx, argparse_ns(side="repo"))
+            self.assertIn("1.1.0", (plugin / "Main.qml").read_text(encoding="utf-8"))
+            self.assertEqual(git(plugin, "status", "--porcelain").stdout.strip(), "")
+
+    def test_publish_lists_git_plugin_and_drops_vendored_copy(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            self._vendor_old_copy(repo)
+            plugin = make_git_plugin(
+                env.ctx.config_plugins / self.PID,
+                self.PID,
+                "1.1.0",
+                "https://someone:ghp_token@github.com/acme/omarchy-weather.git",
+            )
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual(row["status"], "added-local")
+            self.assertTrue(row["default_publish"])
+            self.assertTrue(row["vendored"])
+
+            published = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", list_plugin=[self.PID]))
+            self.assertTrue(published["ok"], published)
+            self.assertEqual(published["plugin_list"], [self.PID])
+            self.assertTrue(published["committed"])
+            data = json.loads((repo / cs.PLUGIN_LIST_REL).read_text(encoding="utf-8"))
+            self.assertEqual(data["format"], cs.PLUGIN_LIST_FORMAT)
+            entry = data["plugins"][0]
+            self.assertEqual(entry["id"], self.PID)
+            self.assertEqual(entry["version"], "1.1.0")
+            self.assertEqual(entry["source"], self.SOURCE)
+            self.assertEqual(entry["commit"], git(plugin, "rev-parse", "HEAD").stdout.strip())
+            self.assertNotIn("ghp_token", (repo / cs.PLUGIN_LIST_REL).read_text(encoding="utf-8"))
+            self.assertFalse((repo / "plugins" / self.PID).exists())
+            self.assertEqual(git(repo, "status", "--porcelain").stdout.strip(), "")
+
+            # Once listed and in sync there is nothing left to review for it.
+            self.assertNotIn(self.PID, self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns())))
+
+    def test_non_git_plugins_still_sync_file_by_file(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write(env.ctx.config_plugins / "local.tool" / "manifest.json", json.dumps({"id": "local.tool", "name": "Local"}))
+            write(env.ctx.config_plugins / "local.tool" / "Main.qml", "Item {}\n")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertNotIn("local.tool", self._plugin_rows(snap))
+            published = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", plugin=["local.tool"]))
+            self.assertIn("plugins/local.tool/Main.qml", published["published"])
+            self.assertTrue((repo / "plugins" / "local.tool" / "Main.qml").is_file())
+            self.assertFalse((repo / cs.PLUGIN_LIST_REL).exists())
+
+    def test_listed_plugin_offers_omarchy_install(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            self._vendor_old_copy(repo)
+            write_plugin_list(repo, [{"id": self.PID, "name": "Weather", "version": "1.1.0", "source": self.SOURCE}])
+            commit_all(repo, "list weather")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            row = self._plugin_rows(snap)[self.PID]
+            self.assertEqual((row["status"], row["action"]), ("added-repo", "install"))
+            self.assertFalse(row["default_publish"])
+            # The vendored copy is not offered as a file bundle either.
+            self.assertFalse([b for b in snap["diff"]["bundles"] if b.get("plugin_id") == self.PID])
+            listed = next(p for p in snap["inspect"]["plugins"] if p["id"] == self.PID)
+            self.assertTrue(listed["git"])
+            self.assertFalse(listed["installed"])
+
+            launched: list[str] = []
+            with patch.object(cs, "launch_omarchy_terminal", side_effect=lambda cmd: launched.append(cmd) or True):
+                result = cs.cmd_install_plugin(env.ctx, argparse_ns(args=[self.PID]))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(launched, [f"omarchy-plugin-add {self.SOURCE}"])
+            self.assertFalse((env.ctx.config_plugins / self.PID).exists())
+
+    def test_install_refuses_unlisted_installed_or_sourceless_plugins(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(
+                repo,
+                [
+                    {"id": self.PID, "source": self.SOURCE},
+                    {"id": "no.source", "source": "ext::sh -c id"},
+                ],
+            )
+            commit_all(repo, "list")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.0.0", self.SOURCE)
+            with patch.object(cs, "launch_omarchy_terminal") as launch:
+                for pid in ("missing.plugin", "no.source", self.PID, "../escape", "-rf"):
+                    with self.assertRaises(cs.SyncError, msg=pid):
+                        cs.cmd_install_plugin(env.ctx, argparse_ns(args=[pid]))
+                launch.assert_not_called()
+
+    def test_version_drift_offers_update_or_publish(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(repo, [{"id": self.PID, "name": "Weather", "version": "1.2.0", "source": self.SOURCE}])
+            commit_all(repo, "list")
+            make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.1.0", self.SOURCE)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual((row["status"], row["action"]), ("repo", "update"))
+            self.assertFalse(row["default_publish"])
+            launched: list[str] = []
+            with patch.object(cs, "launch_omarchy_terminal", side_effect=lambda cmd: launched.append(cmd) or True):
+                cs.cmd_update_plugin(env.ctx, argparse_ns(args=[self.PID]))
+            self.assertEqual(launched, [f"omarchy-plugin-update {self.PID}"])
+
+            write_plugin_list(repo, [{"id": self.PID, "name": "Weather", "version": "1.0.0", "source": self.SOURCE}])
+            commit_all(repo, "older entry")
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual((row["status"], row["action"]), ("local", ""))
+            self.assertTrue(row["default_publish"])
+
+    def test_unseen_upstream_commit_is_an_update(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            plugin = make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.0.0", self.SOURCE)
+            old = git(plugin, "rev-parse", "HEAD").stdout.strip()
+            write_plugin_list(repo, [{"id": self.PID, "version": "1.0.0", "commit": "f" * 40, "source": self.SOURCE}])
+            commit_all(repo, "list")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual(row["action"], "update")
+
+            # A listed commit this checkout already contains means this side is ahead.
+            write(plugin / "Main.qml", "Item {}\n")
+            commit_all(plugin, "same version, newer commit")
+            write_plugin_list(repo, [{"id": self.PID, "version": "1.0.0", "commit": old, "source": self.SOURCE}])
+            commit_all(repo, "old commit")
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual((row["status"], row["action"]), ("local", ""))
+
+    def test_uninstalled_here_publishes_a_removal(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            plugin = make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.0.0", self.SOURCE)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", list_plugin=[self.PID]))
+            self.assertEqual(cs.load_state(env.ctx).get("plugin_list"), [self.PID])
+
+            shutil.rmtree(plugin)
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual(row["status"], "local")
+            self.assertTrue(row["removal"])
+            self.assertFalse(row["default_publish"])
+
+            cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", list_plugin=[self.PID]))
+            data = json.loads((repo / cs.PLUGIN_LIST_REL).read_text(encoding="utf-8"))
+            self.assertEqual(data["plugins"], [])
+            self.assertNotIn(self.PID, self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns())))
+
+    def test_dropped_from_list_elsewhere_is_not_republished_by_default(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.0.0", self.SOURCE)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", list_plugin=[self.PID]))
+            write_plugin_list(repo, [])
+            commit_all(repo, "another machine removed it")
+
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual(row["status"], "added-local")
+            self.assertFalse(row["default_publish"])
+            # A later sync must keep remembering it, or the next default Publish re-adds it.
+            cs.cmd_apply(env.ctx, argparse_ns())
+            self.assertIn(self.PID, cs.load_state(env.ctx).get("plugin_list") or [])
+
+    def test_hidden_plugin_list_row(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(repo, [{"id": self.PID, "source": self.SOURCE}])
+            commit_all(repo, "list")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            snap = cs.cmd_hide(env.ctx, argparse_ns(args=[f"l:{self.PID}"]))
+            self.assertTrue(self._plugin_rows(snap)[self.PID]["hidden"])
+            snap = cs.cmd_unhide(env.ctx, argparse_ns(args=[self.PID]))
+            self.assertFalse(self._plugin_rows(snap)[self.PID]["hidden"])
+
+    def test_model_plugin_list_rows(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        script = f"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync({json.dumps(str(ROOT / "Model.js"))}, 'utf8').replace(/^\\.pragma\\s+library\\s*/m, '');
+const ctx = {{}};
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+const incoming = ctx.buildIncomingItems([], [], [], [], [], [], {{}}, [
+  {{ id: 'acme.weather', name: 'Weather', status: 'added-repo', action: 'install', summary: 'Not installed here' }}
+]);
+const outgoing = ctx.buildOutgoingItems([], [], [], [], [], [], {{}}, [
+  {{ id: 'acme.clock', name: 'Clock', status: 'local', removal: true, summary: 'Uninstalled here' }}
+]);
+const hidden = ctx.buildHiddenItems([], [], [], [], [], {{ 'l:acme.weather': true }}, [
+  {{ id: 'acme.weather', name: 'Weather', status: 'added-repo', action: 'install' }}
+]);
+console.log(JSON.stringify({{
+  incoming, outgoing, hidden,
+  picked: ctx.pickedInItems(incoming.concat(outgoing), {{ 'l:acme.weather': true, 'l:acme.clock': true }}),
+  category: ctx.itemCategory(incoming[0]),
+}}));
+"""
+        out = json.loads(subprocess.run([node, "-e", script], capture_output=True, text=True, check=True).stdout)
+        install = out["incoming"][0]
+        self.assertEqual((install["kind"], install["itemId"], install["action"]), ("l", "acme.weather", "install"))
+        self.assertFalse(install["pickable"])
+        removal = out["outgoing"][0]
+        self.assertTrue(removal["pickable"])
+        self.assertTrue(removal["removal"])
+        self.assertEqual([h["itemId"] for h in out["hidden"]], ["acme.weather"])
+        # Install rows are buttons, never Apply picks.
+        self.assertEqual(out["picked"], 1)
+        self.assertEqual(out["category"], "plugins")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -82,7 +83,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.2.25"
+PLUGIN_VERSION = "1.3.0"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -107,6 +108,15 @@ LOCAL_OVERLAY_EXACT = frozenset({"local.conf", "local.lua", "local.toml"})
 LOCAL_OVERLAY_SUFFIXES = frozenset({"lua", "conf", "toml", "config"})
 THEME_REL = "omarchy/theme.name"
 THEME_SKIP_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+# Git-installed plugins travel as entries in this list, not as copied files.
+PLUGIN_LIST_REL = "plugins.json"
+PLUGIN_LIST_FORMAT = "omarchy-config-plugins"
+PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+PLUGIN_SOURCE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+PLUGIN_SOURCE_PATH_RE = re.compile(r"^[A-Za-z0-9._~/%+-]+$")
+PLUGIN_SOURCE_SCP_RE = re.compile(r"^([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):([A-Za-z0-9._~/%+-]+)$")
+PLUGIN_COMMIT_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+PLUGIN_TERMINAL_LAUNCHER = "omarchy-launch-floating-terminal-with-presentation"
 
 
 class SyncError(Exception):
@@ -1072,9 +1082,11 @@ def validate_repo(path: Path) -> dict[str, Any]:
         for child in sorted(plugins_dir.iterdir()):
             if child.is_dir() and (child / "manifest.json").is_file():
                 plugin_ids.append(child.name)
-        if plugin_ids:
-            score += 2
-            reasons.append(f"{len(plugin_ids)} shell plugins")
+    # Git plugins live only in plugins.json once their copies are dropped.
+    plugin_ids += [pid for pid in repo_plugin_list(path) if pid not in plugin_ids]
+    if plugin_ids:
+        score += 2
+        reasons.append(f"{len(plugin_ids)} shell plugins")
 
     if (path / "apply.sh").is_file() or (path / "sync.sh").is_file():
         score += 1
@@ -1469,6 +1481,329 @@ def collect_bin_names(ctx: Context, repo: Path) -> set[str]:
     return names
 
 
+def valid_plugin_id(plugin_id: Any) -> bool:
+    """Same shape omarchy-plugin-update accepts for an id."""
+    return isinstance(plugin_id, str) and bool(PLUGIN_ID_RE.match(plugin_id)) and ".." not in plugin_id
+
+
+def clean_plugin_source(raw: Any) -> str | None:
+    """A git URL another machine may hand to `omarchy plugin add`, or None.
+
+    Credentials are dropped from https URLs so a token in a local remote never
+    reaches the shared repo. Only https, ssh:// and scp-style user@host:path
+    remotes pass; local paths, file:// and transport helpers (ext::) do not.
+    """
+    if not isinstance(raw, str):
+        return None
+    url = raw.strip()
+    if not url or len(url) > 512 or url.startswith("-"):
+        return None
+    scp = PLUGIN_SOURCE_SCP_RE.match(url)
+    if scp:
+        return url
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in {"https", "ssh"} or parsed.query or parsed.fragment:
+        return None
+    host = parsed.hostname or ""
+    if not PLUGIN_SOURCE_HOST_RE.match(host) or not PLUGIN_SOURCE_PATH_RE.match(parsed.path or ""):
+        return None
+    netloc = host if port is None else f"{host}:{port}"
+    if parsed.scheme == "ssh" and parsed.username and PLUGIN_SOURCE_HOST_RE.match(parsed.username):
+        netloc = f"{parsed.username}@{netloc}"
+    return f"{parsed.scheme}://{netloc}{parsed.path}"
+
+
+def is_git_plugin_dir(plugin_dir: Path) -> bool:
+    """True for a plugin checkout that `omarchy plugin update` manages."""
+    return (plugin_dir / ".git").exists() or os.path.islink(plugin_dir / ".git")
+
+
+def plugin_git_source(plugin_dir: Path) -> str | None:
+    config = plugin_dir / ".git" / "config"
+    if not config.is_file() or config.is_symlink():
+        return None
+    # --file reads only that file: no includes and no repo discovery, so
+    # nothing in the plugin's own git config gets a chance to run.
+    return clean_plugin_source(git_out(None, "config", "--file", str(config), "--get", "remote.origin.url"))
+
+
+def plugin_git_commit(plugin_dir: Path) -> str:
+    head = git_out(plugin_dir, "rev-parse", "--verify", "-q", "HEAD")
+    return head if PLUGIN_COMMIT_RE.match(head) else ""
+
+
+def _short_text(value: Any, limit: int = 200) -> str:
+    return value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def local_plugin_list(ctx: Context) -> dict[str, dict[str, Any]]:
+    """Plugins installed here from git: the entries this machine publishes."""
+    out: dict[str, dict[str, Any]] = {}
+    root = ctx.config_plugins
+    if not root.is_dir() or root.is_symlink():
+        return out
+    for child in sorted(root.iterdir()):
+        pid = child.name
+        if pid == PLUGIN_ID or not valid_plugin_id(pid):
+            continue
+        if child.is_symlink() or not child.is_dir() or not is_git_plugin_dir(child):
+            continue
+        manifest = load_json(child / "manifest.json", default={}, within=ctx.home)
+        if not isinstance(manifest, dict):
+            manifest = {}
+        out[pid] = {
+            "id": pid,
+            "name": _short_text(manifest.get("name")) or pid,
+            "version": _short_text(manifest.get("version"), 64),
+            "commit": plugin_git_commit(child),
+            "source": plugin_git_source(child),
+        }
+    return out
+
+
+def repo_plugin_list(repo: Path) -> dict[str, dict[str, Any]]:
+    """Entries in the repo's plugins.json, validated field by field."""
+    data = load_json(repo / PLUGIN_LIST_REL, default=None, within=repo)
+    rows = data.get("plugins") if isinstance(data, dict) else data
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pid = row.get("id")
+        if not valid_plugin_id(pid) or pid == PLUGIN_ID:
+            continue
+        commit = _short_text(row.get("commit"), 64)
+        out[pid] = {
+            "id": pid,
+            "name": _short_text(row.get("name")) or pid,
+            "version": _short_text(row.get("version"), 64),
+            "commit": commit if PLUGIN_COMMIT_RE.match(commit) else "",
+            "source": clean_plugin_source(row.get("source")),
+        }
+    return out
+
+
+def write_plugin_list(repo: Path, entries: dict[str, dict[str, Any]]) -> None:
+    payload = {
+        "format": PLUGIN_LIST_FORMAT,
+        "version": 1,
+        "plugins": [entries[pid] for pid in sorted(entries)],
+    }
+    write_json(repo / PLUGIN_LIST_REL, payload, within=repo)
+
+
+def _version_key(version: str) -> tuple[int, ...] | None:
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", version.strip())
+    if not match:
+        return None
+    parts = [int(p) for p in match.group(1).split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def plugin_newer_side(plugin_dir: Path, here: dict[str, Any], there: dict[str, Any]) -> str:
+    """Which copy of a git plugin is ahead: "local", "repo", "same" or "unknown"."""
+    local_v, repo_v = _version_key(here["version"]), _version_key(there["version"])
+    if local_v is not None and repo_v is not None and local_v != repo_v:
+        return "local" if local_v > repo_v else "repo"
+    if here["commit"] and there["commit"] and here["commit"] != there["commit"]:
+        # The listed commit being reachable from HEAD means this checkout
+        # already has it. A commit git has never seen here is newer upstream.
+        result = run_git(plugin_dir, ["merge-base", "--is-ancestor", there["commit"], "HEAD"], timeout=10)
+        return "local" if result.returncode == 0 else "repo"
+    if here["version"] != there["version"]:
+        return "unknown"
+    return "same"
+
+
+def describe_plugin_version(entry: dict[str, Any] | None) -> str:
+    if not entry:
+        return ""
+    version = entry.get("version") or ""
+    commit = (entry.get("commit") or "")[:7]
+    if version and commit:
+        return f"{version} ({commit})"
+    return version or commit or "unknown version"
+
+
+def vendored_plugin_dir(repo: Path, plugin_id: str) -> bool:
+    path = repo / "plugins" / plugin_id
+    return path.is_dir() and not path.is_symlink()
+
+
+def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
+    """One row per git plugin that differs between this machine and plugins.json.
+
+    Outgoing rows ("local"/"added-local") publish list entries. Incoming rows
+    ("added-repo"/"repo") are never copied: they carry an Install or Update
+    action that opens Omarchy's own plugin flow.
+
+    The baseline is the set of listed plugins that were installed here at the
+    last Apply/Publish. It tells "uninstalled here" apart from "never installed
+    here", and "dropped from the list elsewhere" apart from "new here".
+    """
+    local = local_plugin_list(ctx)
+    listed = repo_plugin_list(repo)
+    baseline = set(state.get("plugin_list") or [])
+    hidden_keys = set(state.get("hidden") or [])
+    rows: list[dict[str, Any]] = []
+    for pid in sorted(set(local) | set(listed)):
+        here = local.get(pid)
+        there = listed.get(pid)
+        vendored = vendored_plugin_dir(repo, pid)
+        installed = (ctx.config_plugins / pid).is_dir()
+        drop_note = " and drop its copied files from the repo" if vendored else ""
+        status = ""
+        action = ""
+        summary = ""
+        removal = False
+        default_publish = False
+        if here and not there:
+            status = "added-local"
+            if pid in baseline:
+                summary = "Removed from the repo's plugin list elsewhere · still installed here"
+            else:
+                summary = f"Add {describe_plugin_version(here)} to the repo's plugin list{drop_note}"
+                default_publish = True
+        elif there and not installed:
+            if pid in baseline:
+                status = "local"
+                removal = True
+                summary = "Uninstalled here · remove it from the repo's plugin list"
+            elif there["source"]:
+                status = "added-repo"
+                action = "install"
+                summary = f"Not installed here · {describe_plugin_version(there)} from {there['source']}"
+            else:
+                status = "added-repo"
+                summary = "Not installed here · the list has no git source, so install it by hand"
+        elif here and there:
+            side = plugin_newer_side(ctx.config_plugins / pid, here, there)
+            if side == "repo":
+                status = "repo"
+                action = "update"
+                summary = f"Repo lists {describe_plugin_version(there)} · this machine has {describe_plugin_version(here)}"
+            elif side != "same" or here["source"] != there["source"] or here["name"] != there["name"]:
+                status = "local"
+                summary = (
+                    f"Update the repo's entry: {describe_plugin_version(there)} → {describe_plugin_version(here)}"
+                    + drop_note
+                )
+                default_publish = side != "unknown"
+            elif vendored:
+                status = "local"
+                summary = "Drop the copied plugin files from the repo; the plugin list already covers it"
+                default_publish = True
+        if not status:
+            continue
+        hidden = is_hidden_item("l", pid, hidden_keys)
+        rows.append(
+            {
+                "id": pid,
+                "name": (here or there or {}).get("name") or pid,
+                "status": status,
+                "summary": summary,
+                "action": action,
+                "removal": removal,
+                "vendored": vendored,
+                "local_version": describe_plugin_version(here),
+                "repo_version": describe_plugin_version(there),
+                "source": (there or {}).get("source") or (here or {}).get("source") or "",
+                "default_publish": default_publish and not hidden,
+                "hidden": hidden,
+            }
+        )
+    return rows
+
+
+def plugin_list_baseline(ctx: Context, repo: Path, state: dict[str, Any]) -> list[str]:
+    """Listed (or previously listed) plugins that are installed here now."""
+    known = set(state.get("plugin_list") or []) | set(repo_plugin_list(repo))
+    return sorted(pid for pid in known if valid_plugin_id(pid) and (ctx.config_plugins / pid).is_dir())
+
+
+def remove_vendored_plugin(repo: Path, plugin_id: str) -> bool:
+    """Delete plugins/<id>/ from the clone once plugins.json covers the plugin.
+
+    Anchored like strip_plugin_git_dirs: the plugins/ descriptor is verified to
+    sit in the clone and the entry is checked to be a real directory, so a
+    symlinked plugins/<id> cannot steer the rmtree elsewhere.
+    """
+    if not valid_plugin_id(plugin_id):
+        return False
+    try:
+        plugins_fd = _open_dir_bound(repo, Path("plugins"), create=False)
+    except SyncError:
+        return False
+    try:
+        try:
+            st = os.stat(plugin_id, dir_fd=plugins_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        shutil.rmtree(plugin_id, dir_fd=plugins_fd)
+    finally:
+        os.close(plugins_fd)
+    _prune_empty_parents(repo, Path("plugins"))
+    return True
+
+
+def publish_plugin_list(ctx: Context, repo: Path, rows: list[dict[str, Any]]) -> list[str]:
+    """Write the chosen rows into plugins.json and drop their vendored copies."""
+    if not rows:
+        return []
+    entries = repo_plugin_list(repo)
+    local = local_plugin_list(ctx)
+    touched: list[str] = []
+    for row in rows:
+        pid = row["id"]
+        if row.get("removal"):
+            entries.pop(pid, None)
+        elif pid in local:
+            entry = dict(local[pid])
+            previous = entries.get(pid) or {}
+            if not entry.get("source") and previous.get("source"):
+                # A checkout with an unusable origin must not erase the source
+                # other machines install from.
+                entry["source"] = previous["source"]
+            entries[pid] = entry
+        else:
+            continue
+        remove_vendored_plugin(repo, pid)
+        touched.append(pid)
+    if touched:
+        write_plugin_list(repo, entries)
+    return touched
+
+
+def launch_omarchy_terminal(command: str) -> bool:
+    """Run a command in Omarchy's floating terminal, like its plugin menu does."""
+    launcher = shutil.which(PLUGIN_TERMINAL_LAUNCHER)
+    if not launcher:
+        return False
+    devnull = subprocess.DEVNULL
+    try:
+        subprocess.Popen(
+            [launcher, command],
+            start_new_session=True,
+            stdin=devnull,
+            stdout=devnull,
+            stderr=devnull,
+            close_fds=True,
+        )
+    except OSError:
+        return False
+    return True
+
+
 def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     items: dict[str, dict[str, Any]] = {}
     if _tree_disk_usage(repo, MAX_REPO_DISK_BYTES) > MAX_REPO_DISK_BYTES:
@@ -1577,25 +1912,24 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             for p in ctx.config_plugins.iterdir()
             if p.is_dir() and not p.name.startswith(".") and p.name != PLUGIN_ID
         )
+    listed_plugins = repo_plugin_list(repo)
     for plugin_id in sorted(plugin_ids):
         if plugin_id == PLUGIN_ID:
             continue
         repo_plugin = repo_plugins / plugin_id
         local_plugin = ctx.config_plugins / plugin_id
+        # Git-installed plugins sync as plugins.json entries and are installed
+        # with `omarchy plugin add`. Copying files into a checkout downgrades it
+        # and leaves `omarchy plugin update` refusing to fast-forward.
+        if is_git_plugin_dir(local_plugin) or plugin_id in listed_plugins:
+            continue
         rels = set()
         for p in iter_files(repo_plugin):
             rels.add(rel_posix(p, repo))
         for p in iter_files(local_plugin):
             rels.add(f"plugins/{plugin_id}/" + rel_posix(p, local_plugin))
-        git_managed = (local_plugin / ".git").exists()
         for rel in sorted(rels):
-            add(
-                rel,
-                ctx.home / ".config" / "omarchy" / rel,
-                repo / rel,
-                "plugin",
-                extra={"git_managed": git_managed},
-            )
+            add(rel, ctx.home / ".config" / "omarchy" / rel, repo / rel, "plugin")
 
     for rel, local in terminal_map(ctx).items():
         repo_file = repo / rel
@@ -2780,22 +3114,44 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
     if bindings.is_file():
         shortcuts = parse_shortcuts(read_text(bindings, within=tree_root))
 
+    listed = {} if prefer_local else repo_plugin_list(repo)
     plugins = []
+    seen_plugins: set[str] = set()
     if plugins_dir.is_dir():
         for child in sorted(plugins_dir.iterdir()):
             manifest_path = child / "manifest.json"
             if not child.is_dir() or not manifest_path.is_file():
                 continue
             manifest = load_json(manifest_path, default={}, within=tree_root) or {}
+            entry = listed.get(child.name) or {}
+            seen_plugins.add(child.name)
             plugins.append(
                 {
                     "id": manifest.get("id") or child.name,
                     "name": manifest.get("name") or child.name,
-                    "version": manifest.get("version") or "",
+                    "version": entry.get("version") or manifest.get("version") or "",
                     "description": manifest.get("description") or "",
                     "kinds": manifest.get("kinds") or [],
+                    "git": bool(entry) or is_git_plugin_dir(ctx.config_plugins / child.name),
+                    "source": entry.get("source") or "",
+                    "installed": (ctx.config_plugins / child.name).is_dir(),
                 }
             )
+    for pid, entry in sorted(listed.items()):
+        if pid in seen_plugins:
+            continue
+        plugins.append(
+            {
+                "id": pid,
+                "name": entry["name"],
+                "version": entry["version"],
+                "description": "",
+                "kinds": [],
+                "git": True,
+                "source": entry["source"] or "",
+                "installed": (ctx.config_plugins / pid).is_dir(),
+            }
+        )
 
     bar = {"position": "", "widgets": {"left": [], "center": [], "right": []}}
     idle = {}
@@ -3104,12 +3460,20 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             "default_publish": (status in {"local", "added-local", "differs"} or (name_item or {}).get("default_publish")) and not is_hidden_item("t", "selected", hidden_keys),
             "hidden": is_hidden_item("t", "selected", hidden_keys),
         }
+    plugin_list = plugin_list_diff(ctx, repo, state)
+    for row in plugin_list:
+        if row["hidden"]:
+            counts["hidden"] = counts.get("hidden", 0) + 1
+            continue
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+        counts["changed"] += 1
     return {
         "files": files,
         "counts": counts,
         "shortcuts": shortcuts,
         "plugins": plugins,
         "bundles": bundles,
+        "plugin_list": plugin_list,
         "theme": theme_diff,
         "hidden": list(hidden_keys),
     }
@@ -3184,6 +3548,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
                     "sync_state": "not-configured",
                     "repo_url": "",
                     "clone_path": "",
+                    "plugin_version": PLUGIN_VERSION,
                 },
                 "inspect": None,
                 "diff": {"files": [], "counts": {}, "hidden": []},
@@ -3227,6 +3592,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "unknown_differs": diff["counts"].get("differs", 0),
         "shortcut_changes": len([s for s in (diff.get("shortcuts") or []) if not s.get("hidden")]),
         "plugin_changes": len([p for p in (diff.get("plugins") or []) if not p.get("hidden")]),
+        "plugin_list_changes": len([p for p in (diff.get("plugin_list") or []) if not p.get("hidden")]),
         "hidden": state.get("hidden") or [],
         "hidden_count": len(state.get("hidden") or []),
         "plugin_version": PLUGIN_VERSION,
@@ -3852,6 +4218,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     for rel in removed:
         hashes.pop(rel, None)
     state["file_hashes"] = hashes
+    state["plugin_list"] = plugin_list_baseline(ctx, repo, state)
     state["last_apply_at"] = now_iso()
     state["last_applied_commit"] = git_fields.get("head_full") or git_out(repo, "rev-parse", "HEAD")
     save_state(ctx, state)
@@ -3894,6 +4261,16 @@ def ensure_git_identity(repo: Path) -> None:
         run_git(repo, ["config", "user.email", f"{user}@{host}"], check=True)
 
 
+def publish_count_text(published: list[str], plugin_list_ids: list[str]) -> str:
+    parts = []
+    if published or not plugin_list_ids:
+        parts.append(f"{len(published)} file{'s' if len(published) != 1 else ''}")
+    if plugin_list_ids:
+        n = len(plugin_list_ids)
+        parts.append(f"{n} plugin list entr{'ies' if n != 1 else 'y'}")
+    return " and ".join(parts)
+
+
 def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     state = load_state(ctx)
     repo = configured_repo(ctx, state)
@@ -3915,6 +4292,12 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
     plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
+    list_ids = {p for p in (getattr(args, "list_plugin", None) or []) if p}
+    list_rows = [
+        row
+        for row in diff.get("plugin_list") or []
+        if row["id"] in list_ids and row["status"] in {"local", "added-local"}
+    ]
     wanted = parse_files_arg(args.files, explicit=explicit)
     if plugin_ids:
         extra = expand_plugin_paths(diff["files"], plugin_ids, "publish")
@@ -3955,7 +4338,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         {"added-local", "local", "differs"},
         "local_portable",
     )
-    if not chosen and not shortcut_keys:
+    if not chosen and not shortcut_keys and not list_rows:
         if getattr(args, "dry_run", False):
             snap = build_snapshot(ctx, fetch=False)
             snap["published"] = []
@@ -3995,15 +4378,17 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 published.append(item["path"])
         if shortcut_keys:
             published.append("hypr/bindings.lua")
+        plugin_list_ids = [row["id"] for row in list_rows]
         snap = build_snapshot(ctx, fetch=False)
         snap["published"] = published
         snap["removed"] = removed
+        snap["plugin_list"] = plugin_list_ids
         snap["skipped_shortcuts"] = skipped_shortcuts
         snap["committed"] = False
         snap["pushed"] = False
         snap["dry_run"] = True
         snap["message"] = (
-            f"Dry run: would publish {len(published)} file{'s' if len(published) != 1 else ''}"
+            f"Dry run: would publish {publish_count_text(published, plugin_list_ids)}"
             + (f" ({len(removed)} removed)" if removed else "")
             + "."
             + skipped_shortcut_note(skipped_shortcuts)
@@ -4035,6 +4420,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             source_within=ctx.home,
         ):
             published.append("hypr/bindings.lua")
+    plugin_list_ids = publish_plugin_list(ctx, repo, list_rows)
 
     strip_plugin_git_dirs(repo)
 
@@ -4048,6 +4434,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         listed = "\n".join(f"- {'removed ' if p in removed_set else ''}{p}" for p in published[:30])
         if len(published) > 30:
             listed += f"\n- … {len(published) - 30} more"
+        if plugin_list_ids:
+            listed = "\n".join(filter(None, [listed] + [f"- {PLUGIN_LIST_REL}: {pid}" for pid in plugin_list_ids]))
         message = args.message or f"Sync config from {host}\n\n{listed}\n"
         result = run_git(repo, ["commit", "-m", message], timeout=30)
         if result.returncode != 0:
@@ -4075,22 +4463,24 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     for rel in removed:
         hashes.pop(rel, None)
     state["file_hashes"] = hashes
+    state["plugin_list"] = plugin_list_baseline(ctx, repo, state)
     state["last_publish_at"] = now_iso()
     save_state(ctx, state)
     snap = build_snapshot(ctx, fetch=False)
     snap["published"] = published
+    snap["plugin_list"] = plugin_list_ids
     snap["committed"] = committed
     snap["pushed"] = pushed
     if push_error:
         snap["push_error"] = push_error
         snap["ok"] = True
         snap["message"] = (
-            f"Saved {len(published)} file{'s' if len(published) != 1 else ''} in the repo, but push failed: {push_error}"
+            f"Saved {publish_count_text(published, plugin_list_ids)} in the repo, but push failed: {push_error}"
             + skipped_shortcut_note(skipped_shortcuts)
         )
     else:
         snap["message"] = (
-            f"Published {len(published)} file{'s' if len(published) != 1 else ''} to the repo"
+            f"Published {publish_count_text(published, plugin_list_ids)} to the repo"
             + (f" ({len(removed)} removed)" if removed else "")
             + (" and pushed." if pushed else ". Commit is local until you push.")
             + skipped_shortcut_note(skipped_shortcuts)
@@ -4149,12 +4539,20 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         if not item.get("hidden") and item.get("kind") == "plugin" and item.get("status") in wanted_status and item.get("plugin_id")
     ]
     theme = any(item["path"] == THEME_REL and not item.get("hidden") and item.get("status") in wanted_status for item in diff["files"])
+    # Listed plugins are installed through Omarchy, never copied, so only the
+    # publishing side has plugin list rows to act on.
+    list_plugins = [
+        row["id"]
+        for row in (diff.get("plugin_list") or [])
+        if side == "local" and not row.get("hidden") and row.get("status") in {"local", "added-local"}
+    ]
 
     nested = argparse.Namespace(
         explicit=True,
         files=",".join(files),
         shortcut=shortcuts,
         plugin=plugins,
+        list_plugin=list_plugins,
         theme=theme,
         fetch=False,
         push=side == "local" or bool(getattr(args, "push", False)),
@@ -4179,7 +4577,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return result
 
     nested.push = True
-    if not files and not shortcuts and not plugins and not theme and not git_fields.get("ahead"):
+    if not files and not shortcuts and not plugins and not list_plugins and not theme and not git_fields.get("ahead"):
         snap = build_snapshot(ctx, fetch=False)
         snap["message"] = "Nothing local to publish."
         return snap
@@ -4500,11 +4898,56 @@ def cmd_unhide(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         and k.removeprefix("p:") not in remove_set
         and f"t:{k}" not in remove_set
         and k.removeprefix("t:") not in remove_set
+        and f"l:{k}" not in remove_set
+        and k.removeprefix("l:") not in remove_set
     ]
     save_state(ctx, state)
     snap = build_snapshot(ctx, fetch=False)
     snap["hidden"] = state["hidden"]
     snap["message"] = f"Unhid {len(keys)} item{'s' if len(keys) != 1 else ''}."
+    return snap
+
+
+def listed_plugin_arg(args: argparse.Namespace) -> str:
+    pid = args.args[0] if args.args else ""
+    if not valid_plugin_id(pid):
+        raise SyncError("Pass the id of a plugin from the repo's plugin list.")
+    return pid
+
+
+def cmd_install_plugin(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Open Omarchy's own `plugin add` flow for a plugin listed in plugins.json.
+
+    It runs in Omarchy's floating terminal, exactly like Setup > Plugins > Add
+    Plugin, so the user sees Omarchy's warning and confirms there. Nothing is
+    cloned by this helper, and --yes is never passed.
+    """
+    pid = listed_plugin_arg(args)
+    repo = configured_repo(ctx)
+    entry = repo_plugin_list(repo).get(pid)
+    if not entry:
+        raise SyncError(f"{pid} is not in the repo's plugin list.")
+    if not entry["source"]:
+        raise SyncError(f"The repo's plugin list has no git source for {pid}. Install it by hand.")
+    if os.path.lexists(ctx.config_plugins / pid):
+        raise SyncError(f"{pid} is already installed on this machine.")
+    if not launch_omarchy_terminal("omarchy-plugin-add " + shlex.quote(entry["source"])):
+        raise SyncError(f"Could not open Omarchy's plugin installer. Run: omarchy plugin add {entry['source']}")
+    snap = build_snapshot(ctx, fetch=False)
+    snap["message"] = f"Opened Omarchy's installer for {entry['name']}. Refresh this panel when it finishes."
+    return snap
+
+
+def cmd_update_plugin(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Open Omarchy's own `plugin update` flow for a git-installed plugin."""
+    pid = listed_plugin_arg(args)
+    plugin_dir = ctx.config_plugins / pid
+    if plugin_dir.is_symlink() or not plugin_dir.is_dir() or not is_git_plugin_dir(plugin_dir):
+        raise SyncError(f"{pid} is not a git-installed plugin on this machine.")
+    if not launch_omarchy_terminal("omarchy-plugin-update " + shlex.quote(pid)):
+        raise SyncError(f"Could not open Omarchy's plugin updater. Run: omarchy plugin update {pid}")
+    snap = build_snapshot(ctx, fetch=False)
+    snap["message"] = f"Opened Omarchy's updater for {pid}. Refresh this panel when it finishes."
     return snap
 
 
@@ -4528,6 +4971,8 @@ def build_parser() -> argparse.ArgumentParser:
             "unhide",
             "open",
             "terminal",
+            "install-plugin",
+            "update-plugin",
         ],
     )
     parser.add_argument("args", nargs="*")
@@ -4538,6 +4983,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--explicit", action="store_true")
     parser.add_argument("--shortcut", action="append", default=None)
     parser.add_argument("--plugin", action="append", default=None)
+    parser.add_argument("--list-plugin", action="append", default=None)
     parser.add_argument("--theme", action="store_true")
     parser.add_argument("--message", default=None)
     parser.add_argument("--delete-clone", action="store_true")
@@ -4577,6 +5023,10 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_open(ctx, args)
     if command == "terminal":
         return cmd_terminal(ctx, args)
+    if command == "install-plugin":
+        return cmd_install_plugin(ctx, args)
+    if command == "update-plugin":
+        return cmd_update_plugin(ctx, args)
     raise SyncError(f"Unknown command: {command}")
 
 
