@@ -94,7 +94,7 @@ omarchy-shell shell rescanPlugins
 4. Paste the URL from Step 1 into the field.
 5. Click **Connect repo**.
 
-The plugin clones the repo, notices it is empty, and **does not apply anything yet**. The Shortcuts, Plugins, and Configs tabs show **this machine** — that is what will be uploaded.
+The plugin clones the repo, notices it is empty, and **does not apply anything yet**. The header reads **Linked · ready for first push** and the Overview tab shows a highlighted **first push** card. The Changes tab lists **this machine** under Outgoing: that is what will be uploaded.
 
 If clone fails with an authentication message, go back to Step 2.
 
@@ -104,13 +104,15 @@ If clone fails with an authentication message, go back to Step 2.
 
 This is the last “are you sure?” before your desktop layout lives on GitHub.
 
+Open **Review list** (or the Changes tab) and expand **Outgoing**. It holds:
+
 - **Shortcuts** — bindings from `hypr/bindings.lua`
-- **Plugins** — everything under `~/.config/omarchy/plugins/` except this plugin itself
-- **Configs** — Hyprland files, `shell.json`, hooks, terminals
+- **Plugins** — git-installed plugins travel as a list (`plugins.json`); hand-copied ones as files. This plugin itself is never included
+- **Configs** — Hyprland files, `shell.json`, hooks, terminals, and the current theme (images and video wallpapers are skipped)
 
 **Machine-local files** stay on this machine: display layout (`hypr/monitors.lua`) and anything you list as `machine_local` in `.omarchy-config.json`. Overlay files named `*.local.lua` / `local.conf` under `hypr/` are not synced at all. Turn on **Include machine-local files** on the Changes tab only if you mean it.
 
-When it looks right, click **Publish this machine**. Confirm. The plugin copies those files into the private repo, commits, and pushes.
+When it looks right, click **Seed repo (N items)** on the Overview card. Confirm with **Seed & push**. The plugin copies those files into the private repo, commits, and pushes.
 
 Your GitHub repo should now contain `hypr/`, `omarchy/`, `plugins/`, and so on — still **private**.
 
