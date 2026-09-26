@@ -413,6 +413,15 @@ Panel {
     : (cloneProbe && cloneProbe.facts ? String(cloneProbe.facts.hostname || "") : String(cloneTarget || ""))
   readonly property string cloneSourceName: cloneProbe && cloneProbe.source ? String(cloneProbe.source.hostname || "this machine") : "this machine"
 
+  readonly property string cloneLoginUser: cloneProbe && cloneProbe.facts ? String(cloneProbe.facts.login_user || "") : ""
+  function cloneHostPart() { var t = String(cloneTarget).trim(); return t.indexOf("@") >= 0 ? t.split("@").pop() : t }
+  function cloneUseAccount(user) {
+    var next = cloneMap(cloneAnswers)
+    next["account"] = user
+    cloneAnswers = next
+    cloneTarget = user + "@" + cloneHostPart()
+    cloneRun(["probe"].concat(cloneTargetArgs()))
+  }
   function cloneCheck(id) {
     var list = cloneProbe && cloneProbe.checks ? cloneProbe.checks : []
     for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i]
@@ -427,6 +436,7 @@ Panel {
     var f = ["machine"]
     if (cloneProbe && !cloneConnected) f.push("ssh")
     if (cloneProbe && cloneConnected && !cloneProbe.ready) f.push("blocked")
+    if (cloneWarned("account")) f.push("account")
     if (cloneWarned("session")) f.push("session")
     if (cloneWarned("version")) f.push("version")
     if (cloneWarned("linked")) f.push("linked")
@@ -505,6 +515,11 @@ Panel {
         body: "SSH is a secure remote login. Do these once, then press NEXT to check again." }
       case "blocked": return { title: host + " is not ready yet",
         body: "Fix the item below on the new machine, then Start over." }
+      case "account": return { title: "Which account on " + host + " is yours?",
+        body: "Its desktop is stamped into ONE account. " + ((cloneCheck("account") || {}).detail || ""),
+        choices: String((cloneCheck("account") || {}).fix || "").split(",").filter(function(u) { return u !== "" }).map(function(u) {
+          return { value: u, label: u + (u === cloneLoginUser ? "   (the account this computer reached)" : ""),
+                   detail: u === cloneLoginUser ? "Continue as " + u + "." : "NEXT re-checks as " + u + "@" + cloneHostPart() + " (this computer's key must be on it)." } }) }
       case "session": return { title: "Nobody is logged in to " + host + "'s desktop",
         body: "Everything can still be copied. It takes effect the next time someone logs in there.",
         choices: [
@@ -569,6 +584,7 @@ Panel {
   readonly property bool cloneCanNext: {
     switch (cloneScreen) {
       case "machine": return String(cloneTarget).trim() !== ""
+      case "account": return cloneAnswer("account") !== ""
       case "session": return cloneAnswer("session") !== ""
       case "version": return cloneAnswer("version") !== ""
       case "linked": return cloneAnswer("linked") !== ""
@@ -607,6 +623,9 @@ Panel {
       case "machine":
       case "ssh":
         cloneRun(["probe"].concat(cloneTargetArgs())); return
+      case "account":
+        if (cloneAnswer("account") !== cloneLoginUser) { cloneUseAccount(cloneAnswer("account")); return }
+        break
       case "session":
         if (cloneAnswer("session") === "wait") { cloneRun(["probe"].concat(cloneTargetArgs())); return }
         break
@@ -702,6 +721,7 @@ Panel {
         return
       }
       // Past the checks: the first question that applies after them.
+      if (cloneWarned("account") && cloneAnswer("account") !== cloneLoginUser) { cloneGo("account"); return }
       if (cloneWarned("session") && cloneAnswer("session") !== "continue") { cloneGo("session"); return }
       if (cloneWarned("version") && cloneAnswer("version") !== "continue") { cloneGo("version"); return }
       if (cloneWarned("linked")) { cloneGo("linked"); return }
@@ -3057,6 +3077,17 @@ Panel {
         }
       }
 
+      Button {
+        visible: root.cloneScreen === "blocked" && root.cloneFailed("account") && String((root.cloneCheck("account") || {}).fix || "").indexOf("@") > 0
+        text: "Use " + String((root.cloneCheck("account") || {}).fix || "")
+        iconText: "󰀄"
+        bordered: true
+        selected: true
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.cloneBusy
+        onClicked: root.cloneUseAccount(String(root.cloneCheck("account").fix).split("@")[0])
+      }
       // ---- blocked: a check that cannot be answered with a choice
       Repeater {
         model: root.cloneScreen === "blocked" && root.cloneProbe ? root.cloneProbe.checks.filter(function(c) { return c.status === "fail" }) : []

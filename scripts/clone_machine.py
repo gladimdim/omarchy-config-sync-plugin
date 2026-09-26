@@ -86,7 +86,9 @@ SESSION_PREFIX = (
     "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; "
     "[ -n \"$HYPRLAND_INSTANCE_SIGNATURE\" ] || export HYPRLAND_INSTANCE_SIGNATURE=\"$(ls -t \"$XDG_RUNTIME_DIR/hypr\" 2>/dev/null | head -1)\"; "
     "[ -n \"$WAYLAND_DISPLAY\" ] || export WAYLAND_DISPLAY=\"$(ls \"$XDG_RUNTIME_DIR\" 2>/dev/null | grep -m1 -E '^wayland-[0-9]+$')\"; "
-    "[ -n \"$OMARCHY_PATH\" ] || export OMARCHY_PATH=\"$HOME/.local/share/omarchy\"; "
+    "if [ -z \"$OMARCHY_PATH\" ]; then "
+    "if [ -d \"$HOME/.local/share/omarchy/.git\" ]; then export OMARCHY_PATH=\"$HOME/.local/share/omarchy\"; "
+    "else export OMARCHY_PATH=/usr/share/omarchy; fi; fi; "
     "export PATH=\"$OMARCHY_PATH/bin:$HOME/.local/bin:$PATH\"; "
 )
 
@@ -136,6 +138,22 @@ try:
 except Exception:
     pass
 units = sh(["systemctl", "--user", "list-unit-files", "--state=enabled", "--no-legend", "--plain"])
+def desktop_owner():
+    """Who owns the Omarchy desktop: a live graphical session, else autologin."""
+    for line in sh(["loginctl", "list-sessions", "--no-legend"]).splitlines():
+        sid = line.split()[0] if line.split() else ""
+        props = dict(l.split("=", 1) for l in sh(["loginctl", "show-session", sid, "-p", "Type", "-p", "Name"]).splitlines() if "=" in l)
+        if props.get("Type") in ("wayland", "x11"):
+            return props.get("Name", "")
+    import glob
+    for conf in sorted(glob.glob("/etc/sddm.conf.d/*.conf")) + ["/etc/sddm.conf"]:
+        for l in read(conf).splitlines():
+            if l.strip().startswith("User=") and l.strip()[5:]:
+                return l.strip()[5:]
+    return ""
+import pwd
+accounts = sorted(p.pw_name for p in pwd.getpwall()
+                  if 1000 <= p.pw_uid < 60000 and not p.pw_shell.endswith(("nologin", "false")) and os.path.isdir(p.pw_dir))
 usage = shutil.disk_usage(home)
 print(json.dumps({
     "hostname": platform.node(),
@@ -160,6 +178,9 @@ print(json.dumps({
     "units": [u.split()[0] for u in units.splitlines() if u.strip()],
     "commands": {c: bool(shutil.which(c)) for c in sys.argv[1:]},
     "home": str(home),
+    "login_user": pwd.getpwuid(uid).pw_name,
+    "desktop_owner": desktop_owner(),
+    "accounts": accounts,
 }))
 '''
 
@@ -427,6 +448,19 @@ def cmd_probe(ctx: cs.Context, args: argparse.Namespace) -> dict[str, Any]:
     else:
         add("self", "Not this machine", not same,
             f"{theirs.get('hostname')} is a different machine" if not same else "That address is THIS machine. A clone onto itself is refused.")
+    me_user, owner = theirs.get("login_user") or "", theirs.get("desktop_owner") or ""
+    others = [a for a in theirs.get("accounts") or [] if a != me_user]
+    if owner and owner != me_user:
+        add("account", "The account that owns the desktop", False,
+            f"You reached {theirs.get('hostname')} as '{me_user}', but its Omarchy desktop belongs to '{owner}'. "
+            f"Use {owner}@{target.dest.split('@')[-1]} instead (this computer's key must be on that account).",
+            owner + "@" + target.dest.split("@")[-1])
+    elif not owner and others:
+        checks.append(check("account", "The account that owns the desktop", "warn",
+                            f"Logged in as '{me_user}'. Nobody is logged in there, and it also has: " + ", ".join(others)
+                            + ". Pick the account you use on it.", ",".join([me_user] + others)))
+    else:
+        checks.append(check("account", "The account that owns the desktop", "pass", f"'{me_user}'"))
     add("omarchy", "Omarchy is installed", bool(theirs.get("has_omarchy")),
         f"Omarchy {theirs.get('omarchy') or theirs.get('omarchy_dev') or '?'}" if theirs.get("has_omarchy") else "No Omarchy found. Install Omarchy first: https://omarchy.org",
         "install-omarchy")
@@ -462,7 +496,8 @@ def cmd_probe(ctx: cs.Context, args: argparse.Namespace) -> dict[str, Any]:
         "stage": "machine",
         "source": {k: mine.get(k) for k in ("hostname", "arch", "omarchy", "omarchy_dev", "hyprland", "quickshell")},
         "facts": {k: theirs.get(k) for k in ("hostname", "user", "arch", "omarchy", "omarchy_dev", "hyprland",
-                                           "quickshell", "plugin_version", "linked_repo", "lineage")},
+                                           "quickshell", "plugin_version", "linked_repo", "lineage",
+                                           "login_user", "desktop_owner", "accounts")},
     })
 
 
@@ -1851,7 +1886,8 @@ def cmd_machines(ctx: cs.Context, args: argparse.Namespace) -> dict[str, Any]:
 OMARCHY_CHECK = ('if command -v omarchy >/dev/null 2>&1 || [ -d /usr/share/omarchy ] || [ -d "$HOME/.local/share/omarchy" ]; '
                  'then echo omarchy=yes; else echo omarchy=no; fi; '
                  'echo "host=$(cat /proc/sys/kernel/hostname 2>/dev/null)"; '
-                 'echo "version=$(pacman -Q omarchy 2>/dev/null | cut -d" " -f2)"')
+                 'echo "version=$(pacman -Q omarchy 2>/dev/null | cut -d" " -f2)"; '
+                 'echo "user=$(id -un)"')
 MAX_CANDIDATES = 128
 
 
@@ -1999,7 +2035,10 @@ def cmd_discover(ctx: cs.Context, args: argparse.Namespace) -> dict[str, Any]:
         facts = dict(line.split("=", 1) for line in proc.stdout.decode("utf-8", "replace").splitlines() if "=" in line)
         if facts.get("omarchy") != "yes" or not facts.get("version"):
             return dict(c, status="not-omarchy")  # confirmed only by the installed package
-        return dict(c, status="omarchy", name=facts.get("host") or c["name"], version=facts.get("version", ""))
+        user = facts.get("user", "")
+        dest = c["dest"] if "@" in c["dest"] or not user else f"{user}@{c['dest']}"
+        return dict(c, status="omarchy", name=facts.get("host") or c["name"], version=facts.get("version", ""),
+                    user=user, dest=dest)
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=32) as pool:
