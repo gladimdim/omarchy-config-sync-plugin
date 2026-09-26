@@ -69,7 +69,8 @@ Panel {
   readonly property var tabs: [
     { name: "Overview", icon: "󰘿" },
     { name: "Changes", icon: "󰦓" },
-    { name: "Configs", icon: "󰒓" }
+    { name: "Configs", icon: "󰒓" },
+    { name: "New machine", icon: "󰆏" }
   ]
   readonly property var allReviewItems: incomingItems.concat(outgoingItems).concat(bothItems)
   // Deletions are opt-in, so they are only ever a surprise if the confirm step stays silent.
@@ -356,6 +357,392 @@ Panel {
     for (var j = 0; j < configCategories.length; j++)
       if (configCategories[j].changeItems.length > 0) return configCategories[j]
     return configCategories.length ? configCategories[0] : null
+  }
+
+
+
+  // ---- New machine (clone wizard): one question per screen, NEXT, EXECUTE ----
+  readonly property string cloneScriptPath: String(Qt.resolvedUrl("scripts/clone_machine.py")).replace(/^file:\/\//, "")
+  property string cloneScreen: "machine"
+  property string cloneTarget: ""
+  property bool cloneBusy: false
+  property string cloneAction: ""
+  property string cloneError: ""
+  property string cloneMessage: ""
+  property var cloneProbe: null
+  property var clonePreview: null
+  property var cloneResult: null
+  property var cloneHealth: null
+  property var cloneAdopt: null
+  property string cloneConfirmText: ""
+  // Terminal steps are the user's job: the first NEXT opens the terminal and
+  // stays; the next NEXT moves on once they have finished there.
+  property var cloneTermOpened: ({})
+  property var cloneFound: null      // discover result
+  property var clonePicked: null     // a found machine waiting for ARE YOU SURE
+  readonly property bool cloneDeferred: !!cloneResult && !!cloneResult.ok && (cloneResult.log || []).some(function(l) { return l.status === "deferred" })
+  property string clonePendingKind: ""
+  // First call opens the terminal; later calls ask whether it finished OK.
+  // Returns true while the step is not yet done (the caller must stay put).
+  function cloneTerminalStep(key, kind) {
+    if (!cloneTermOpened[key]) {
+      var next = cloneMap(cloneTermOpened)
+      next[key] = true
+      cloneTermOpened = next
+      cloneTerminal(kind)
+      return true
+    }
+    if (cloneTermOpened[key] === "ok") return false
+    clonePendingKind = key
+    cloneRun(["terminal-status"].concat(cloneTargetArgs()).concat(["--kind", kind]))
+    return true
+  }
+  // Recommended answers are pre-selected; version/linked must be chosen.
+  readonly property var cloneDefaults: ({ plugins: "exact", display: "keep", bar: "copy", wallpapers: "copy",
+                                          review: "copy", programs: "later", family: "own" })
+  property var cloneAnswers: ({})
+  function cloneAnswer(key) { return key in cloneAnswers ? cloneAnswers[key] : (cloneDefaults[key] || "") }
+  function cloneSetAnswer(key, value) {
+    var next = cloneMap(cloneAnswers)
+    next[key] = value
+    cloneAnswers = next
+    if (key === "plugins") clonePreview = null  // the plan depends on it
+  }
+
+  readonly property string cloneHostname: clonePreview ? String(clonePreview.target_hostname || "")
+    : (cloneProbe && cloneProbe.facts ? String(cloneProbe.facts.hostname || "") : String(cloneTarget || ""))
+  readonly property string cloneSourceName: cloneProbe && cloneProbe.source ? String(cloneProbe.source.hostname || "this machine") : "this machine"
+
+  function cloneCheck(id) {
+    var list = cloneProbe && cloneProbe.checks ? cloneProbe.checks : []
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i]
+    return null
+  }
+  function cloneFailed(id) { var c = cloneCheck(id); return !!c && c.status === "fail" }
+  function cloneWarned(id) { var c = cloneCheck(id); return !!c && c.status === "warn" }
+  readonly property bool cloneConnected: { var s = cloneCheck("ssh"); return !!s && s.status === "pass" }
+
+  // The screens that apply right now, in order.
+  readonly property var cloneFlow: {
+    var f = ["machine"]
+    if (cloneProbe && !cloneConnected) f.push("ssh")
+    if (cloneProbe && cloneConnected && !cloneProbe.ready) f.push("blocked")
+    if (cloneWarned("session")) f.push("session")
+    if (cloneWarned("version")) f.push("version")
+    if (cloneWarned("linked")) f.push("linked")
+    f.push("plugins")
+    var p = clonePreview
+    if (p && p.plan) {
+      if ((p.plan.machine || []).length) f.push("display")
+      if (p.plan.shell_json) f.push("bar")
+      if (p.wallpapers && p.wallpapers.count > 0) f.push("wallpapers")
+      if ((p.plan.hooks || []).length + (p.specific || []).length > 0) f.push("review")
+      if ((p.missing || []).length > 0) f.push("programs")
+    }
+    f.push("confirm", "result", "family", "done")
+    return f
+  }
+
+  readonly property var cloneReviewPaths: {
+    var p = clonePreview
+    if (!p || !p.plan) return []
+    var out = (p.plan.hooks || []).slice()
+    for (var i = 0; i < (p.specific || []).length; i++) if (out.indexOf(p.specific[i].path) < 0) out.push(p.specific[i].path)
+    return out
+  }
+  readonly property string cloneReviewText: {
+    var p = clonePreview
+    if (!p) return ""
+    var lines = []
+    var hooks = p.plan.hooks || []
+    for (var i = 0; i < hooks.length; i++) lines.push("•  " + hooks[i] + "  (runs automatically)")
+    var sp = p.specific || []
+    for (var j = 0; j < sp.length; j++) lines.push("•  " + sp[j].path + "  (" + sp[j].reasons.join(", ") + ")")
+    return lines.join("\n")
+  }
+  readonly property string cloneProgramsText: clonePreview
+    ? (clonePreview.missing || []).map(function(m) { return "•  " + m.command + (m.command !== m.package ? "  (package " + m.package + ")" : "") + (m.repo === "aur" ? "  [AUR]" : "") }).join("\n")
+    : ""
+  readonly property var cloneExcludes: {
+    var out = []
+    var p = clonePreview
+    if (!p || !p.plan) return out
+    if (cloneAnswer("display") === "keep") out = out.concat(p.plan.machine || [])
+    if (cloneAnswer("bar") === "keep" && p.plan.shell_json) out.push("omarchy/shell.json")
+    if (cloneAnswer("review") === "skip") out = out.concat(cloneReviewPaths)
+    var seen = {}
+    return out.filter(function(x) { if (seen[x]) return false; seen[x] = true; return true })
+  }
+  readonly property string cloneSummary: {
+    var p = clonePreview
+    if (!p || !p.plan) return ""
+    var copied = p.plan.overwrite + p.plan.create - cloneExcludes.length
+    var lines = [
+      "From " + p.source.hostname + " @ " + p.source.commit + " (" + Model.relativeAgo(p.source.committed) + ")",
+      "•  " + Math.max(0, copied) + " config files (" + p.plan.overwrite + " replace existing ones)",
+      "•  Plugins: " + (cloneAnswer("plugins") === "exact"
+        ? (p.copy_plugins || []).length + " exact copies (" + Math.round((p.copy_bytes || 0) / 1048576) + " MB)"
+        : (p.plugin_cmds || []).length + " installed from GitHub afterwards"),
+      "•  Display layout: " + (cloneAnswer("display") === "keep" ? "its own" : "copied"),
+      "•  Bar layout: " + (cloneAnswer("bar") === "keep" ? "its own" : "copied"),
+      "•  Wallpapers: " + (p.wallpapers && p.wallpapers.count > 0 && cloneAnswer("wallpapers") === "copy"
+        ? p.wallpapers.count + " (" + Math.round(p.wallpapers.bytes / 1048576) + " MB)" : "not copied")
+    ]
+    if ((p.secrets || []).length) lines.push("•  Never sent (look like secrets): " + p.secrets.map(function(s) { return s.path }).join(", "))
+    if ((p.built || []).length) lines.push("•  Not copied, build or install them there: " + p.built.map(function(b) { return b.split("/").pop() }).join(", "))
+    if (p.source.unpublished > 0) lines.push("•  Note: " + p.source.unpublished + " change(s) on " + p.source.hostname + " are not published yet and will not be included.")
+    return lines.join("\n")
+  }
+
+  readonly property var cloneQuestion: {
+    var host = cloneHostname || "the new machine"
+    var me = cloneSourceName
+    var p = clonePreview
+    switch (cloneScreen) {
+      case "machine": return { title: "Which machine should look like " + me + "?",
+        body: "Type its name, IP address, or Tailscale name (or user@host). NEXT checks it can take a clone. Nothing changes on it until the very last step." }
+      case "ssh": return { title: "Let " + me + " log in to " + host,
+        body: "SSH is a secure remote login. Do these once, then press NEXT to check again." }
+      case "blocked": return { title: host + " is not ready yet",
+        body: "Fix the item below on the new machine, then Start over." }
+      case "session": return { title: "Nobody is logged in to " + host + "'s desktop",
+        body: "Everything can still be copied. It takes effect the next time someone logs in there.",
+        choices: [
+          { value: "continue", label: "Copy now", detail: "Log in on " + host + " afterwards to see it." },
+          { value: "wait", label: "I will log in first", detail: "Log in there, then press NEXT to check again." }] }
+      case "version": return { title: host + " runs a different Omarchy",
+        body: (cloneCheck("version") || {}).detail || "",
+        choices: [
+          { value: "update", label: "I will update it first", detail: "Run  omarchy update  there, then press NEXT to check again." },
+          { value: "continue", label: "Continue anyway", detail: "Some plugins may log errors until it is updated." }] }
+      case "linked": return { title: host + " already syncs with a repo",
+        body: (cloneCheck("linked") || {}).detail || "",
+        choices: [
+          { value: "replace", label: "Replace that link", detail: "The old link is set aside, and Undo puts it back." },
+          { value: "stop", label: "Stop here", detail: "Leave " + host + " as it is." }] }
+      case "plugins": return { title: "How should the plugins get there?",
+        body: "NEXT then sends a copy of " + me + "'s setup to " + host + " and does a dry run (nothing is changed yet).",
+        choices: [
+          { value: "exact", label: "Exact copies of " + me + "'s plugins (recommended)", detail: "Same versions. No GitHub login or questions on " + host + "." },
+          { value: "fresh", label: "Latest versions from GitHub", detail: "You confirm each plugin in a terminal after the clone." }] }
+      case "display": return { title: "Screens and monitors",
+        body: me + "'s display layout is written for " + me + "'s screens.",
+        choices: [
+          { value: "keep", label: host + " keeps its own (recommended)", detail: "Right for different hardware." },
+          { value: "copy", label: "Copy " + me + "'s", detail: "Only if both machines have the same screens." }] }
+      case "bar": return { title: "The top bar",
+        choices: [
+          { value: "copy", label: "Copy " + me + "'s bar (recommended)", detail: "Same widgets in the same order." },
+          { value: "keep", label: host + " keeps its own bar", detail: "Config Sync's icon is added to it." }] }
+      case "wallpapers": return { title: "Wallpapers",
+        body: p && p.wallpapers ? (p.wallpapers.count + " file(s), " + Math.round(p.wallpapers.bytes / 1048576) + " MB, sent straight over SSH. Existing files are never overwritten.") : "",
+        choices: [
+          { value: "copy", label: "Copy them (recommended)" },
+          { value: "skip", label: "Skip wallpapers" }] }
+      case "review": return { title: "These run on their own, or mention " + me,
+        body: "Hooks run automatically on events. Files that mention " + me + " may point at things only it has.",
+        choices: [
+          { value: "copy", label: "Copy them all (recommended for an exact clone)" },
+          { value: "skip", label: "Skip all of them" }] }
+      case "programs": return { title: host + " is missing programs your shortcuts use",
+        body: "Config Sync never types or stores a sudo password.",
+        choices: [
+          { value: "now", label: "Install them now", detail: "A terminal opens, logged in to " + host + ", with the exact command. You type its sudo password there." },
+          { value: "later", label: "Later", detail: "Those shortcuts will not work until the programs are installed." }] }
+      case "confirm": return { title: "Ready to clone " + me + " onto " + host, body: "" }
+      case "result": return {
+        title: cloneDeferred ? "Almost done: one step waits for a login on " + host
+          : (cloneResult && cloneResult.ok ? "Done: " + host + " now looks like " + me : "The clone stopped part way"),
+        body: cloneDeferred ? "Log in on " + host + ", then press Resume to finish."
+          : (cloneResult && cloneResult.ok ? "Checking its health below." : "Press Resume to continue where it stopped, or Undo to put everything back.") }
+      case "family": return { title: "Keep Config Sync on " + host + "?",
+        body: "It is already installed there. Link it to a repo so " + host + " keeps syncing. It gets a key for that one repo only; no GitHub login or token goes onto it.",
+        choices: [
+          { value: "own", label: "Its own private repo (recommended)", detail: host + "_omarchy_config_sync" },
+          { value: "share", label: "Share " + me + "'s repo", detail: "Changes on either machine flow to both." },
+          { value: "none", label: "Not now" }] }
+      case "done": return { title: "All done", body: "" }
+    }
+    return { title: "", body: "" }
+  }
+
+  readonly property bool cloneCanNext: {
+    switch (cloneScreen) {
+      case "machine": return String(cloneTarget).trim() !== ""
+      case "session": return cloneAnswer("session") !== ""
+      case "version": return cloneAnswer("version") !== ""
+      case "linked": return cloneAnswer("linked") !== ""
+      case "confirm": return !!clonePreview && cloneConfirmText.trim() === cloneHostname
+    }
+    return true
+  }
+  readonly property string cloneBusyText: {
+    switch (cloneAction) {
+      case "discover": return "Looking for Omarchy machines this computer can see (Tailscale, SSH config, local network)…"
+      case "probe": return "Checking " + (cloneTarget || "the machine") + "…"
+      case "preview": return "Getting ready: sending a copy and doing a dry run on " + cloneHostname + "…"
+      case "clone": return "Cloning. This can take a few minutes; keep both machines awake."
+      case "health": return "Checking " + cloneHostname + "'s health…"
+      case "undo": return "Undoing the clone…"
+      case "adopt": return "Setting up " + cloneHostname + "'s repo…"
+    }
+    return "Working…"
+  }
+
+  function cloneGo(screen) { cloneError = ""; cloneScreen = screen }
+  function cloneAdvance() {
+    var i = cloneFlow.indexOf(cloneScreen)
+    if (i >= 0 && i + 1 < cloneFlow.length) cloneGo(cloneFlow[i + 1])
+  }
+  function cloneBack() {
+    var i = cloneFlow.indexOf(cloneScreen)
+    if (i > 0) cloneGo(cloneFlow[i - 1] === "ssh" && cloneConnected ? cloneFlow[Math.max(0, i - 2)] : cloneFlow[i - 1])
+  }
+  function cloneNext() {
+    if (!cloneCanNext || cloneBusy) return
+    switch (cloneScreen) {
+      case "blocked":
+      case "done":
+        return  // nothing past a failed check; nothing after done
+      case "machine":
+      case "ssh":
+        cloneRun(["probe"].concat(cloneTargetArgs())); return
+      case "session":
+        if (cloneAnswer("session") === "wait") { cloneRun(["probe"].concat(cloneTargetArgs())); return }
+        break
+      case "version":
+        if (cloneAnswer("version") === "update") { cloneRun(["probe"].concat(cloneTargetArgs())); return }
+        break
+      case "linked":
+        if (cloneAnswer("linked") === "stop") { cloneReset(); return }
+        break
+      case "plugins":
+        if (!clonePreview) {
+          cloneRun(["preview"].concat(cloneTargetArgs()).concat(cloneAnswer("plugins") === "fresh" ? ["--plugins", "fresh"] : []))
+          return
+        }
+        break
+      case "programs":
+        if (cloneAnswer("programs") === "now" && cloneTerminalStep("programs", "packages")) return
+        break
+      case "confirm":
+        cloneRun(["clone"].concat(cloneTargetArgs()).concat([
+          "--runid", clonePreview.runid, "--confirm", cloneConfirmText.trim(),
+          "--exclude", JSON.stringify(cloneExcludes)])
+          .concat(cloneAnswer("wallpapers") === "skip" ? ["--no-wallpapers"] : []))
+        return
+      case "result":
+        if (cloneResult && (!cloneResult.ok || cloneDeferred)) { cloneRun(["clone"].concat(cloneTargetArgs()).concat(["--resume"])); return }
+        if (cloneResult && (cloneResult.plugin_cmds || []).length > 0 && cloneTerminalStep("plugins", "plugins")) return
+        break
+      case "family":
+        if (cloneAnswer("family") !== "none") {
+          cloneRun(["adopt"].concat(cloneTargetArgs()).concat(["--mode", cloneAnswer("family")]))
+          return
+        }
+        break
+    }
+    cloneAdvance()
+  }
+
+  function cloneRun(args) {
+    if (cloneProc.running) return
+    cloneBusy = true
+    cloneError = ""
+    cloneMessage = ""
+    cloneAction = args[0]
+    cloneProc.command = ["python3", "-u", root.cloneScriptPath].concat(args)
+    cloneProc.running = true
+  }
+  function cloneTargetArgs() { return ["--target", String(cloneTarget).trim()] }
+  function cloneReset() {
+    cloneScreen = "machine"
+    cloneProbe = null
+    clonePreview = null
+    cloneResult = null
+    cloneHealth = null
+    cloneAdopt = null
+    cloneAnswers = ({})
+    cloneTermOpened = ({})
+    clonePicked = null
+    cloneConfirmText = ""
+    cloneError = ""
+    cloneMessage = ""
+  }
+  function cloneTerminal(kind) { cloneRun(["terminal"].concat(cloneTargetArgs()).concat(["--kind", kind])) }
+  function cloneHandle(text) {
+    cloneBusy = false
+    var data
+    try {
+      data = JSON.parse(String(text || "").trim().split("\n").pop())
+    } catch (e) {
+      cloneError = "The clone helper returned no readable result."
+      return
+    }
+    var action = cloneAction
+    if (!data.ok) {
+      cloneError = String(data.error || "That step failed.")
+      // Only a clone that actually started gets the Resume/Undo screen; a
+      // refusal before anything changed stays here with its reason.
+      if (action === "clone" && data.resumable) { cloneResult = data; cloneGo("result"); cloneError = String(data.error || "") }
+      if (action === "preview" && data.unfinished) { cloneResult = { ok: false, resumable: true, log: [] }; cloneGo("result") }
+      return
+    }
+    cloneMessage = String(data.message || "")
+    if (action === "probe") {
+      cloneProbe = data
+      if (!cloneConnected) { cloneGo("ssh"); return }
+      if (!data.ready) { cloneGo("blocked"); return }
+      if (cloneScreen === "version" && cloneWarned("version")) {
+        cloneError = "Still a different Omarchy version. Update it there, or choose Continue anyway."
+        return
+      }
+      if (cloneScreen === "session" && cloneWarned("session") && cloneAnswer("session") === "wait") {
+        cloneError = "Still nobody logged in there. Log in on it, or choose Copy now."
+        return
+      }
+      // Past the checks: the first question that applies after them.
+      if (cloneWarned("session") && cloneAnswer("session") !== "continue") { cloneGo("session"); return }
+      if (cloneWarned("version") && cloneAnswer("version") !== "continue") { cloneGo("version"); return }
+      if (cloneWarned("linked")) { cloneGo("linked"); return }
+      cloneGo("plugins")
+    } else if (action === "preview") {
+      clonePreview = data
+      cloneAdvance()
+    } else if (action === "discover") {
+      cloneFound = data
+    } else if (action === "terminal") {
+      cloneMessage = "Finish in the terminal window, then press NEXT."
+    } else if (action === "terminal-status") {
+      if (!data.finished) { cloneMessage = String(data.message || ""); return }
+      if (!data.succeeded) {
+        cloneError = "The terminal step failed (exit code " + data.rc + "). Fix it there and press NEXT again, or choose Later."
+        var reopen = cloneMap(cloneTermOpened)
+        delete reopen[clonePendingKind]  // the next NEXT reopens the terminal
+        cloneTermOpened = reopen
+        return
+      }
+      var ok = cloneMap(cloneTermOpened)
+      ok[clonePendingKind] = "ok"
+      cloneTermOpened = ok
+      cloneAdvance()
+    } else if (action === "clone") {
+      cloneResult = data
+      cloneGo("result")
+      Qt.callLater(function() { root.cloneRun(["health"].concat(root.cloneTargetArgs())) })
+    } else if (action === "health") {
+      cloneHealth = data
+    } else if (action === "undo") {
+      var msg = cloneMessage
+      var keep = cloneTarget
+      cloneReset()
+      cloneTarget = keep
+      cloneError = ""
+      cloneMessage = msg
+    } else if (action === "adopt") {
+      cloneAdopt = data
+      cloneGo("done")
+    }
   }
 
   function setPicked(kind, id, on) {
@@ -835,7 +1222,10 @@ Panel {
     Qt.callLater(function() {
       root.seedPicks()
       // An empty repo opens on Overview: the first-push card is the guide there.
-      if (root.openOnChanges && root.syncState === "empty") {
+      if (root.openOnChanges && root.activeTab === 3) {
+        // Mid-way through New machine: never pull the user off it.
+        root.openOnChanges = false
+      } else if (root.openOnChanges && root.syncState === "empty") {
         root.activeTab = 0
         root.openOnChanges = false
       } else if (root.openOnChanges && root.hasReviewable) {
@@ -947,6 +1337,15 @@ Panel {
     stderr: StdioCollector { waitForEnd: true }
   }
 
+  Process {
+    id: cloneProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.cloneHandle(text)
+    }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
   IpcHandler {
     target: "gladimdim.config-sync"
     function open(): void { root.open() }
@@ -999,7 +1398,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: urlField.activeFocus || root.editingRepo || root.confirmKind !== ""
+      blocked: urlField.activeFocus || root.editingRepo || root.confirmKind !== "" || root.activeTab === 3
 
       onCloseRequested: {
         if (root.confirmKind !== "") root.confirmKind = ""
@@ -1313,6 +1712,7 @@ Panel {
             sourceComponent: {
               if (root.activeTab === 1) return tabChangesComp
               if (root.activeTab === 2) return tabConfigsComp
+              if (root.activeTab === 3) return tabCloneComp
               return tabOverviewComp
             }
           }
@@ -2444,6 +2844,503 @@ Panel {
       }
     }
   }
+  Component {
+    id: tabCloneComp
+    Column {
+      width: parent.width
+      spacing: Style.space(12)
+
+      // Where you are: "Step 3 of 9 · Plugins"
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Step " + (root.cloneFlow.indexOf(root.cloneScreen) + 1) + " of " + root.cloneFlow.length
+          + "  ·  Clone " + root.cloneSourceName + " onto " + (root.cloneHostname || "a new machine")
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      // The question
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.cloneQuestion.title || ""
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        font.bold: true
+        wrapMode: Text.WordWrap
+      }
+      Text {
+        visible: text !== ""
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.cloneQuestion.body || ""
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+
+      // ---- machine: one text field
+      TextField {
+        visible: root.cloneScreen === "machine"
+        width: parent.width
+        placeholderText: "newlaptop   ·   pi@10.0.0.42   ·   newlaptop.your-tailnet.ts.net"
+        text: root.cloneTarget
+        foreground: root.foreground
+        font.family: root.fontFamily
+        enabled: !root.cloneBusy
+        onTextChanged: {
+          if (text === root.cloneTarget) return
+          root.cloneReset()
+          root.cloneTarget = text
+        }
+        onAccepted: root.cloneNext()
+      }
+
+      // ---- find machines: passive discovery, then ARE YOU SURE on pick
+      Button {
+        visible: root.cloneScreen === "machine" && !root.clonePicked
+        text: root.cloneFound ? "Search again" : "Find machines near me"
+        iconText: "󰍉"
+        tooltipText: "Machines this computer already knows. Nothing is scanned or changed."
+        bordered: true
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !root.cloneBusy
+        onClicked: root.cloneRun(["discover"])
+      }
+      Text {
+        visible: root.cloneScreen === "machine" && !!root.cloneFound && !root.clonePicked
+        width: parent.width
+        textFormat: Text.PlainText
+        text: !root.cloneFound ? "" : ((root.cloneFound.machines.length === 0
+            ? "No Omarchy machine found that this computer can log in to."
+            : "Omarchy machines this computer can reach. Pick one:")
+          + (root.cloneFound.unconfirmed > 0
+            ? "  (" + root.cloneFound.unconfirmed + " other machine(s) answer SSH but could not be checked. For a new one without your key yet, type its name above: NEXT helps you set up the key.)"
+            : ""))
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Repeater {
+        model: root.cloneScreen === "machine" && root.cloneFound && !root.clonePicked ? root.cloneFound.machines : []
+        ChoiceCard {
+          required property var modelData
+          width: parent.width
+          title: (modelData.status === "omarchy" ? "󰣇  " : "?  ") + modelData.name
+            + (modelData.version ? "   Omarchy " + modelData.version : "")
+          detail: modelData.dest + "  ·  via " + modelData.via.join(" + ")
+            + (modelData.status !== "omarchy" ? "  ·  " + (modelData.detail || "not confirmed yet") : "")
+          selected: false
+          onPicked: root.clonePicked = modelData
+        }
+      }
+      Rectangle {
+        visible: root.cloneScreen === "machine" && !!root.clonePicked
+        width: parent.width
+        implicitHeight: sureCol.implicitHeight + Style.space(24)
+        radius: Style.cornerRadius
+        color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.12)
+        border.width: 2
+        border.color: root.urgent
+        Column {
+          id: sureCol
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.margins: Style.space(12)
+          spacing: Style.space(10)
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "ARE YOU SURE?  Use " + (root.clonePicked ? root.clonePicked.name : "") + "?"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            wrapMode: Text.WordWrap
+          }
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "This will make HEAVY edits to " + (root.clonePicked ? root.clonePicked.name + " (" + root.clonePicked.dest + ")" : "that machine")
+              + ": its shortcuts, bar, plugins, hooks, scripts and theme will be replaced with " + root.cloneSourceName
+              + "'s. Nothing changes yet: the next steps check it and show you exactly what will change, and there is Undo."
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+          Row {
+            spacing: Style.space(8)
+            Button {
+              text: "Yes, use " + (root.clonePicked ? root.clonePicked.name : "it")
+              iconText: "󰄬"
+              bordered: true
+              selected: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                var dest = root.clonePicked.dest
+                root.cloneReset()
+                root.cloneTarget = dest
+                root.cloneNext()
+              }
+            }
+            Button {
+              text: "Cancel"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.clonePicked = null
+            }
+          }
+        }
+      }
+
+      // ---- ssh help: plain words, one action
+      Column {
+        visible: root.cloneScreen === "ssh"
+        width: parent.width
+        spacing: Style.space(8)
+        CloneCheckRow {
+          visible: !!root.cloneCheck("ssh") || !!root.cloneCheck("reach")
+          width: parent.width
+          item: root.cloneCheck("ssh") || root.cloneCheck("reach") || ({})
+        }
+        GuideStep {
+          step: "1"
+          title: "On the new machine, turn SSH on"
+          body: "Open a terminal there and run:\n    sudo systemctl enable --now sshd\nThen let only THIS computer through its firewall:\n    "
+            + (root.cloneProbe && root.cloneProbe.source_ip
+               ? "sudo ufw allow from " + root.cloneProbe.source_ip + " to any port 22 proto tcp"
+               : "sudo ufw allow in on tailscale0 to any port 22")
+            + "\n(Using Tailscale? This allows SSH over Tailscale only:  sudo ufw allow in on tailscale0 to any port 22)"
+        }
+        GuideStep {
+          step: "2"
+          title: "Here, press Copy my key over"
+          body: "A terminal opens. Type the NEW machine's password once. After that, no passwords."
+        }
+        Row {
+          spacing: Style.space(8)
+          Button {
+            text: "Copy my key over"
+            iconText: "󰌆"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            enabled: !root.cloneBusy
+            onClicked: root.cloneTerminal(root.cloneCheck("ssh") && root.cloneCheck("ssh").fix === "hostkey" ? "hostkey" : "copy-id")
+          }
+          Button {
+            text: "Get Tailscale"
+            iconText: "󰖟"
+            tooltipText: "https://tailscale.com/download"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: Qt.openUrlExternally("https://tailscale.com/download")
+          }
+        }
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Recommended: Tailscale joins your own machines into a private network that works anywhere, with no ports opened to the internet. Free for personal use. Install it on both, sign in with the same account, then use the new machine's Tailscale name."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+      }
+
+      // ---- blocked: a check that cannot be answered with a choice
+      Repeater {
+        model: root.cloneScreen === "blocked" && root.cloneProbe ? root.cloneProbe.checks.filter(function(c) { return c.status === "fail" }) : []
+        CloneCheckRow { required property var modelData; width: parent.width; item: modelData }
+      }
+
+      // ---- the choices for this question
+      Repeater {
+        model: root.cloneQuestion.choices || []
+        ChoiceCard {
+          required property var modelData
+          width: parent.width
+          title: modelData.label
+          detail: modelData.detail || ""
+          selected: root.cloneAnswer(root.cloneScreen) === modelData.value
+          onPicked: root.cloneSetAnswer(root.cloneScreen, modelData.value)
+        }
+      }
+
+      // ---- lists that belong to a question
+      Text {
+        visible: root.cloneScreen === "review" || root.cloneScreen === "programs"
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.cloneScreen === "review" ? root.cloneReviewText : root.cloneProgramsText
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+
+      // ---- confirm: summary, warning, name
+      Column {
+        visible: root.cloneScreen === "confirm"
+        width: parent.width
+        spacing: Style.space(8)
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.cloneSummary
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+        Rectangle {
+          width: parent.width
+          implicitHeight: warnText.implicitHeight + Style.space(20)
+          radius: Style.cornerRadius
+          color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.12)
+          border.width: 2
+          border.color: root.urgent
+          Text {
+            id: warnText
+            anchors.fill: parent
+            anchors.margins: Style.space(10)
+            textFormat: Text.PlainText
+            text: root.cloneHostname + " will look like " + root.cloneSourceName + ", NOT like it does now. "
+              + "Its shortcuts, bar, plugins, hooks, scripts and theme are replaced with " + root.cloneSourceName + "'s. "
+              + "Files that only exist on " + root.cloneHostname + " are kept, and everything replaced is saved there so Undo can put it back.\n"
+              + "Not copied: passwords, SSH keys and logins, installed apps, system settings, files that look like secrets, and the repo's history."
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+        }
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Type  " + root.cloneHostname + "  to confirm:"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+        TextField {
+          width: parent.width
+          placeholderText: root.cloneHostname
+          text: root.cloneConfirmText
+          foreground: root.foreground
+          font.family: root.fontFamily
+          onTextChanged: root.cloneConfirmText = text
+        }
+      }
+
+      // ---- result / done
+      Repeater {
+        model: root.cloneScreen === "result" && root.cloneResult && root.cloneResult.log ? root.cloneResult.log : []
+        CloneCheckRow {
+          required property var modelData
+          width: parent.width
+          item: ({ title: modelData.stage, status: modelData.status === "fail" ? "fail" : (modelData.status === "deferred" ? "warn" : "pass"),
+                   detail: modelData.status + (modelData.detail ? " · " + modelData.detail : "") })
+        }
+      }
+      Repeater {
+        model: (root.cloneScreen === "result" || root.cloneScreen === "done") && root.cloneHealth ? root.cloneHealth.checks : []
+        CloneCheckRow { required property var modelData; width: parent.width; item: modelData }
+      }
+      Text {
+        visible: root.cloneScreen === "done"
+        width: parent.width
+        textFormat: Text.PlainText
+        text: (root.cloneAdopt ? root.cloneAdopt.message + "\n\n" : "")
+          + "Left for you on " + root.cloneHostname + ":\n•  Sign in to 1Password, your browser and Tailscale\n•  Make its own SSH key if it needs one\n•  Optional: turn SSH password logins off"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+
+      Text {
+        visible: root.cloneError !== ""
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.cloneError
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+      Text {
+        visible: root.cloneError === "" && !root.cloneBusy && root.cloneMessage !== ""
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.cloneMessage
+        color: root.accent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+      Text {
+        visible: root.cloneBusy
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.cloneBusyText
+        color: root.accent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      // ---- Back · NEXT (or EXECUTE)
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+        Button {
+          visible: root.cloneScreen !== "machine" && root.cloneScreen !== "result" && root.cloneScreen !== "done"
+          text: "Back"
+          iconText: "󰁍"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: !root.cloneBusy
+          onClicked: root.cloneBack()
+        }
+        Button {
+          visible: root.cloneScreen !== "done" && root.cloneScreen !== "blocked" && !root.clonePicked
+          text: root.cloneScreen === "confirm"
+            ? ("EXECUTE: Clone " + root.cloneSourceName + " onto " + root.cloneHostname)
+            : (root.cloneScreen === "result" && root.cloneResult && !root.cloneResult.ok ? "Resume"
+               : (root.cloneScreen === "result" && root.cloneDeferred ? "Resume (after logging in there)" : "NEXT"))
+          iconText: root.cloneScreen === "confirm" ? "󰆏" : "󰁔"
+          bordered: true
+          selected: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: !root.cloneBusy && root.cloneCanNext
+          onClicked: root.cloneNext()
+        }
+        Button {
+          visible: (root.cloneScreen === "result" || root.cloneScreen === "done") && !!root.cloneResult
+          text: "Undo clone"
+          iconText: "󰕍"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: !root.cloneBusy
+          onClicked: root.cloneRun(["undo"].concat(root.cloneTargetArgs()))
+        }
+        Button {
+          visible: root.cloneScreen === "done" || root.cloneScreen === "blocked"
+          text: "Start over"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: !root.cloneBusy
+          onClicked: { root.cloneReset(); root.cloneTarget = "" }
+        }
+      }
+    }
+  }
+
+  component ChoiceCard: Rectangle {
+    id: choice
+    property string title: ""
+    property string detail: ""
+    property bool selected: false
+    signal picked()
+    implicitHeight: choiceCol.implicitHeight + Style.space(18)
+    radius: Style.cornerRadius
+    color: selected ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16) : (choiceMa.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06) : root.cardBg)
+    border.width: selected ? 2 : 1
+    border.color: selected ? root.accent : root.cardBorder
+    Text {
+      id: radio
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      textFormat: Text.PlainText
+      text: choice.selected ? "󰄯" : "󰄰"
+      color: choice.selected ? root.accent : root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+    Column {
+      id: choiceCol
+      anchors.left: radio.right
+      anchors.leftMargin: Style.space(10)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: 2
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: choice.title
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: choice.selected
+        wrapMode: Text.WordWrap
+      }
+      Text {
+        visible: text !== ""
+        width: parent.width
+        textFormat: Text.PlainText
+        text: choice.detail
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+    }
+    MouseArea {
+      id: choiceMa
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: choice.picked()
+    }
+  }
+
+  component CloneCheckRow: Row {
+    property var item: ({})
+    spacing: Style.space(8)
+    Text {
+      textFormat: Text.PlainText
+      text: item.status === "pass" ? "󰄬" : (item.status === "warn" ? "󰀦" : "󰅖")
+      color: item.status === "pass" ? root.accent : (item.status === "warn" ? root.foreground : root.urgent)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      width: Style.space(18)
+    }
+    Column {
+      width: parent.width - Style.space(26)
+      spacing: 1
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: String(item.title || "")
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+      }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: String(item.detail || "") + (item.fix && item.status !== "pass" && item.fix.length > 20 ? "\n" + item.fix : "")
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+    }
+  }
+
   component GuideStep: Row {
     property string step: ""
     property string title: ""

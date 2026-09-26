@@ -4013,8 +4013,9 @@ MIRROR_STATUSES = {
 }
 
 
-def mirror_paths(diff_files: list[dict[str, Any]], direction: str) -> set[str]:
+def mirror_paths(diff_files: list[dict[str, Any]], direction: str, exclude: set[str] | None = None) -> set[str]:
     wanted_statuses = MIRROR_STATUSES[direction]
+    skip = exclude or set()
     # Machine-local files (display layout, machine_local paths) carry no
     # direction; a mirror sends them whenever the sending side has one.
     source_key = "repo_exists" if direction == "apply" else "local_exists"
@@ -4022,8 +4023,33 @@ def mirror_paths(diff_files: list[dict[str, Any]], direction: str) -> set[str]:
         i["path"]
         for i in diff_files
         if not i.get("hidden")
+        and i["path"] not in skip
         and (i["status"] in wanted_statuses or (i["status"] == "machine" and i.get(source_key)))
     }
+
+
+def parse_exclude_arg(args: argparse.Namespace) -> set[str]:
+    """Repo-relative paths a mirror must leave alone: --exclude a,b or a JSON list.
+
+    An invalid entry is an error, never silently dropped: a path someone asked
+    to leave alone must not be copied because it failed to parse.
+    """
+    raw = str(getattr(args, "exclude", None) or "")
+    if raw.lstrip().startswith("["):
+        try:
+            items = json.loads(raw)
+        except json.JSONDecodeError:
+            raise SyncError("The exclude list is not valid JSON.")
+        if not isinstance(items, list):
+            raise SyncError("The exclude list must be a JSON list.")
+    else:
+        items = [p.strip() for p in raw.split(",") if p.strip()]
+    out: set[str] = set()
+    for item in items:
+        if not isinstance(item, str) or not validate_safe_rel_path(item):
+            raise SyncError(f"Refusing an exclude path that is not a plain repo path: {item!r}")
+        out.add(item)
+    return out
 
 
 def launch_mirror_plugins(commands: list[str], dry_run: bool) -> str:
@@ -4138,8 +4164,10 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     mirror = bool(getattr(args, "mirror", False))
     if mirror:
         args.include_machine = True
-        wanted = mirror_paths(diff["files"], "apply")
-    plugin_cmds = mirror_plugin_commands(diff.get("plugin_list") or []) if mirror else []
+        wanted = mirror_paths(diff["files"], "apply", parse_exclude_arg(args))
+    # A remote clone opens plugin installs from the source machine instead.
+    launch_plugins = mirror and not getattr(args, "skip_plugin_launch", False)
+    plugin_cmds = mirror_plugin_commands(diff.get("plugin_list") or []) if launch_plugins else []
     if plugin_ids:
         extra = expand_plugin_paths(diff["files"], plugin_ids, "apply")
         wanted = set() if wanted is None else set(wanted)
@@ -4364,7 +4392,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     mirror = bool(getattr(args, "mirror", False))
     if mirror:
         args.include_machine = True
-        wanted = mirror_paths(diff["files"], "publish")
+        wanted = mirror_paths(diff["files"], "publish", parse_exclude_arg(args))
         list_rows = [
             row
             for row in diff.get("plugin_list") or []
@@ -4641,6 +4669,8 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             args=[],
             command="apply" if side == "repo" else "publish",
             url=None,
+            exclude=getattr(args, "exclude", None),
+            skip_plugin_launch=bool(getattr(args, "skip_plugin_launch", False)),
         )
         if side == "repo":
             result = cmd_apply(ctx, mirror_args)
@@ -5084,6 +5114,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--push", action="store_true")
     parser.add_argument("--include-machine", action="store_true")
     parser.add_argument("--mirror", action="store_true")
+    parser.add_argument("--exclude", default=None)
+    parser.add_argument("--skip-plugin-launch", action="store_true")
     parser.add_argument("--files", default=None)
     parser.add_argument("--explicit", action="store_true")
     parser.add_argument("--shortcut", action="append", default=None)

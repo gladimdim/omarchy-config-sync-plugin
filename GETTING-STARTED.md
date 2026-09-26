@@ -159,6 +159,21 @@ From a terminal: `config_sync.py resync --side local --mirror` or `--side repo -
 
 ---
 
+## Set up a new machine from this one (New machine tab)
+
+Bought a new laptop and installed Omarchy? The **New machine** tab makes it look like this machine, step by step. Each screen asks one question; **NEXT** checks things for you and only moves on when they pass; the last screen has one **EXECUTE** button.
+
+1. **Which machine?** Type its name, IP or Tailscale name, or press **Find machines near me**. The search only lists Omarchy machines this computer already knows about (Tailscale peers, `~/.ssh/config`, the local network, mDNS). It never scans address ranges. Picking one asks **ARE YOU SURE**: the clone makes heavy edits to that machine.
+2. **SSH, once.** If this computer cannot log in yet, the wizard shows exactly what to run on the new machine (`sudo systemctl enable --now sshd`, then a firewall rule that lets in **only this computer's address**) and opens a terminal to copy your key over (you type the new machine's password once). Tailscale is recommended: it works across networks without opening ports to the internet. https://tailscale.com/download
+3. **Checks.** It must be a different machine (machine id and SSH host key), run Omarchy, have Python 3.10+, git, the same CPU type and free disk. A different Omarchy version or an existing Config Sync link asks you first.
+4. **Questions.** Plugins (exact copies of yours, or the latest from GitHub), display layout (kept by default), bar layout, wallpapers, hooks and files that mention this machine, and any programs your shortcuts use that it is missing (installed with `omarchy pkg add` in a terminal where you type its sudo password; Config Sync never sees it).
+5. **EXECUTE.** Type the new machine's name to confirm. Everything that gets replaced is saved on that machine first; **Undo** puts it all back.
+6. **Keep syncing.** Give it its own private repo (created from this machine; the new machine gets a key for that one repo only, no GitHub login) or share this machine's repo.
+
+**What is never copied:** files that look like secrets, the repo's git history, compiled programs (build or install them on the new machine), passwords, SSH keys and logins, installed apps, and system settings. Files that exist only on the new machine are kept.
+
+---
+
 ## If something goes wrong
 
 **“Git could not authenticate”**  

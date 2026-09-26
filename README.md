@@ -55,6 +55,7 @@ omarchy plugin enable gladimdim.config-sync --section right
 | After Connect | Tabs show **this machine** | Tabs show **the repo** |
 | Primary button | **Seed repo** (first push) | **Apply** (backup, then copy onto the machine) |
 | Carbon copy | **Seed everything** / **Mirror this machine to repo** | **Mirror onto this machine** (everything, plus plugin installs) |
+| New laptop | **New machine** tab: find it, answer a few questions, EXECUTE (over SSH, with Undo) | nothing to do there except allow SSH |
 
 ## Daily flow
 
