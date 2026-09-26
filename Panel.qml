@@ -415,10 +415,12 @@ Panel {
 
   readonly property string cloneLoginUser: cloneProbe && cloneProbe.facts ? String(cloneProbe.facts.login_user || "") : ""
   function cloneHostPart() { var t = String(cloneTarget).trim(); return t.indexOf("@") >= 0 ? t.split("@").pop() : t }
+  property string clonePendingAccount: ""
+  // Re-check as another account. The choice only sticks once the probe has
+  // really logged in as that user (see cloneHandle), so it cannot loop.
   function cloneUseAccount(user) {
-    var next = cloneMap(cloneAnswers)
-    next["account"] = user
-    cloneAnswers = next
+    if (!/^[a-z_][a-z0-9_.-]{0,31}$/.test(user)) { cloneError = "That is not a valid account name."; return }
+    clonePendingAccount = user
     cloneTarget = user + "@" + cloneHostPart()
     cloneRun(["probe"].concat(cloneTargetArgs()))
   }
@@ -701,6 +703,13 @@ Panel {
     var action = cloneAction
     if (!data.ok) {
       cloneError = String(data.error || "That step failed.")
+      if (action === "probe" && clonePendingAccount) {
+        cloneError = "Could not log in as " + clonePendingAccount + ": " + cloneError
+        clonePendingAccount = ""
+        var cleared = cloneMap(cloneAnswers)
+        delete cleared["account"]
+        cloneAnswers = cleared
+      }
       // Only a clone that actually started gets the Resume/Undo screen; a
       // refusal before anything changed stays here with its reason.
       if (action === "clone" && data.resumable) { cloneResult = data; cloneGo("result"); cloneError = String(data.error || "") }
@@ -710,6 +719,16 @@ Panel {
     cloneMessage = String(data.message || "")
     if (action === "probe") {
       cloneProbe = data
+      if (clonePendingAccount) {
+        var reached = data.facts ? String(data.facts.login_user || "") : ""
+        var picked = cloneMap(cloneAnswers)
+        if (reached === clonePendingAccount) picked["account"] = reached
+        else delete picked["account"]
+        cloneAnswers = picked
+        if (reached !== clonePendingAccount && cloneConnected)
+          cloneError = "Logged in as " + reached + ", not " + clonePendingAccount + "."
+        clonePendingAccount = ""
+      }
       if (!cloneConnected) { cloneGo("ssh"); return }
       if (!data.ready) { cloneGo("blocked"); return }
       if (cloneScreen === "version" && cloneWarned("version")) {
@@ -3078,15 +3097,15 @@ Panel {
       }
 
       Button {
-        visible: root.cloneScreen === "blocked" && root.cloneFailed("account") && String((root.cloneCheck("account") || {}).fix || "").indexOf("@") > 0
-        text: "Use " + String((root.cloneCheck("account") || {}).fix || "")
+        visible: root.cloneScreen === "blocked" && root.cloneFailed("account") && String((root.cloneCheck("account") || {}).fix || "") !== ""
+        text: "Use " + String((root.cloneCheck("account") || {}).fix || "") + "@" + root.cloneHostPart()
         iconText: "󰀄"
         bordered: true
         selected: true
         foreground: root.foreground
         fontFamily: root.fontFamily
         enabled: !root.cloneBusy
-        onClicked: root.cloneUseAccount(String(root.cloneCheck("account").fix).split("@")[0])
+        onClicked: root.cloneUseAccount(String(root.cloneCheck("account").fix))
       }
       // ---- blocked: a check that cannot be answered with a choice
       Repeater {

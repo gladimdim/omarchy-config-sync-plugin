@@ -139,18 +139,31 @@ except Exception:
     pass
 units = sh(["systemctl", "--user", "list-unit-files", "--state=enabled", "--no-legend", "--plain"])
 def desktop_owner():
-    """Who owns the Omarchy desktop: a live graphical session, else autologin."""
+    """The human using this machine's desktop right now: an active, local,
+    seated user session (not the greeter, not SSH, not remote). "" if none,
+    or if several different people are logged in."""
+    owners = set()
     for line in sh(["loginctl", "list-sessions", "--no-legend"]).splitlines():
         sid = line.split()[0] if line.split() else ""
-        props = dict(l.split("=", 1) for l in sh(["loginctl", "show-session", sid, "-p", "Type", "-p", "Name"]).splitlines() if "=" in l)
-        if props.get("Type") in ("wayland", "x11"):
-            return props.get("Name", "")
-    import glob
-    for conf in sorted(glob.glob("/etc/sddm.conf.d/*.conf")) + ["/etc/sddm.conf"]:
-        for l in read(conf).splitlines():
-            if l.strip().startswith("User=") and l.strip()[5:]:
-                return l.strip()[5:]
-    return ""
+        props = dict(l.split("=", 1) for l in sh(["loginctl", "show-session", sid, "-p", "Type", "-p", "Name",
+                     "-p", "Class", "-p", "Remote", "-p", "Seat", "-p", "State"]).splitlines() if "=" in l)
+        if (props.get("Type") in ("wayland", "x11") and props.get("Class") == "user" and props.get("Remote") == "no"
+                and props.get("Seat") and props.get("State") in ("active", "online")):
+            owners.add(props.get("Name", ""))
+    return owners.pop() if len(owners) == 1 else ""
+def autologin_user():
+    """SDDM [Autologin] User=, later files winning. A hint only, never proof."""
+    import glob, configparser
+    user = ""
+    for conf in sorted(glob.glob("/usr/lib/sddm/sddm.conf.d/*.conf")) + sorted(glob.glob("/etc/sddm.conf.d/*.conf")) + ["/etc/sddm.conf"]:
+        cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None, strict=False)
+        try:
+            cp.read_string(read(conf))
+        except configparser.Error:
+            continue
+        if cp.has_option("Autologin", "User"):
+            user = cp.get("Autologin", "User").strip().strip("\"'")
+    return user
 import pwd
 accounts = sorted(p.pw_name for p in pwd.getpwall()
                   if 1000 <= p.pw_uid < 60000 and not p.pw_shell.endswith(("nologin", "false")) and os.path.isdir(p.pw_dir))
@@ -180,6 +193,7 @@ print(json.dumps({
     "home": str(home),
     "login_user": pwd.getpwuid(uid).pw_name,
     "desktop_owner": desktop_owner(),
+    "autologin_user": autologin_user(),
     "accounts": accounts,
 }))
 '''
@@ -448,19 +462,30 @@ def cmd_probe(ctx: cs.Context, args: argparse.Namespace) -> dict[str, Any]:
     else:
         add("self", "Not this machine", not same,
             f"{theirs.get('hostname')} is a different machine" if not same else "That address is THIS machine. A clone onto itself is refused.")
-    me_user, owner = theirs.get("login_user") or "", theirs.get("desktop_owner") or ""
-    others = [a for a in theirs.get("accounts") or [] if a != me_user]
+    user_ok = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
+    accounts = [a for a in theirs.get("accounts") or [] if user_ok.match(a)]
+    me_user = theirs.get("login_user") or ""
+    owner = theirs.get("desktop_owner") or ""
+    owner = owner if owner in accounts else ""
+    hint = theirs.get("autologin_user") or ""
+    hint = hint if hint in accounts else ""
+    others = [a for a in accounts if a != me_user]
     if owner and owner != me_user:
         add("account", "The account that owns the desktop", False,
-            f"You reached {theirs.get('hostname')} as '{me_user}', but its Omarchy desktop belongs to '{owner}'. "
-            f"Use {owner}@{target.dest.split('@')[-1]} instead (this computer's key must be on that account).",
-            owner + "@" + target.dest.split("@")[-1])
-    elif not owner and others:
+            f"You reached {theirs.get('hostname')} as '{me_user}', but '{owner}' is using its desktop right now. "
+            f"Use that account instead (this computer's key must be on it).", owner)
+    elif owner == me_user and me_user:
+        checks.append(check("account", "The account that owns the desktop", "pass", f"'{me_user}' is using its desktop"))
+    elif others:
+        # Nobody at the desktop and more than one person: ask. Autologin is
+        # only a suggestion (an imaged machine may still name the old account).
+        order = ([hint] if hint else []) + [a for a in [me_user] + others if a and a != hint]
         checks.append(check("account", "The account that owns the desktop", "warn",
-                            f"Logged in as '{me_user}'. Nobody is logged in there, and it also has: " + ", ".join(others)
-                            + ". Pick the account you use on it.", ",".join([me_user] + others)))
+                            f"Reached as '{me_user}'. Nobody is at its desktop and it has several accounts: "
+                            + ", ".join([me_user] + others) + (f" (autologin is set to '{hint}')" if hint else "")
+                            + ". Pick the account you use on it.", ",".join(order)))
     else:
-        checks.append(check("account", "The account that owns the desktop", "pass", f"'{me_user}'"))
+        checks.append(check("account", "The account that owns the desktop", "pass", f"'{me_user}' (the only account)"))
     add("omarchy", "Omarchy is installed", bool(theirs.get("has_omarchy")),
         f"Omarchy {theirs.get('omarchy') or theirs.get('omarchy_dev') or '?'}" if theirs.get("has_omarchy") else "No Omarchy found. Install Omarchy first: https://omarchy.org",
         "install-omarchy")
@@ -497,7 +522,7 @@ def cmd_probe(ctx: cs.Context, args: argparse.Namespace) -> dict[str, Any]:
         "source": {k: mine.get(k) for k in ("hostname", "arch", "omarchy", "omarchy_dev", "hyprland", "quickshell")},
         "facts": {k: theirs.get(k) for k in ("hostname", "user", "arch", "omarchy", "omarchy_dev", "hyprland",
                                            "quickshell", "plugin_version", "linked_repo", "lineage",
-                                           "login_user", "desktop_owner", "accounts")},
+                                           "login_user", "desktop_owner", "autologin_user", "accounts")},
     })
 
 
@@ -2036,7 +2061,11 @@ def cmd_discover(ctx: cs.Context, args: argparse.Namespace) -> dict[str, Any]:
         if facts.get("omarchy") != "yes" or not facts.get("version"):
             return dict(c, status="not-omarchy")  # confirmed only by the installed package
         user = facts.get("user", "")
-        dest = c["dest"] if "@" in c["dest"] or not user else f"{user}@{c['dest']}"
+        if not re.match(r"^[a-z_][a-z0-9_.-]{0,31}$", user):
+            user = ""
+        # An ssh-config alias carries its own User; only bare names/IPs get user@.
+        keep = "@" in c["dest"] or "SSH config" in c["via"] or not user
+        dest = c["dest"] if keep else f"{user}@{c['dest']}"
         return dict(c, status="omarchy", name=facts.get("host") or c["name"], version=facts.get("version", ""),
                     user=user, dest=dest)
 
