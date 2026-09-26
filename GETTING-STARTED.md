@@ -94,7 +94,7 @@ omarchy-shell shell rescanPlugins
 4. Paste the URL from Step 1 into the field.
 5. Click **Connect repo**.
 
-The plugin clones the repo, notices it is empty, and **does not apply anything yet**. The Shortcuts, Plugins, and Configs tabs show **this machine** — that is what will be uploaded.
+The plugin clones the repo, notices it is empty, and **does not apply anything yet**. The header reads **Linked · ready for first push** and the Overview tab shows a highlighted **first push** card. The Changes tab lists **this machine** under Outgoing: that is what will be uploaded.
 
 If clone fails with an authentication message, go back to Step 2.
 
@@ -104,13 +104,15 @@ If clone fails with an authentication message, go back to Step 2.
 
 This is the last “are you sure?” before your desktop layout lives on GitHub.
 
+Open **Review list** (or the Changes tab) and expand **Outgoing**. It holds:
+
 - **Shortcuts** — bindings from `hypr/bindings.lua`
-- **Plugins** — everything under `~/.config/omarchy/plugins/` except this plugin itself
-- **Configs** — Hyprland files, `shell.json`, hooks, terminals
+- **Plugins** — git-installed plugins travel as a list (`plugins.json`); hand-copied ones as files. This plugin itself is never included
+- **Configs** — Hyprland files, `shell.json`, hooks, terminals, and the current theme (images and video wallpapers are skipped)
 
 **Machine-local files** stay on this machine: display layout (`hypr/monitors.lua`) and anything you list as `machine_local` in `.omarchy-config.json`. Overlay files named `*.local.lua` / `local.conf` under `hypr/` are not synced at all. Turn on **Include machine-local files** on the Changes tab only if you mean it.
 
-When it looks right, click **Publish this machine**. Confirm. The plugin copies those files into the private repo, commits, and pushes.
+When it looks right, click **Seed repo (N items)** on the Overview card. Confirm with **Seed & push**. The plugin copies those files into the private repo, commits, and pushes.
 
 Your GitHub repo should now contain `hypr/`, `omarchy/`, `plugins/`, and so on — still **private**.
 
@@ -138,6 +140,37 @@ Both machines need the **same Config Sync plugin version** (Overview shows `Plug
 | Added a shortcut / plugin on this machine | Badge: local changes | **Publish** |
 | Published from the other machine | Badge: incoming updates | **Apply** |
 | Both machines edited the same file | Changes → Both | Keep local or Take repo, then Apply/Publish |
+
+---
+
+## Recreate a machine exactly (Mirror)
+
+Normal Apply/Publish is careful: plugins, hooks and `~/.local/bin` tools are never ticked by default, the display layout stays machine-local, and shortcuts that call helper functions are skipped one by one. When you want a **carbon copy** instead, use Mirror on the Overview tab:
+
+| Button | Does |
+| --- | --- |
+| **Seed everything (exact mirror)** | First push of an empty repo with everything, ticked or not |
+| **Mirror this machine to repo** | Pushes everything on this machine into the repo |
+| **Mirror onto this machine** | Applies everything from the repo, then opens Omarchy's installer once for every listed plugin not installed here |
+
+"Everything" means `hypr/bindings.lua` as a whole file (so binds with inline functions and `[[...]]` strings survive), every plugin, hook and bin tool, the theme, and machine-local files such as `hypr/monitors.lua`. Hidden items stay hidden. Mirror never deletes files that exist only on the receiving side, and Apply writes a timestamped backup first.
+
+From a terminal: `config_sync.py resync --side local --mirror` or `--side repo --mirror` (add `--dry-run` to preview).
+
+---
+
+## Set up a new machine from this one (New machine tab)
+
+Bought a new laptop and installed Omarchy? The **New machine** tab makes it look like this machine, step by step. Each screen asks one question; **NEXT** checks things for you and only moves on when they pass; the last screen has one **EXECUTE** button.
+
+1. **Which machine?** Type its name, IP or Tailscale name, or press **Find machines near me**. The search only lists Omarchy machines this computer already knows about (Tailscale peers, `~/.ssh/config`, the local network, mDNS). It never scans address ranges. Picking one asks **ARE YOU SURE**: the clone makes heavy edits to that machine.
+2. **SSH, once.** If this computer cannot log in yet, the wizard shows exactly what to run on the new machine (`sudo systemctl enable --now sshd`, then a firewall rule that lets in **only this computer's address**) and opens a terminal to copy your key over (you type the new machine's password once). Tailscale is recommended: it works across networks without opening ports to the internet. https://tailscale.com/download
+3. **Checks.** It must be a different machine (machine id and SSH host key), run Omarchy, have Python 3.10+, git, the same CPU type and free disk. A different Omarchy version or an existing Config Sync link asks you first.
+4. **Questions.** Plugins (exact copies of yours, or the latest from GitHub), display layout (kept by default), bar layout, wallpapers, hooks and files that mention this machine, and any programs your shortcuts use that it is missing (installed with `omarchy pkg add` in a terminal where you type its sudo password; Config Sync never sees it).
+5. **EXECUTE.** Type the new machine's name to confirm. Everything that gets replaced is saved on that machine first; **Undo** puts it all back.
+6. **Keep syncing.** Give it its own private repo (created from this machine; the new machine gets a key for that one repo only, no GitHub login) or share this machine's repo.
+
+**What is never copied:** files that look like secrets, the repo's git history, compiled programs (build or install them on the new machine), passwords, SSH keys and logins, installed apps, and system settings. Files that exist only on the new machine are kept.
 
 ---
 
