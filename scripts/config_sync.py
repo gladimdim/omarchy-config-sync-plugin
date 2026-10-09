@@ -5059,6 +5059,21 @@ def cmd_update_plugin(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return snap
 
 
+def cmd_set_background_polling(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    if args.args not in (["true"], ["false"]):
+        raise SyncError("Background polling must be true or false.")
+    shell_path = ctx.config_omarchy / "shell.json"
+    data = load_json(shell_path, default=None, within=ctx.home / ".config")
+    section, entry, index = extract_widget_entry(data)
+    if section is None or entry is None:
+        raise SyncError("Config Sync is not present in the shell bar layout.")
+    enabled = args.args[0] == "true"
+    entry["backgroundPolling"] = enabled
+    data["bar"]["layout"][section][index] = entry
+    write_json(shell_path, data, within=ctx.home / ".config")
+    return ok({"message": "Background polling " + ("enabled." if enabled else "disabled.")})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Omarchy config-sync backend")
     parser.add_argument(
@@ -5082,6 +5097,7 @@ def build_parser() -> argparse.ArgumentParser:
             "install-plugin",
             "update-plugin",
             "reinstall-plugin",
+            "set-background-polling",
         ],
     )
     parser.add_argument("args", nargs="*")
@@ -5106,6 +5122,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     command = args.command
+    if command == "set-background-polling":
+        return cmd_set_background_polling(ctx, args)
     if command in {"snapshot", "status", "inspect"}:
         return cmd_snapshot(ctx, args)
     if command == "connect":

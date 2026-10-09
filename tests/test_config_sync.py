@@ -127,6 +127,39 @@ def make_config_repo(root: Path, *, with_monitor: bool = True) -> Path:
     return root
 
 
+class BackgroundPollingTests(unittest.TestCase):
+    def test_toggle_persists_and_preserves_other_settings_without_fetching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            ctx = cs.Context(home=home, state_dir=home / "state", default_clone=home / "repo")
+            path = ctx.config_omarchy / "shell.json"
+            data = {"idle": {"lock": 300}, "bar": {"layout": {
+                "left": [{"id": "omarchy.menu"}],
+                "right": [{"id": cs.PLUGIN_ID, "custom": "preserved"}, {"id": "omarchy.audio"}],
+            }}}
+            write(path, json.dumps(data))
+            with patch.object(cs, "fetch_repo", side_effect=AssertionError("must not fetch")):
+                for enabled in (True, False):
+                    args = cs.build_parser().parse_args(["set-background-polling", str(enabled).lower()])
+                    self.assertTrue(cs.dispatch(ctx, args)["ok"])
+                    data["bar"]["layout"]["right"][0]["backgroundPolling"] = enabled
+                    self.assertEqual(json.loads(path.read_text()), data)
+
+    def test_invalid_value_does_not_modify_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            ctx = cs.Context(home=home, state_dir=home / "state", default_clone=home / "repo")
+            path = ctx.config_omarchy / "shell.json"
+            write(path, '{"bar":{"layout":{"right":["gladimdim.config-sync"]}}}')
+            before = path.read_bytes()
+            with self.assertRaises(cs.SyncError):
+                cs.dispatch(ctx, cs.build_parser().parse_args(["set-background-polling", "invalid"]))
+            self.assertEqual(path.read_bytes(), before)
+            cs.dispatch(ctx, cs.build_parser().parse_args(["set-background-polling", "true"]))
+            self.assertEqual(json.loads(path.read_text())["bar"]["layout"]["right"],
+                             [{"id": cs.PLUGIN_ID, "backgroundPolling": True}])
+
+
 class TempHome:
     def __init__(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

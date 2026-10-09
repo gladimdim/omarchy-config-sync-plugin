@@ -24,6 +24,7 @@ Panel {
   readonly property color cardBorder: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.12)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string scriptPath: String(Qt.resolvedUrl("scripts/config_sync.py")).replace(/^file:\/\//, "")
+  readonly property bool backgroundPolling: root.setting("backgroundPolling", false) === true
 
   property bool busy: false
   property string lastError: ""
@@ -791,18 +792,35 @@ Panel {
       confirmKind = ""
       lastError = ""
       openOnChanges = true
-      refresh(true)
+      refresh(false)
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
   }
 
-  Component.onCompleted: refresh(true)
+  Component.onCompleted: refresh(root.backgroundPolling)
 
   Timer {
     interval: 10 * 60 * 1000
     running: true
     repeat: true
-    onTriggered: if (!root.busy) root.refresh(true)
+    onTriggered: if (!root.busy) root.refresh(root.backgroundPolling)
+  }
+
+  Process {
+    id: pollingSettingsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var data = JSON.parse(text)
+          if (data.ok) root.lastMessage = String(data.message || "")
+          else root.lastError = String(data.error || "Could not save background polling.")
+        } catch (e) {
+          root.lastError = "Could not save background polling."
+        }
+      }
+    }
+    stderr: StdioCollector { waitForEnd: true }
   }
 
   Process {
@@ -1303,6 +1321,25 @@ Panel {
     Column {
       width: parent.width
       spacing: Style.space(12)
+
+      Toggle {
+        width: parent.width
+        label: "Background polling"
+        description: "Fetch remote updates at startup and every 10 minutes. May request SSH authorization. When off, only local checks run in the background."
+        checked: root.backgroundPolling
+        enabled: !pollingSettingsProc.running
+        foreground: root.foreground
+        accent: root.accent
+        fontFamily: root.fontFamily
+        titleSize: Style.font.body
+        descriptionSize: Style.font.caption
+        onClicked: {
+          root.lastError = ""
+          pollingSettingsProc.command = ["python3", "-u", root.scriptPath,
+            "set-background-polling", root.backgroundPolling ? "false" : "true"]
+          pollingSettingsProc.running = true
+        }
+      }
 
       Text {
         width: parent.width

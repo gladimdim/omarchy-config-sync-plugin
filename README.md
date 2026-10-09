@@ -26,7 +26,7 @@ When there is drift, **Review Changes** opens a checklist: incoming vs local **s
 - **Preview before apply**: shortcuts from `hypr/bindings.lua`, plugins with versions, bar layout, hooks, helper scripts, and terminal configs.
 - **Apply** copies repo → this machine (timestamped backup under `~/.config/omarchy-backup.<timestamp>/`), reloads Hyprland, and rescans the shell. The Config Sync widget itself is preserved in the bar even if the incoming `shell.json` does not list it.
 - **Publish** copies this machine → repo, commits, and pushes so the next machine can Apply.
-- **Drift detection** on open (and every 10 minutes): local-only edits, incoming remote files, both-changed files, and git merge conflicts.
+- **Local drift detection** on open and every 10 minutes: local-only edits, already-fetched incoming remote files, both-changed files, and git merge conflicts. Explicit refresh or optional background polling fetches remote updates.
 - **Conflict handling**: per-file Keep local / Take repo for overlapping edits; Keep local / Take incoming for git merge conflicts. Display layout (`hypr/monitors.lua`) stays on this machine unless you opt in.
 
 ## Install
@@ -59,11 +59,28 @@ omarchy plugin enable gladimdim.config-sync --section right
 
 1. **New machine** — click the icon, paste `https://github.com/<you>/omarchy-config.git` (or the local clone). Review Shortcuts / Plugins / Configs. Press **Apply**.
 2. **You changed this machine** — open the panel. A badge and the Changes tab list local edits (new keybinding, plugin, …). Press **Publish** to commit and push.
-3. **The other machine published** — a badge appears. Open the panel, review incoming files, press **Apply**.
+3. **The other machine published** — open the panel and press **Refresh** to fetch updates, review incoming files, press **Apply**. With background polling enabled, the badge also updates automatically.
 4. **Both changed the same file** — Changes → Both changed → **Keep local** or **Take repo** per file, then Apply and/or Publish.
 5. **Git diverged** (two machines pushed without pulling) — **Pull**, resolve any unmerged paths, then continue.
 
 State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` does not unlink the repo. Removing the plugin (`omarchy plugin remove gladimdim.config-sync`) forgets that state: a reinstall starts unlinked. **Unlink** in the panel does the same without deleting the plugin. A clone you pointed at in-place (for example `~/Github/omarchy-config`) is never deleted.
+
+## Background polling
+
+Background remote polling is **off by default** to avoid unattended SSH-agent authorization prompts (for example, from 1Password). Startup and the 10-minute timer still check local changes and already-fetched remote state without contacting the remote. Opening the panel always performs a local-only check. Press Refresh or right-click the icon to fetch updates explicitly. Sync actions such as Apply, Publish, and Pull still contact the remote as needed.
+
+Use the **Background polling** toggle at the top of the panel's **Overview** tab to enable or disable automatic remote fetching at startup and every 10 minutes. The preference is saved in `~/.config/omarchy/shell.json` and survives restarts.
+
+You can also edit `backgroundPolling` in this widget's entry directly:
+
+```json
+{
+  "id": "gladimdim.config-sync",
+  "backgroundPolling": true
+}
+```
+
+Set it to `false` (or omit it) to disable background remote fetching. The setting hot-reloads with `shell.json`; fetching may request authorization from your SSH agent when enabled.
 
 ## What is synced
 
