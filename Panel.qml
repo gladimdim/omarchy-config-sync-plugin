@@ -841,7 +841,7 @@ Panel {
     bar: root.bar
     text: "󰘿"
     tooltipText: configured
-      ? ("Config Sync — " + Model.stateTitle(root.syncState))
+      ? ("Config Sync — " + Model.stateTitle(root.syncState) + " (Right Click to Refresh)")
       : "Config Sync — link your omarchy-config repo"
     onPressed: function(b) {
       if (b === Qt.RightButton) root.refresh(true)
@@ -2035,6 +2035,11 @@ Panel {
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.openFile("hypr/bindings.lua", "", "")
                 }
+
+                PanelToolTip {
+                  visible: scFmMa.containsMouse
+                  text: "Open file location"
+                }
               }
               Rectangle {
                 width: Style.space(30)
@@ -2057,6 +2062,11 @@ Panel {
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.openTerminal("hypr/bindings.lua", "", "")
+                }
+
+                PanelToolTip {
+                  visible: scTermMa.containsMouse
+                  text: "Open in terminal"
                 }
               }
             }
@@ -2134,6 +2144,11 @@ Panel {
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.openFile("plugins/" + modelData.id, "", "")
                   }
+
+                  PanelToolTip {
+                    visible: plFmMa.containsMouse
+                    text: "Open file location"
+                  }
                 }
                 Rectangle {
                   width: Style.space(30)
@@ -2156,6 +2171,11 @@ Panel {
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.openTerminal("plugins/" + modelData.id, "", "")
+                  }
+
+                  PanelToolTip {
+                    visible: plTermMa.containsMouse
+                    text: "Open in terminal"
                   }
                 }
               }
@@ -3407,6 +3427,11 @@ Panel {
             cursorShape: Qt.PointingHandCursor
             onClicked: root.openFile(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
           }
+
+          PanelToolTip {
+            visible: fmMa.containsMouse
+            text: "Open file location"
+          }
         }
 
         Rectangle {
@@ -3433,6 +3458,11 @@ Panel {
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: root.openTerminal(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
+          }
+
+          PanelToolTip {
+            visible: termMa.containsMouse
+            text: "Open in terminal"
           }
         }
       }
