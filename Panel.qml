@@ -1128,7 +1128,7 @@ Panel {
               body: "HTTPS (https://github.com/you/omarchy-config.git), SSH, or owner/repo. An empty private repo is what you want on the first machine. On the next machine, paste this same URL and Apply."
             }
 
-            TextField {
+            RepoUrlField {
               id: urlField
               width: parent.width
               placeholderText: "https://github.com/you/omarchy-config.git"
@@ -1137,13 +1137,8 @@ Panel {
               font.family: root.fontFamily
               enabled: !root.busy
               onTextChanged: root.repoUrlInput = text
-              onAccepted: root.connectRepo()
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Escape) {
-                  keyCatcher.forceActiveFocus()
-                  event.accepted = true
-                }
-              }
+              onSubmitted: root.connectRepo()
+              Keys.onEscapePressed: keyCatcher.forceActiveFocus()
             }
 
             Row {
@@ -1544,7 +1539,7 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
-            TextField {
+            RepoUrlField {
               id: repoEditField
               width: parent.width
               placeholderText: "https://github.com/you/omarchy-config.git"
@@ -1553,7 +1548,7 @@ Panel {
               font.family: root.fontFamily
               enabled: !root.busy
               onTextChanged: root.repoUrlInput = text
-              onAccepted: root.saveEditRepo()
+              onSubmitted: root.saveEditRepo()
             }
             Text {
               width: parent.width
@@ -2448,6 +2443,75 @@ Panel {
         subtitle: "Additional tracked configuration files"
         changeItems: Model.itemsForCategory(root.allReviewItems, "other")
         files: Model.filesForCategory(root.diffFiles, "other")
+      }
+    }
+  }
+
+  // A field Qt may edit is a field Qt reads the Wayland clipboard for, inside
+  // the shell: when pasting, and on its own whenever the clipboard changes, to
+  // know whether Paste applies. Either read lasts as long and grows as large
+  // as the program owning the clipboard cares to make it. So the field is
+  // read-only to Qt, which then leaves the clipboard alone, and editing is
+  // done here: typing, Backspace, Delete, Enter, cut, and a paste that goes
+  // through a child process bounded by `timeout` and `head`. Moving,
+  // selecting, and copying are still Qt's.
+  component RepoUrlField: TextField {
+    id: field
+    signal submitted()
+
+    readOnly: true
+    cursorVisible: activeFocus
+    ContextMenu.menu: null
+
+    function edit(start, end, insert) {
+      var next = Model.spliceText(text, start, end, insert, Model.REPO_URL_LIMIT)
+      text = next.text
+      cursorPosition = next.cursor
+    }
+
+    Keys.onPressed: function(event) {
+      if (!field.enabled) return
+      var from = selectionStart
+      var to = selectionEnd
+      if (event.matches(StandardKey.Paste)
+          || (event.key === Qt.Key_Insert && (event.modifiers & Qt.ShiftModifier))) {
+        if (!clipboardReader.running) clipboardReader.running = true
+      } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+        field.submitted()
+      } else if (event.key === Qt.Key_Backspace) {
+        edit(from === to ? from - 1 : from, to, "")
+      } else if (event.key === Qt.Key_Delete) {
+        edit(from, from === to ? to + 1 : to, "")
+      } else if (event.matches(StandardKey.Cut)) {
+        copy()
+        edit(from, to, "")
+      } else if (event.text !== "" && !/[\u0000-\u001f\u007f]/.test(event.text)
+                 && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
+        edit(from, to, event.text)
+      } else {
+        return
+      }
+      event.accepted = true
+    }
+
+    // Middle-click (primary selection paste) and right-click (context menu)
+    // stay away from Qt's clipboard path.
+    MouseArea {
+      anchors.fill: parent
+      acceptedButtons: Qt.MiddleButton | Qt.RightButton
+      onPressed: field.forceActiveFocus()
+    }
+
+    Process {
+      id: clipboardReader
+      command: ["timeout", "-k", "1", "2", "sh", "-c", "wl-paste --no-newline --type text 2>/dev/null | head -c " + Model.REPO_URL_LIMIT]
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: {
+          var pasted = String(text || "").trim()
+          if (pasted !== "" && field.enabled && field.visible)
+            field.edit(field.selectionStart, field.selectionEnd, pasted)
+        }
       }
     }
   }

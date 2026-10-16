@@ -466,3 +466,18 @@ function pluginActionTip(action) {
   if (action === "reinstall") return "Move this plain copy to a backup and install it from git in a terminal"
   return "Open Omarchy's plugin installer in a terminal"
 }
+
+// Repo URL field: a local path, HTTPS/SSH URL, or owner/repo never needs more.
+var REPO_URL_LIMIT = 1024
+
+// Replaces text[start, end) with insert, dropping control characters and
+// keeping the result within limit. Returns the new text and cursor position.
+function spliceText(text, start, end, insert, limit) {
+  var s = String(text || "")
+  var from = Math.max(0, Math.min(Number(start) || 0, Number(end) || 0, s.length))
+  var to = Math.min(s.length, Math.max(Number(start) || 0, Number(end) || 0, from))
+  var piece = String(insert || "").replace(/[\u0000-\u001f\u007f]/g, "")
+  var room = Math.max(0, (Number(limit) || Infinity) - (s.length - (to - from)))
+  if (piece.length > room) piece = piece.substring(0, room)
+  return { text: s.substring(0, from) + piece + s.substring(to), cursor: from + piece.length }
+}
