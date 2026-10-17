@@ -122,6 +122,12 @@ PLUGIN_SOURCE_PATH_RE = re.compile(r"^[A-Za-z0-9._~/%+-]+$")
 PLUGIN_SOURCE_SCP_RE = re.compile(r"^([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):([A-Za-z0-9._~/%+-]+)$")
 PLUGIN_COMMIT_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 PLUGIN_TERMINAL_LAUNCHER = "omarchy-launch-floating-terminal-with-presentation"
+PACKAGE_SPECS = (
+    ("pacman-native", "Native pacman", "packages/pacman-native.txt", "pacman"),
+    ("aur", "AUR", "packages/aur.txt", "aur"),
+    ("flatpak", "Flatpak", "packages/flatpak.txt", "flatpak"),
+)
+PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+@/-]*$")
 
 
 class SyncError(Exception):
@@ -1857,6 +1863,221 @@ def launch_omarchy_terminal(command: str) -> bool:
     except OSError:
         return False
     return True
+
+
+def package_names_from_text(text: str) -> set[str]:
+    names = set()
+    for raw in text.splitlines():
+        name = raw.strip()
+        if not name or name.startswith("#"):
+            continue
+        if PACKAGE_NAME_RE.fullmatch(name):
+            names.add(name)
+    return names
+
+
+def local_package_names(ctx: Context, kind: str) -> tuple[set[str], str | None]:
+    commands = {
+        "pacman": ["pacman", "-Qqen"],
+        "aur": ["pacman", "-Qqem"],
+        "flatpak": ["flatpak", "list", "--app", "--columns=application"],
+    }
+    command = commands[kind]
+    if not shutil.which(command[0]):
+        return set(), f"{command[0]} is not installed"
+    result = run_bounded(command, timeout=30)
+    if result.returncode != 0:
+        return set(), (result.stderr or result.stdout or f"{command[0]} failed").strip()
+    return package_names_from_text(result.stdout), None
+
+
+def package_diff(ctx: Context, repo: Path) -> list[dict[str, Any]]:
+    # Existing config repos opt in by containing at least one package list.
+    # Empty repos are the first-machine seed flow and should discover the
+    # local inventory so packages can be included in the first push.
+    if not is_seedable_empty(repo) and not any((repo / rel).is_file() for _id, _label, rel, _manager in PACKAGE_SPECS):
+        return []
+    groups = []
+    for group_id, label, rel, manager in PACKAGE_SPECS:
+        local, local_error = local_package_names(ctx, manager)
+        repo_file = repo / rel
+        repo_names = package_names_from_text(read_text(repo_file, within=repo)) if repo_file.is_file() else set()
+        rows = []
+        for name in sorted(repo_names - local):
+            rows.append({
+                "id": f"{group_id}:{name}",
+                "name": name,
+                "group": group_id,
+                "label": label,
+                "status": "repo",
+                "default_apply": True,
+                "default_publish": False,
+            })
+        for name in sorted(local - repo_names):
+            rows.append({
+                "id": f"{group_id}:{name}",
+                "name": name,
+                "group": group_id,
+                "label": label,
+                "status": "local",
+                "default_apply": False,
+                "default_publish": True,
+            })
+        if rows:
+            groups.append({
+                "id": group_id,
+                "label": label,
+                "manager": manager,
+                "path": rel,
+                "status": "changed",
+                "items": rows,
+                "changed_count": len(rows),
+                "incoming_count": len(repo_names - local),
+                "outgoing_count": len(local - repo_names),
+                "local_count": len(local),
+                "repo_count": len(repo_names),
+                "local_error": local_error or "",
+            })
+    return groups
+
+
+def selected_package_rows(diff: list[dict[str, Any]], package_ids: list[str] | None) -> list[dict[str, Any]]:
+    wanted = set(package_ids or [])
+    if not wanted:
+        return []
+    return [
+        row
+        for group in diff
+        for row in group.get("items", [])
+        if row.get("id") in wanted
+    ]
+
+
+def package_operation_command(rows: list[dict[str, Any]], direction: str) -> str:
+    install: dict[str, list[str]] = {"pacman": [], "aur": [], "flatpak": []}
+    remove: dict[str, list[str]] = {"pacman": [], "aur": [], "flatpak": []}
+    for row in rows:
+        manager = next((spec[3] for spec in PACKAGE_SPECS if spec[0] == row["group"]), row["group"])
+        target = install if ((direction == "apply" and row["status"] == "repo") or (direction == "publish" and row["status"] == "local")) else remove
+        target[manager].append(row["name"])
+
+    commands = ["set -euo pipefail", "printf '\\nPackage sync started (%s)\\n' \"$(date)\""]
+    for manager, names in install.items():
+        if not names:
+            continue
+        quoted = " ".join(shlex.quote(name) for name in names)
+        if manager == "pacman":
+            commands.append(f"sudo pacman -S --needed -- {quoted}")
+        elif manager == "aur":
+            commands.append(f"yay -S --needed -- {quoted}")
+        else:
+            commands.append(f"flatpak install -y flathub {quoted}")
+    for manager, names in remove.items():
+        if not names:
+            continue
+        quoted = " ".join(shlex.quote(name) for name in names)
+        if manager == "pacman":
+            commands.append(f"sudo pacman -Rns -- {quoted}")
+        elif manager == "aur":
+            commands.append(f"yay -Rns -- {quoted}")
+        else:
+            commands.append(f"flatpak uninstall -y {quoted}")
+    commands.extend([
+        "printf '\\nPackage sync finished successfully. Refresh Config Sync to verify the result.\\n'",
+        "read -r -p 'Press Enter to close…' _",
+    ])
+    return " ; ".join(commands)
+
+
+def plugin_list_operation_command(ctx: Context, repo: Path, ids: list[str]) -> str:
+    commands = ["set -euo pipefail", "printf '\\nPlugin sync started (%s)\\n' \"$(date)\""]
+    entries = repo_plugin_list(repo)
+    for pid in ids:
+        entry = entries.get(pid)
+        if not entry or not entry.get("source"):
+            continue
+        action = next(
+            (
+                row.get("action")
+                for row in (plugin_list_diff(ctx, repo, load_state(ctx)) or [])
+                if row.get("id") == pid
+            ),
+            "install",
+        )
+        if action == "update":
+            commands.append("omarchy-plugin-update " + shlex.quote(pid))
+        elif action == "reinstall":
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup = ctx.home / ".config" / f"omarchy-backup.{stamp}" / "plugins" / pid
+            commands.append(reinstall_plugin_command(ctx.config_plugins / pid, backup, entry["source"]))
+        else:
+            commands.append("omarchy-plugin-add " + shlex.quote(entry["source"]))
+    commands.extend(
+        [
+            "printf '\\nPlugin sync finished successfully. Refresh Config Sync to verify the result.\\n'",
+            "read -r -p 'Press Enter to close…' _",
+        ]
+    )
+    return " ; ".join(commands)
+
+
+def package_file_sets(ctx: Context, repo: Path) -> dict[str, set[str]]:
+    return {
+        group_id: package_names_from_text(read_text(repo / rel, within=repo)) if (repo / rel).is_file() else set()
+        for group_id, _label, rel, _manager in PACKAGE_SPECS
+    }
+
+
+def package_inventory_summary(ctx: Context, repo: Path) -> list[dict[str, Any]]:
+    summary = []
+    for group_id, label, rel, manager in PACKAGE_SPECS:
+        local, local_error = local_package_names(ctx, manager)
+        repo_file = repo / rel
+        tracked = package_names_from_text(read_text(repo_file, within=repo)) if repo_file.is_file() else set()
+        summary.append(
+            {
+                "id": group_id,
+                "label": label,
+                "installed": len(local),
+                "tracked": len(tracked),
+                "available": bool(shutil.which(manager if manager != "aur" else "pacman")),
+                "error": local_error or "",
+            }
+        )
+    return summary
+
+
+def publish_package_rows(ctx: Context, repo: Path, rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    current = package_file_sets(ctx, repo)
+    local_sets = {}
+    errors = []
+    needed_groups = {str(row.get("group") or "") for row in rows}
+    for group_id, _label, _rel, manager in PACKAGE_SPECS:
+        if group_id not in needed_groups:
+            continue
+        names, error = local_package_names(ctx, manager)
+        local_sets[group_id] = names
+        if error:
+            errors.append(f"{group_id}: {error}")
+    if errors:
+        raise SyncError("Could not read the local package inventory: " + "; ".join(errors))
+    touched = set()
+    for row in rows:
+        group_id = row["group"]
+        if group_id not in current:
+            continue
+        touched.add(group_id)
+        if row["name"] in local_sets[group_id]:
+            current[group_id].add(row["name"])
+        else:
+            current[group_id].discard(row["name"])
+    for group_id, _label, rel, _manager in PACKAGE_SPECS:
+        if group_id not in touched:
+            continue
+        atomic_write_text(repo / rel, "\n".join(sorted(current[group_id])) + "\n", mode=0o644, within=repo)
+    return [f"packages/{group_id}" for group_id in sorted(touched)]
 
 
 def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
@@ -3710,6 +3931,8 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
         if present:
             terminals.append(Path(rel).stem.replace("ghostty.config", "ghostty"))
 
+    package_stats = package_inventory_summary(ctx, repo)
+
     configs = []
     for item in collect_inventory(ctx, repo):
         wanted = item["local_exists"] if prefer_local else item["repo_exists"]
@@ -3737,6 +3960,7 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
         "bins": bins,
         "terminals": terminals,
         "configs": configs,
+        "packages": package_stats,
         "theme": inspect_theme(ctx, repo, prefer_local=prefer_local),
     }
 
@@ -4005,6 +4229,13 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             continue
         counts[row["status"]] = counts.get(row["status"], 0) + 1
         counts["changed"] += 1
+    packages = package_diff(ctx, repo)
+    package_changes = sum(int(group.get("changed_count") or 0) for group in packages)
+    counts["package_changes"] = package_changes
+    counts["changed"] += package_changes
+    for group in packages:
+        counts["local"] += int(group.get("outgoing_count") or 0)
+        counts["repo"] += int(group.get("incoming_count") or 0)
     return {
         "files": files,
         "counts": counts,
@@ -4012,6 +4243,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         "plugins": plugins,
         "bundles": bundles,
         "plugin_list": plugin_list,
+        "packages": packages,
         "theme": theme_diff,
         "hidden": list(hidden_keys),
     }
@@ -4089,7 +4321,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
                     "plugin_version": PLUGIN_VERSION,
                 },
                 "inspect": None,
-                "diff": {"files": [], "counts": {}, "hidden": []},
+                "diff": {"files": [], "counts": {}, "packages": [], "hidden": []},
                 "hidden": [],
             }
         )
@@ -4131,6 +4363,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "shortcut_changes": len([s for s in (diff.get("shortcuts") or []) if not s.get("hidden")]),
         "plugin_changes": len([p for p in (diff.get("plugins") or []) if not p.get("hidden")]),
         "plugin_list_changes": len([p for p in (diff.get("plugin_list") or []) if not p.get("hidden")]),
+        "package_changes": int(diff["counts"].get("package_changes") or 0),
         "hidden": state.get("hidden") or [],
         "hidden_count": len(state.get("hidden") or []),
         "plugin_version": PLUGIN_VERSION,
@@ -4661,6 +4894,8 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
     plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
+    list_plugin_ids = [p for p in (getattr(args, "list_plugin", None) or []) if p]
+    package_rows = selected_package_rows(diff.get("packages") or [], getattr(args, "package", None))
     wanted = parse_files_arg(args.files, explicit=explicit)
     if plugin_ids:
         extra = expand_plugin_paths(diff["files"], plugin_ids, "apply")
@@ -4711,7 +4946,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         {"added-repo", "repo", "differs"},
         "repo_portable",
     )
-    if not chosen and not shortcut_keys and not merges:
+    if not chosen and not shortcut_keys and not merges and not package_rows and not list_plugin_ids:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["removed"] = []
@@ -4734,11 +4969,14 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = applied
         snap["removed"] = removed
+        snap["packages"] = [row["id"] for row in package_rows]
+        snap["plugins"] = list_plugin_ids
         snap["skipped_shortcuts"] = skipped_shortcuts
         snap["dry_run"] = True
         snap["message"] = (
             f"Dry run: would apply {len(applied)} file{'s' if len(applied) != 1 else ''}"
             + (f" ({len(removed)} removed from this machine)" if removed else "")
+            + (f" and sync {len(package_rows)} packages" if package_rows else "")
             + "."
             + skipped_shortcut_note(skipped_shortcuts)
         )
@@ -4827,6 +5065,24 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             theme_note = apply_omarchy_theme(slug, dry_run=False)
             if theme_note:
                 notes["theme"] = theme_note
+    package_started = False
+    if package_rows:
+        command = package_operation_command(package_rows, "apply")
+        if not launch_omarchy_terminal(command):
+            raise SyncError(
+                "Could not open the package sync terminal. Install "
+                f"{PLUGIN_TERMINAL_LAUNCHER} or run the package commands manually."
+            )
+        package_started = True
+    plugin_started = False
+    if list_plugin_ids:
+        command = plugin_list_operation_command(ctx, repo, list_plugin_ids)
+        if not launch_omarchy_terminal(command):
+            raise SyncError(
+                "Could not open the plugin sync terminal. Install "
+                f"{PLUGIN_TERMINAL_LAUNCHER} or install the plugins manually."
+            )
+        plugin_started = True
     snap = build_snapshot(ctx, fetch=False)
     snap["applied"] = applied
     snap["backup_dir"] = str(backup_dir)
@@ -4839,11 +5095,15 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     snap["message"] = (
         f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo"
         + (f" ({len(removed)} removed from this machine)" if removed else "")
+        + (f" Started package sync for {len(package_rows)} package{'s' if len(package_rows) != 1 else ''} in a floating terminal." if package_started else "")
+        + (f" Started plugin sync for {len(list_plugin_ids)} plugin{'s' if len(list_plugin_ids) != 1 else ''} in a floating terminal." if plugin_started else "")
         + f".{theme_msg}"
         + skipped_shortcut_note(skipped_shortcuts)
     )
     snap["skipped_shortcuts"] = skipped_shortcuts
     snap["removed"] = removed
+    snap["packages"] = [row["id"] for row in package_rows]
+    snap["plugins"] = list_plugin_ids
     return snap
 
 
@@ -4890,6 +5150,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
     plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
+    package_rows = selected_package_rows(diff.get("packages") or [], getattr(args, "package", None))
     list_ids = {p for p in (getattr(args, "list_plugin", None) or []) if p}
     list_rows = [
         row
@@ -4946,12 +5207,13 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         {"added-local", "local", "differs"},
         "local_portable",
     )
-    if not chosen and not shortcut_keys and not list_rows and not merges:
+    if not chosen and not shortcut_keys and not list_rows and not merges and not package_rows:
         if getattr(args, "dry_run", False):
             snap = build_snapshot(ctx, fetch=False)
             snap["published"] = []
             snap["removed"] = []
             snap["skipped_shortcuts"] = skipped_shortcuts
+            snap["packages"] = [row["id"] for row in package_rows]
             snap["dry_run"] = True
             snap["message"] = "Dry run: nothing to publish." + skipped_shortcut_note(skipped_shortcuts)
             return snap
@@ -4992,6 +5254,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["published"] = published
         snap["removed"] = removed
         snap["plugin_list"] = plugin_list_ids
+        snap["packages"] = [row["id"] for row in package_rows]
         snap["skipped_shortcuts"] = skipped_shortcuts
         snap["committed"] = False
         snap["pushed"] = False
@@ -4999,6 +5262,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = (
             f"Dry run: would publish {publish_count_text(published, plugin_list_ids)}"
             + (f" ({len(removed)} removed)" if removed else "")
+            + (f" and sync {len(package_rows)} packages" if package_rows else "")
             + "."
             + skipped_shortcut_note(skipped_shortcuts)
         )
@@ -5032,6 +5296,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     merged_there = write_merged_files(ctx, repo, merges, state.get("file_hashes") or {}, "publish")
     published.extend(merged_there)
     plugin_list_ids = publish_plugin_list(ctx, repo, list_rows)
+    package_paths = publish_package_rows(ctx, repo, package_rows)
+    published.extend(package_paths)
 
     strip_plugin_git_dirs(repo)
 
@@ -5085,6 +5351,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     snap = build_snapshot(ctx, fetch=False)
     snap["published"] = published
     snap["plugin_list"] = plugin_list_ids
+    snap["packages"] = [row["id"] for row in package_rows]
     snap["committed"] = committed
     snap["pushed"] = pushed
     if push_error:
@@ -5160,7 +5427,11 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     list_plugins = [
         row["id"]
         for row in (diff.get("plugin_list") or [])
-        if side == "local" and not row.get("hidden") and row.get("status") in {"local", "added-local"}
+        if not row.get("hidden")
+        and (
+            (side == "local" and row.get("status") in {"local", "added-local"})
+            or (side == "repo" and row.get("status") in {"repo", "added-repo"})
+        )
     ]
 
     nested = argparse.Namespace(
@@ -5169,6 +5440,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         shortcut=shortcuts,
         plugin=plugins,
         list_plugin=list_plugins,
+        package=[row["id"] for group in (diff.get("packages") or []) for row in group.get("items", [])],
         theme=theme,
         fetch=False,
         push=side == "local" or bool(getattr(args, "push", False)),
@@ -5183,7 +5455,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     )
 
     if side == "repo":
-        if not files and not shortcuts and not plugins and not theme:
+        if not files and not shortcuts and not plugins and not list_plugins and not theme:
             snap = build_snapshot(ctx, fetch=False)
             snap["message"] = "Nothing from the repo to apply. This machine may already match."
             return snap
@@ -5643,6 +5915,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--merge", action="append", default=None)
     parser.add_argument("--plugin", action="append", default=None)
     parser.add_argument("--list-plugin", action="append", default=None)
+    parser.add_argument("--package", action="append", default=None)
     parser.add_argument("--theme", action="store_true")
     parser.add_argument("--message", default=None)
     parser.add_argument("--delete-clone", action="store_true")

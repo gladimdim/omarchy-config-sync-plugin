@@ -26,6 +26,7 @@ When there is drift, **Review Changes** opens a checklist: incoming vs local **s
 - **Preview before apply**: shortcuts from `hypr/bindings.lua`, plugins with versions, bar layout, hooks, helper scripts, and terminal configs.
 - **Apply** copies repo → this machine (timestamped backup under `~/.config/omarchy-backup.<timestamp>/`), reloads Hyprland, and rescans the shell. The Config Sync widget itself is preserved in the bar even if the incoming `shell.json` does not list it.
 - **Publish** copies this machine → repo, commits, and pushes so the next machine can Apply.
+- **Package sync** inventories native pacman, AUR, and Flatpak packages automatically. Changes can be synced all at once, by package group, or one package at a time. Apply runs selected install/remove commands in a visible floating terminal.
 - **Drift detection** on open (and every 10 minutes): local-only edits, incoming remote files, both-changed files, and git merge conflicts.
 - **Three-way merge**: when both machines edited the same config file, Config Sync compares each side with the version they last synced. A file that already contains the other side's edits is a plain one-way change. Otherwise the row offers **Merge**, which keeps both sides' edits: line by line for text files, key by key for `shell.json`. Where both changed the same lines or key, Merge keeps this machine's and the row says which. Merge is picked for you only when nothing overlaps. Apply writes the merge here, Publish writes it to the repo, and the other button finishes the job.
 - **Conflict handling**: per-file Keep local / Take repo when a merge is not possible (the selected theme, plugins, or no common version in the repo's history); Keep local / Take incoming for git merge conflicts. Display layout (`hypr/monitors.lua`) stays on this machine unless you opt in.
@@ -76,6 +77,9 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `omarchy/{branding,extensions,hooks,agents}/` | same under `~/.config/omarchy/` |
 | `plugins.json` | Plugins installed with git (`omarchy plugin add`): id, version, commit, and source URL. Never copied as files; see below. |
 | `plugins/*` | `~/.config/omarchy/plugins/` for plugins that are **not** git checkouts, file by file (skips this plugin; shebang/ELF helpers keep the execute bit) |
+| `packages/pacman-native.txt` | Native packages from `pacman -Qqen` |
+| `packages/aur.txt` | AUR packages from `pacman -Qqem`, installed through `yay` |
+| `packages/flatpak.txt` | Flatpak applications, installed through `flatpak` |
 | `bin/*` | `~/.local/bin/` (scripts already in the repo, plus local helpers named by bindings, hooks, or plugins) |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
 
@@ -85,6 +89,7 @@ A plugin folder with a `.git` checkout is never copied in either direction, so A
 
 - **Install** when a listed plugin is missing. It opens Omarchy's own plugin installer (`omarchy plugin add <source>`) in a floating terminal, so you see Omarchy's warning and confirm there.
 - **Update** when the repo lists a newer version or a commit this checkout has not seen. It opens `omarchy plugin update <id>`, which pulls the plugin's upstream, not the repo.
+- Incoming listed plugins can also be handled together with **Apply**; their install, update, or plain-copy reinstall commands run in one visible floating terminal.
 - An outgoing row when this machine is ahead, or when you uninstalled a listed plugin (unticked by default).
 
 Repos that already hold copied files for a git plugin under `plugins/<id>/` stop applying them. Publishing that plugin's list entry removes the copy from the repo. Plugins without `.git` (your own, or a clone of a built-in) keep syncing file by file.
@@ -93,6 +98,8 @@ Machine-local files are **not** applied unless you enable **Include machine-loca
 
 - `hypr/monitors.lua` (display layout)
 - Extra paths listed in `.omarchy-config.json` under `machine_local`
+
+Package lists are exact for the selected rows: packages present only on the source side are added, and packages present only on the other side are removed. The operation always opens a floating terminal so `sudo`, `yay`, and errors remain visible. Nothing happens until Apply or Publish is confirmed.
 
 Per-machine Hyprland overlays (`*.local.lua`, `local.conf`, `input.local.lua`, …) are ignored entirely so they never show up as Incoming. Plugin files such as `Local.qml` are still synced. Night-light (`hypr/hyprsunset.conf`) stays portable.
 

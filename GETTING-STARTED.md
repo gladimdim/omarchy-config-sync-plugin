@@ -108,6 +108,7 @@ Open **Review list** (or the Changes tab) and expand **Outgoing**. It holds:
 
 - **Shortcuts** — bindings from `hypr/bindings.lua`
 - **Plugins** — git-installed plugins travel as a list (`plugins.json`); hand-copied ones as files. This plugin itself is never included
+- **Packages** — native pacman, AUR, and Flatpak inventories are collected automatically. Choose everything, a package group, or individual packages before syncing.
 - **Configs** — Hyprland files, `shell.json`, hooks, terminals, and the current theme (images and video wallpapers are skipped)
 
 **Machine-local files** stay on this machine: display layout (`hypr/monitors.lua`) and anything you list as `machine_local` in `.omarchy-config.json`. Overlay files named `*.local.lua` / `local.conf` under `hypr/` are not synced at all. Turn on **Include machine-local files** on the Changes tab only if you mean it.
@@ -126,6 +127,7 @@ On the new Omarchy machine:
 2. Click the icon, paste the **same** private repo URL, Connect.
 3. This time the repo is **not** empty. Review incoming shortcuts and plugins.
 4. Click **Apply** (not Publish). A timestamped backup is written under `~/.config/omarchy-backup.*` first.
+   Incoming listed plugins are installed or updated through Omarchy in a visible floating terminal.
 
 After that, daily life is:
 
@@ -134,6 +136,8 @@ When the badge lights up, **Review Changes** (or press `c`) opens a checklist. Y
 The selected Omarchy theme (`omarchy theme current`) is part of that list. Stock themes only need the name. If you customized a theme under `~/.config/omarchy/themes/<slug>/`, those overlay files sync too (wallpapers and preview images are skipped so the repo stays small). Apply runs `omarchy theme set` on the other machine.
 
 Both machines need the **same Config Sync plugin version** (Overview shows `Plugin: config-sync` plus the version from `manifest.json`). Incoming/outgoing groups, Include checkboxes, and Resync live in that version. Update with `omarchy plugin update gladimdim.config-sync --yes`, or copy `~/.config/omarchy/plugins/gladimdim.config-sync/` from a machine that already has the current version, then `omarchy restart shell`. Removing the plugin also forgets the linked repo, so a reinstall starts at Connect.
+
+Package Apply/Publish is explicit and exact for the selected packages. Missing packages are installed and packages selected as removed are uninstalled. Commands run in a floating terminal because native and AUR operations may require `sudo` or `yay`; refresh the panel after the terminal completes.
 
 | You did this | Open the icon | Press |
 | --- | --- | --- |
