@@ -2741,7 +2741,7 @@ class SemanticDiffTests(unittest.TestCase):
         # Incoming from repo
         summary, changes = cs.summarize_file_diff("omarchy/shell.json", loc, rep, "repo")
         self.assertIn("Dock Bar: top → bottom", changes)
-        self.assertIn("Bar transparency: off → on", changes)
+        self.assertIn("Bar background: opaque → none", changes)
         self.assertIn("Idle Lock: 5m → 10m", changes)
         self.assertIn("+audio", changes)
         self.assertIn("Dock Bar: top → bottom", summary)
@@ -2750,6 +2750,33 @@ class SemanticDiffTests(unittest.TestCase):
         summary, changes = cs.summarize_file_diff("omarchy/shell.json", loc, rep, "local")
         self.assertIn("Dock Bar: bottom → top", changes)
         self.assertIn("Idle Lock: 10m → 5m", changes)
+
+    def test_shell_bar_background_semantic_diff(self) -> None:
+        loc, rep = self.tmp / "local.json", self.tmp / "repo.json"
+        write(rep, json.dumps({"bar": {"background": "glassy"}}))
+        write(loc, json.dumps({"bar": {"background": "none"}}))
+        for status, expected in (
+            ("repo", "Bar background: none → glassy"),
+            ("local", "Bar background: glassy → none"),
+            ("both", "Bar background: local none vs repo glassy"),
+        ):
+            with self.subTest(status=status):
+                _, changes = cs.summarize_file_diff("omarchy/shell.json", loc, rep, status)
+                self.assertEqual(changes, [expected])
+
+    def test_shell_bar_background_reads_the_legacy_transparent_key(self) -> None:
+        # omarchy-bar drops bar.transparent as soon as it writes bar.background,
+        # so the two shapes must still compare as the same setting.
+        loc, rep = self.tmp / "local.json", self.tmp / "repo.json"
+        write(loc, json.dumps({"bar": {"background": "glassy"}}))
+        for legacy, expected in (
+            (True, "Bar background: glassy → none"),
+            (False, "Bar background: glassy → opaque"),
+        ):
+            with self.subTest(transparent=legacy):
+                write(rep, json.dumps({"bar": {"transparent": legacy}}))
+                _, changes = cs.summarize_file_diff("omarchy/shell.json", loc, rep, "repo")
+                self.assertEqual(changes, [expected])
 
     def test_shell_toml_semantic_diff(self) -> None:
         loc = self.tmp / "local.toml"
