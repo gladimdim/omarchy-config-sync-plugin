@@ -2138,9 +2138,30 @@ def extract_shell_widgets(data: Any) -> set[str]:
     return widgets
 
 
+def shell_bar_background(data: Any) -> str:
+    """The bar background the way `omarchy-bar background` reports it.
+
+    `bar.background` is the current key: none, glassy, or opaque. A shell.json
+    from before it existed carries the on/off `bar.transparent` instead, where
+    true means none and false means opaque.
+    """
+    bar = data.get("bar") if isinstance(data, dict) else None
+    bar = bar if isinstance(bar, dict) else {}
+    background = bar.get("background")
+    if isinstance(background, str) and background:
+        return background
+    return "none" if bar.get("transparent") is True else "opaque"
+
+
 def extra_shell_changes(before: dict[str, Any], after: dict[str, Any], status: str) -> list[str]:
     """Describe settings beyond the shell fields with dedicated summaries."""
-    handled = {("bar", "position"), ("bar", "transparent"), ("idle", "lock"), ("idle", "screensaver")}
+    handled = {
+        ("bar", "position"),
+        ("bar", "background"),
+        ("bar", "transparent"),
+        ("idle", "lock"),
+        ("idle", "screensaver"),
+    }
     missing = object()
     changes: list[str] = []
 
@@ -2282,11 +2303,12 @@ def summarize_file_diff(
         if b_pos != a_pos and (b_pos or a_pos):
             changes.append(format_setting_change("Dock Bar", b_pos or "top", a_pos or "top", status))
 
-        # Transparency
-        b_tr = (before.get("bar") or {}).get("transparent")
-        a_tr = (after.get("bar") or {}).get("transparent")
-        if b_tr != a_tr and (b_tr is not None or a_tr is not None):
-            changes.append(format_setting_change("Bar transparency", "on" if b_tr else "off", "on" if a_tr else "off", status))
+        # Bar background: none, glassy, or opaque. Older files say transparent
+        # true/false instead, so compare the resolved value rather than the key.
+        b_bg = shell_bar_background(before)
+        a_bg = shell_bar_background(after)
+        if b_bg != a_bg:
+            changes.append(format_setting_change("Bar background", b_bg, a_bg, status))
 
         # Idle lock
         b_lock = (before.get("idle") or {}).get("lock")
