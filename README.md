@@ -79,6 +79,8 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `bin/*` | `~/.local/bin/` (scripts already in the repo, plus local helpers named by bindings, hooks, or plugins) |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
 
+**Publish** only stages the paths in this table. Anything else you keep in the clone — a note, a tool's cache folder — stays untracked.
+
 ### Git-installed plugins
 
 A plugin folder with a `.git` checkout is never copied in either direction, so Apply cannot downgrade it or leave `omarchy plugin update` refusing to fast-forward. Instead, Publish records it in `plugins.json` (credentials are stripped from the source URL), and on the other machine the Changes tab shows:

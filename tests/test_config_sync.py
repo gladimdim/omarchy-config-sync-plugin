@@ -3657,5 +3657,103 @@ console.log(JSON.stringify({{
         self.assertEqual(out["category"], "plugins")
 
 
+class PublishStagingTests(unittest.TestCase):
+    """Publish commits the paths Config Sync maps, never everything in the clone."""
+
+    def _linked(self, env: "TempHome") -> Path:
+        repo = make_config_repo(env.home / "cfg")
+        cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+        return repo
+
+    def test_stray_files_in_the_clone_are_not_committed(self) -> None:
+        with TempHome() as env:
+            repo = self._linked(env)
+            # Whatever else lives in the clone: a tool's cache folder, a note.
+            write(repo / "notes.txt", "scratch\n")
+            write(repo / ".atl" / "skill-registry.md", "# internal\n")
+            write(repo / "cache" / "blob.bin", "junk\n")
+            write(env.home / ".config" / "hypr" / "looknfeel.lua", "hl.decoration({ rounding = 2 })\n")
+
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="hypr/looknfeel.lua"))
+            self.assertTrue(pub["ok"], pub)
+            self.assertTrue(pub["committed"])
+            self.assertIn("hypr/looknfeel.lua", pub["published"])
+
+            committed = git(repo, "show", "--name-only", "--pretty=format:", "HEAD").stdout.split()
+            self.assertIn("hypr/looknfeel.lua", committed)
+            for stray in ("notes.txt", ".atl/skill-registry.md", "cache/blob.bin"):
+                self.assertNotIn(stray, committed, "a file Config Sync does not manage was published")
+                self.assertTrue((repo / stray).is_file(), "the stray file itself must be left alone")
+            self.assertIn("notes.txt", git(repo, "status", "--porcelain", "--untracked-files=all").stdout)
+
+    def test_a_removed_vendored_plugin_is_still_committed_as_a_deletion(self) -> None:
+        pid = "acme.weather"
+        source = "https://github.com/acme/omarchy-weather.git"
+        with TempHome() as env:
+            repo = self._linked(env)
+            write(repo / "plugins" / pid / "manifest.json", json.dumps({"id": pid, "name": "Weather", "version": "1.0.0"}))
+            write(repo / "plugins" / pid / "Main.qml", "import QtQuick\nItem { /* 1.0.0 */ }\n")
+            commit_all(repo, "vendored weather 1.0.0")
+            make_git_plugin(env.ctx.config_plugins / pid, pid, "1.1.0", source)
+
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", list_plugin=[pid]))
+            self.assertTrue(pub["ok"], pub)
+            self.assertEqual(pub["plugin_list"], [pid])
+            self.assertTrue(pub["committed"])
+
+            name_status = git(repo, "show", "--name-status", "--pretty=format:", "HEAD").stdout
+            self.assertIn(f"D\tplugins/{pid}/Main.qml", name_status, name_status)
+            self.assertIn(f"D\tplugins/{pid}/manifest.json", name_status, name_status)
+            self.assertFalse((repo / "plugins" / pid).exists())
+            self.assertEqual(git(repo, "status", "--porcelain").stdout.strip(), "")
+
+    def test_managed_paths_are_the_mapped_roots(self) -> None:
+        with TempHome() as env:
+            repo = self._linked(env)
+            self.assertEqual(
+                cs.managed_repo_paths(repo),
+                ["hypr", "omarchy", "terminals", "plugins", "bin"],
+            )
+            # A root emptied on disk is still staged when git tracks it, so
+            # removing the last file under it still reaches the commit.
+            shutil.rmtree(repo / "bin")
+            self.assertIn("bin", cs.managed_repo_paths(repo))
+            # A hand-edited file at the repo root is not managed.
+            self.assertNotIn("apply.sh", cs.managed_repo_paths(repo))
+            write(repo / "notes.txt", "scratch\n")
+            self.assertNotIn("notes.txt", cs.managed_repo_paths(repo))
+
+    def test_commit_gate_reads_the_index_not_the_worktree(self) -> None:
+        with TempHome() as env:
+            repo = self._linked(env)
+            # An untracked file and an unstaged edit are not commit material.
+            write(repo / "notes.txt", "scratch\n")
+            write(repo / "hypr" / "looknfeel.lua", "hl.decoration({ rounding = 1 })\n")
+            self.assertFalse(cs.has_staged_changes(repo))
+            git(repo, "add", "hypr/looknfeel.lua")
+            self.assertTrue(cs.has_staged_changes(repo))
+
+    def test_emptying_a_managed_root_still_commits_the_deletion(self) -> None:
+        with TempHome() as env:
+            repo = self._linked(env)
+            local_kitty = env.ctx.home / ".config" / "kitty" / "kitty.conf"
+            write(local_kitty, "font_size 12\n")
+            first = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="terminals/kitty.conf"))
+            self.assertTrue(first["ok"], first)
+            local_kitty.unlink()
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            row = next(f for f in snap["diff"]["files"] if f["path"] == "terminals/kitty.conf")
+            self.assertTrue(row["removal"], row)
+
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="terminals/kitty.conf"))
+            self.assertTrue(pub["ok"], pub)
+            self.assertEqual(pub["removed"], ["terminals/kitty.conf"])
+            self.assertFalse((repo / "terminals" / "kitty.conf").exists())
+            name_status = git(repo, "show", "--name-status", "--pretty=format:", "HEAD").stdout
+            self.assertIn("D\tterminals/kitty.conf", name_status, name_status)
+            self.assertEqual(git(repo, "status", "--porcelain").stdout.strip(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

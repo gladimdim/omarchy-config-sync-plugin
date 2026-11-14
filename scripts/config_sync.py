@@ -2023,6 +2023,36 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     return [items[k] for k in sorted(items)]
 
 
+# Repo roots collect_inventory maps from this machine, plus the two files
+# Config Sync writes itself. Everything else in the clone belongs to the user.
+MANAGED_ROOTS = ("hypr", "omarchy", "terminals", "plugins", "bin")
+MANAGED_FILES = (MARKER_NAME, PLUGIN_LIST_REL)
+
+
+def managed_repo_paths(repo: Path) -> list[str]:
+    """The repo paths a Publish may stage.
+
+    Staging this list instead of `git add -A` keeps anything else that lives in
+    the clone — a tool's cache folder, a scratch note — out of the commit. A
+    root stays listed while it exists or while git still tracks something under
+    it, so deleting the last file under a root is still staged as a removal.
+    """
+    paths = []
+    for rel in (*MANAGED_ROOTS, *MANAGED_FILES):
+        if (repo / rel).exists() or git_out(repo, "ls-files", "--", rel):
+            paths.append(rel)
+    return paths
+
+
+def has_staged_changes(repo: Path) -> bool:
+    """True when the index holds a change the next commit would carry.
+
+    `git status` also reports untracked files and tracked-but-unstaged edits,
+    so it cannot answer this now that staging is limited to managed paths.
+    """
+    return bool(git_out(repo, "diff", "--cached", "--name-only"))
+
+
 def classify_file(item: dict[str, Any], stored_hash: str | None) -> str:
     local_hash = item.get("local_hash")
     repo_hash = item.get("repo_hash")
@@ -5033,7 +5063,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     removed = []
     for item in chosen:
         if item.get("removal"):
-            # git add -A below stages the deletion; history is the backup here.
+            # The scoped `git add` below stages the deletion; history is the
+            # backup here.
             if remove_mapped_file(item, "publish", repo):
                 removed.append(item["path"])
                 published.append(item["path"])
@@ -5058,10 +5089,13 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     strip_plugin_git_dirs(repo)
 
     ensure_git_identity(repo)
-    run_git(repo, ["add", "-A"], check=True)
-    porcelain = git_out(repo, "status", "--porcelain")
+    managed = managed_repo_paths(repo)
+    if managed:
+        # A scoped add, never a bare `git add -A`: the pathspec is the guard,
+        # and it still stages deletions of tracked files under those paths.
+        run_git(repo, ["add", "-A", "--", *managed], check=True)
     committed = False
-    if porcelain:
+    if has_staged_changes(repo):
         host = socket.gethostname()
         removed_set = set(removed)
         listed = "\n".join(f"- {'removed ' if p in removed_set else ''}{p}" for p in published[:30])
