@@ -3657,5 +3657,48 @@ console.log(JSON.stringify({{
         self.assertEqual(out["category"], "plugins")
 
 
+class BackupNameTests(unittest.TestCase):
+    """Save and editor leftovers never travel between machines."""
+
+    def test_backup_and_editor_names_are_skipped(self) -> None:
+        for name in (
+            "kitty.conf.bak",
+            "kitty.conf.bak.1",
+            "kitty.conf.bak-spaces-merged",
+            "kitty.conf.backup",
+            "kitty.conf.orig",
+            "kitty.conf.old",
+            "kitty.conf~",
+            "kitty.conf.swp",
+            "kitty.conf.swo",
+        ):
+            self.assertTrue(cs.is_skipped_file(name), name)
+
+    def test_names_that_only_contain_bak_are_not_skipped(self) -> None:
+        for name in ("bakery.lua", "kitty.conf", "backup-plan.conf", "notes.bakery.md", "old.conf"):
+            self.assertFalse(cs.is_skipped_file(name), name)
+
+    def test_backups_next_to_synced_files_are_not_inventoried(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            # The real incident: a save-as copy left beside a hook.
+            write(
+                env.ctx.config_omarchy / "hooks" / "post-update.d" / "plugin-patches-update.bak-spaces-merged",
+                "#!/bin/bash\ntrue\n",
+            )
+            write(repo / "plugins" / "demo.widget" / "Main.qml.backup", "import QtQuick\nItem {}\n")
+            write(repo / "plugins" / "demo.widget" / "Main.qml.swp", "swap\n")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            paths = [f["path"] for f in cs.cmd_snapshot(env.ctx, argparse_ns())["diff"]["files"]]
+            for name in (
+                "omarchy/hooks/post-update.d/plugin-patches-update.bak-spaces-merged",
+                "plugins/demo.widget/Main.qml.backup",
+                "plugins/demo.widget/Main.qml.swp",
+            ):
+                self.assertNotIn(name, paths, "a backup file was offered for syncing")
+            self.assertIn("omarchy/hooks/post-update.d/setup-agent.hook", paths)
+            self.assertIn("plugins/demo.widget/Main.qml", paths)
+
+
 if __name__ == "__main__":
     unittest.main()

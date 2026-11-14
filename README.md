@@ -79,6 +79,8 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `bin/*` | `~/.local/bin/` (scripts already in the repo, plus local helpers named by bindings, hooks, or plugins) |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
 
+Leftovers from a save, a copy, or an editor — `*.bak`, `*.bak.1`, `*.bak-old`, `*.backup`, `*.orig`, `*.old`, `*~`, `*.swp`, `*.swo` — are skipped.
+
 ### Git-installed plugins
 
 A plugin folder with a `.git` checkout is never copied in either direction, so Apply cannot downgrade it or leave `omarchy plugin update` refusing to fast-forward. Instead, Publish records it in `plugins.json` (credentials are stripped from the source URL), and on the other machine the Changes tab shows:
