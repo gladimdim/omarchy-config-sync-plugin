@@ -622,6 +622,20 @@ def machine_local_paths(repo: Path | None = None) -> set[str]:
     return paths
 
 
+def plugin_versions_tracked(repo: Path | None) -> bool:
+    """False when `.omarchy-config.json` sets `plugin_list.track_versions` to false.
+
+    Each machine then updates its git plugins on its own: plugins.json records
+    only which plugins are installed, and version or commit drift between
+    machines is not a change in either direction (#36).
+    """
+    if repo is None:
+        return True
+    marker = load_json(repo / MARKER_NAME, default={}, within=repo)
+    section = marker.get("plugin_list") if isinstance(marker, dict) else None
+    return not (isinstance(section, dict) and section.get("track_versions") is False)
+
+
 def validate_safe_rel_path(rel: str) -> bool:
     if not rel or not isinstance(rel, str):
         return False
@@ -1630,6 +1644,12 @@ def repo_plugin_list(repo: Path) -> dict[str, dict[str, Any]]:
 
 
 def write_plugin_list(repo: Path, entries: dict[str, dict[str, Any]]) -> None:
+    if not plugin_versions_tracked(repo):
+        # Drop pins already in the file too, so none of them go stale.
+        entries = {
+            pid: {k: v for k, v in entry.items() if k not in {"version", "commit"}}
+            for pid, entry in entries.items()
+        }
     payload = {
         "format": PLUGIN_LIST_FORMAT,
         "version": 1,
@@ -1663,6 +1683,13 @@ def plugin_newer_side(plugin_dir: Path, here: dict[str, Any], there: dict[str, A
     return "same"
 
 
+def with_plugin_version(text: str, entry: dict[str, Any] | None, sep: str = " ") -> str:
+    """Append the entry's version to text, or leave text alone when it has none."""
+    if not entry or not (entry.get("version") or entry.get("commit")):
+        return text
+    return f"{text}{sep}{describe_plugin_version(entry)}"
+
+
 def describe_plugin_version(entry: dict[str, Any] | None) -> str:
     if not entry:
         return ""
@@ -1693,6 +1720,7 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
     listed = repo_plugin_list(repo)
     baseline = set(state.get("plugin_list") or [])
     hidden_keys = set(state.get("hidden") or [])
+    track_versions = plugin_versions_tracked(repo)
     rows: list[dict[str, Any]] = []
     for pid in sorted(set(local) | set(listed)):
         here = local.get(pid)
@@ -1720,7 +1748,7 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
             elif there["source"]:
                 status = "added-repo"
                 action = "install"
-                summary = f"Not installed here · {describe_plugin_version(there)} from {there['source']}"
+                summary = with_plugin_version("Not installed here ·", there) + f" from {there['source']}"
             else:
                 status = "added-repo"
                 summary = "Not installed here · the list has no git source, so install it by hand"
@@ -1734,23 +1762,27 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
             if there["source"]:
                 action = "reinstall"
                 summary = (
-                    f"Installed here as plain files, not from git · reinstall {describe_plugin_version(there)}"
-                    f" from {there['source']} to track updates"
+                    with_plugin_version("Installed here as plain files, not from git · reinstall", there)
+                    + f" from {there['source']} to track updates"
                 )
             else:
                 summary = "Installed here as plain files · the list has no git source, so reinstall it by hand"
         elif here and there:
-            side = plugin_newer_side(ctx.config_plugins / pid, here, there)
+            if track_versions:
+                side = plugin_newer_side(ctx.config_plugins / pid, here, there)
+            else:
+                side = "same"
             if side == "repo":
                 status = "repo"
                 action = "update"
                 summary = f"Repo lists {describe_plugin_version(there)} · this machine has {describe_plugin_version(here)}"
             elif side != "same" or here["source"] != there["source"] or here["name"] != there["name"]:
                 status = "local"
-                summary = (
-                    f"Update the repo's entry: {describe_plugin_version(there)} → {describe_plugin_version(here)}"
-                    + drop_note
-                )
+                if track_versions:
+                    summary = f"Update the repo's entry: {describe_plugin_version(there)} → {describe_plugin_version(here)}"
+                else:
+                    summary = "Update the repo's entry: name or source changed"
+                summary += drop_note
                 default_publish = side != "unknown"
             elif vendored:
                 status = "local"
