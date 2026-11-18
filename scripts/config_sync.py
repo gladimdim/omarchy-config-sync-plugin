@@ -81,7 +81,10 @@ SAFE_LUA_ROOTS = {"hl", "os", "true", "false", "nil", "and", "or", "not"}
 
 SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules"}
 SKIP_FILE_NAMES = {".DS_Store"}
-SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
+# Leftovers from a save, a copy, or an editor: never config. A name that only
+# contains "bak" (`bakery.lua`) is not one. Dot names (`.x.swp`) are already
+# skipped by iter_files, so `.swp` here covers the visible `x.swp` form.
+SKIP_NAME_RE = re.compile(r"(?:\.bak(?:[.-].*)?|\.backup|\.orig|\.old|\.sw[op])$|~$")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
 PLUGIN_VERSION = "1.5.1"
 
