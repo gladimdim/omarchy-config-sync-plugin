@@ -3553,6 +3553,69 @@ class PluginListTests(unittest.TestCase):
             self.assertEqual((row["status"], row["action"]), ("local", ""))
             self.assertTrue(row["default_publish"])
 
+    def _untrack_versions(self, repo: Path) -> None:
+        marker = repo / cs.MARKER_NAME
+        data = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
+        data["plugin_list"] = {"track_versions": False}
+        write(marker, json.dumps(data))
+        commit_all(repo, "track plugin ids only")
+
+    def test_untracked_versions_ignore_drift_both_ways(self) -> None:
+        """#36: with track_versions false, each machine updates on its own."""
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            self._untrack_versions(repo)
+            self.assertFalse(cs.plugin_versions_tracked(repo))
+            make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.1.0", self.SOURCE)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            for listed_version, listed_commit in (("1.2.0", ""), ("1.0.0", ""), ("1.1.0", "f" * 40)):
+                write_plugin_list(
+                    repo,
+                    [{"id": self.PID, "name": "Acme.Weather", "version": listed_version, "commit": listed_commit, "source": self.SOURCE}],
+                )
+                commit_all(repo, f"list {listed_version}")
+                rows = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))
+                self.assertNotIn(self.PID, rows, listed_version)
+
+            # A changed source is still a real change to publish.
+            write_plugin_list(repo, [{"id": self.PID, "name": "Acme.Weather", "source": "https://github.com/old/weather.git"}])
+            commit_all(repo, "old source")
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual((row["status"], row["action"]), ("local", ""))
+            self.assertNotIn("unknown version", row["summary"])
+
+    def test_untracked_versions_publish_ids_only(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(repo, [{"id": "other.plugin", "name": "Other", "version": "2.0.0", "commit": "e" * 40, "source": self.SOURCE}])
+            commit_all(repo, "list other")
+            self._untrack_versions(repo)
+            make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "1.1.0", self.SOURCE)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            published = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", list_plugin=[self.PID]))
+            self.assertEqual(published["plugin_list"], [self.PID])
+            data = json.loads((repo / cs.PLUGIN_LIST_REL).read_text(encoding="utf-8"))
+            self.assertEqual(
+                data["plugins"],
+                [
+                    {"id": self.PID, "name": "Acme.Weather", "source": self.SOURCE},
+                    {"id": "other.plugin", "name": "Other", "source": self.SOURCE},
+                ],
+            )
+            self.assertNotIn(self.PID, self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns())))
+
+    def test_untracked_versions_still_offer_install(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            self._untrack_versions(repo)
+            write_plugin_list(repo, [{"id": self.PID, "name": "Acme.Weather", "source": self.SOURCE}])
+            commit_all(repo, "list")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            row = self._plugin_rows(cs.cmd_snapshot(env.ctx, argparse_ns()))[self.PID]
+            self.assertEqual((row["status"], row["action"]), ("added-repo", "install"))
+            self.assertEqual(row["summary"], f"Not installed here · from {self.SOURCE}")
+
     def test_unseen_upstream_commit_is_an_update(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
@@ -3753,6 +3816,49 @@ class PublishStagingTests(unittest.TestCase):
             name_status = git(repo, "show", "--name-status", "--pretty=format:", "HEAD").stdout
             self.assertIn("D\tterminals/kitty.conf", name_status, name_status)
             self.assertEqual(git(repo, "status", "--porcelain").stdout.strip(), "")
+
+
+class BackupNameTests(unittest.TestCase):
+    """Save and editor leftovers never travel between machines."""
+
+    def test_backup_and_editor_names_are_skipped(self) -> None:
+        for name in (
+            "kitty.conf.bak",
+            "kitty.conf.bak.1",
+            "kitty.conf.bak-spaces-merged",
+            "kitty.conf.backup",
+            "kitty.conf.orig",
+            "kitty.conf.old",
+            "kitty.conf~",
+            "kitty.conf.swp",
+            "kitty.conf.swo",
+        ):
+            self.assertTrue(cs.is_skipped_file(name), name)
+
+    def test_names_that_only_contain_bak_are_not_skipped(self) -> None:
+        for name in ("bakery.lua", "kitty.conf", "backup-plan.conf", "notes.bakery.md", "old.conf"):
+            self.assertFalse(cs.is_skipped_file(name), name)
+
+    def test_backups_next_to_synced_files_are_not_inventoried(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            # The real incident: a save-as copy left beside a hook.
+            write(
+                env.ctx.config_omarchy / "hooks" / "post-update.d" / "plugin-patches-update.bak-spaces-merged",
+                "#!/bin/bash\ntrue\n",
+            )
+            write(repo / "plugins" / "demo.widget" / "Main.qml.backup", "import QtQuick\nItem {}\n")
+            write(repo / "plugins" / "demo.widget" / "Main.qml.swp", "swap\n")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            paths = [f["path"] for f in cs.cmd_snapshot(env.ctx, argparse_ns())["diff"]["files"]]
+            for name in (
+                "omarchy/hooks/post-update.d/plugin-patches-update.bak-spaces-merged",
+                "plugins/demo.widget/Main.qml.backup",
+                "plugins/demo.widget/Main.qml.swp",
+            ):
+                self.assertNotIn(name, paths, "a backup file was offered for syncing")
+            self.assertIn("omarchy/hooks/post-update.d/setup-agent.hook", paths)
+            self.assertIn("plugins/demo.widget/Main.qml", paths)
 
 
 if __name__ == "__main__":

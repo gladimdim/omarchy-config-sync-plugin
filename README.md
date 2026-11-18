@@ -81,6 +81,8 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 
 **Publish** only stages the paths in this table. Anything else you keep in the clone — a note, a tool's cache folder — stays untracked.
 
+Leftovers from a save, a copy, or an editor — `*.bak`, `*.bak.1`, `*.bak-old`, `*.backup`, `*.orig`, `*.old`, `*~`, `*.swp`, `*.swo` — are skipped.
+
 ### Git-installed plugins
 
 A plugin folder with a `.git` checkout is never copied in either direction, so Apply cannot downgrade it or leave `omarchy plugin update` refusing to fast-forward. Instead, Publish records it in `plugins.json` (credentials are stripped from the source URL), and on the other machine the Changes tab shows:
@@ -88,6 +90,14 @@ A plugin folder with a `.git` checkout is never copied in either direction, so A
 - **Install** when a listed plugin is missing. It opens Omarchy's own plugin installer (`omarchy plugin add <source>`) in a floating terminal, so you see Omarchy's warning and confirm there.
 - **Update** when the repo lists a newer version or a commit this checkout has not seen. It opens `omarchy plugin update <id>`, which pulls the plugin's upstream, not the repo.
 - An outgoing row when this machine is ahead, or when you uninstalled a listed plugin (unticked by default).
+
+To let each machine update its plugins on its own, set this in the repo's `.omarchy-config.json`:
+
+```json
+{ "plugin_list": { "track_versions": false } }
+```
+
+`plugins.json` then records only id, name, and source. Publish leaves out version and commit (and drops any already in the file), and a version or commit difference between machines no longer shows up as Update or as an outgoing row. Install, uninstall, and source changes still show up.
 
 Repos that already hold copied files for a git plugin under `plugins/<id>/` stop applying them. Publishing that plugin's list entry removes the copy from the repo. Plugins without `.git` (your own, or a clone of a built-in) keep syncing file by file.
 
