@@ -87,6 +87,14 @@ A plugin folder with a `.git` checkout is never copied in either direction, so A
 - **Update** when the repo lists a newer version or a commit this checkout has not seen. It opens `omarchy plugin update <id>`, which pulls the plugin's upstream, not the repo.
 - An outgoing row when this machine is ahead, or when you uninstalled a listed plugin (unticked by default).
 
+To let each machine update its plugins on its own, set this in the repo's `.omarchy-config.json`:
+
+```json
+{ "plugin_list": { "track_versions": false } }
+```
+
+`plugins.json` then records only id, name, and source. Publish leaves out version and commit (and drops any already in the file), and a version or commit difference between machines no longer shows up as Update or as an outgoing row. Install, uninstall, and source changes still show up.
+
 Repos that already hold copied files for a git plugin under `plugins/<id>/` stop applying them. Publishing that plugin's list entry removes the copy from the repo. Plugins without `.git` (your own, or a clone of a built-in) keep syncing file by file.
 
 Machine-local files are **not** applied unless you enable **Include machine-local files**:
