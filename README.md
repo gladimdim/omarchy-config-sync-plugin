@@ -79,6 +79,8 @@ State lives in `~/.local/share/omarchy-config-sync/` so applying `shell.json` do
 | `bin/*` | `~/.local/bin/` (scripts already in the repo, plus local helpers named by bindings, hooks, or plugins) |
 | `terminals/alacritty.toml` etc. | matching terminal config files |
 
+**Publish** only stages the paths in this table. Anything else you keep in the clone — a note, a tool's cache folder — stays untracked.
+
 Leftovers from a save, a copy, or an editor — `*.bak`, `*.bak.1`, `*.bak-old`, `*.backup`, `*.orig`, `*.old`, `*~`, `*.swp`, `*.swo` — are skipped.
 
 ### Git-installed plugins
