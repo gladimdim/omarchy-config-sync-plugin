@@ -86,7 +86,7 @@ SKIP_FILE_NAMES = {".DS_Store"}
 # skipped by iter_files, so `.swp` here covers the visible `x.swp` form.
 SKIP_NAME_RE = re.compile(r"(?:\.bak(?:[.-].*)?|\.backup|\.orig|\.old|\.sw[op])$|~$")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.6.0"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
