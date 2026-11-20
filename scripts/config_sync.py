@@ -4218,6 +4218,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "shortcut_changes": len([s for s in (diff.get("shortcuts") or []) if not s.get("hidden")]),
         "plugin_changes": len([p for p in (diff.get("plugins") or []) if not p.get("hidden")]),
         "plugin_list_changes": len([p for p in (diff.get("plugin_list") or []) if not p.get("hidden")]),
+        "track_versions": plugin_versions_tracked(repo),
         "hidden": state.get("hidden") or [],
         "hidden_count": len(state.get("hidden") or []),
         "plugin_version": PLUGIN_VERSION,
@@ -5197,6 +5198,71 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return snap
 
 
+def cmd_plugin_versions(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Turn plugin version tracking on or off for the whole config repo.
+
+    The switch lives in the repo's `.omarchy-config.json`, so every machine that
+    syncs the repo follows it. The change is committed on its own (pathspec
+    commit, so nothing else staged rides along) and pushed with --push.
+    """
+    choice = (args.args[0] if args.args else "").strip().lower()
+    if choice not in {"on", "off"}:
+        raise SyncError("Pass on or off: plugin-versions on|off.")
+    repo = configured_repo(ctx)
+    marker_path = repo / MARKER_NAME
+    marker = load_json(marker_path, default={}, within=repo)
+    data = marker if isinstance(marker, dict) else {}
+    section = data.get("plugin_list") if isinstance(data.get("plugin_list"), dict) else {}
+    section = dict(section)
+    if choice == "off":
+        section["track_versions"] = False
+    else:
+        section.pop("track_versions", None)
+    if section:
+        data["plugin_list"] = section
+    else:
+        data.pop("plugin_list", None)
+    write_json(marker_path, data, within=repo)
+    paths = [MARKER_NAME]
+    if choice == "off" and (repo / PLUGIN_LIST_REL).is_file():
+        # Drop the pins already in the file. "on" has nothing to restore: the
+        # next Publish of a plugin entry records its version again.
+        write_plugin_list(repo, repo_plugin_list(repo))
+        paths.append(PLUGIN_LIST_REL)
+
+    ensure_git_identity(repo)
+    run_git(repo, ["add", "--", *paths], check=True)
+    committed = False
+    if git_out(repo, "diff", "--cached", "--name-only", "--", *paths):
+        label = "Stop tracking plugin versions" if choice == "off" else "Track plugin versions"
+        result = run_git(repo, ["commit", "-m", f"{label}\n\nSet from {socket.gethostname()}.\n", "--", *paths], timeout=30)
+        if result.returncode != 0:
+            raise SyncError(git_error_message(["commit"], result))
+        committed = True
+
+    pushed = False
+    push_error = None
+    if committed and args.push:
+        result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
+        if result.returncode != 0:
+            push_error = git_error_message(["push"], result)
+        else:
+            pushed = True
+
+    snap = build_snapshot(ctx, fetch=False)
+    what = "Stopped tracking plugin versions" if choice == "off" else "Tracking plugin versions again"
+    if not committed:
+        snap["message"] = f"Plugin versions are already {'not tracked' if choice == 'off' else 'tracked'}."
+    elif push_error:
+        snap["push_error"] = push_error
+        snap["message"] = f"Saved in the repo, but push failed: {push_error}"
+    else:
+        snap["message"] = what + (" and pushed." if pushed else ". Commit is local until you push.")
+    snap["committed"] = committed
+    snap["pushed"] = pushed
+    return snap
+
+
 def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     """Make this machine match the repo, or publish this machine over the repo."""
     side = (args.side or "repo").strip().lower()
@@ -5717,6 +5783,7 @@ def build_parser() -> argparse.ArgumentParser:
             "resync",
             "hide",
             "unhide",
+            "plugin-versions",
             "open",
             "terminal",
             "install-plugin",
@@ -5769,6 +5836,8 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_hide(ctx, args)
     if command == "unhide":
         return cmd_unhide(ctx, args)
+    if command == "plugin-versions":
+        return cmd_plugin_versions(ctx, args)
     if command == "open":
         return cmd_open(ctx, args)
     if command == "terminal":

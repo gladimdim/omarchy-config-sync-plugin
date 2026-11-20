@@ -650,6 +650,10 @@ Panel {
       lastError = ""
       var targetUrl = String(repoUrlInput || "").trim()
       run(["connect", "--stdin"], targetUrl)
+    } else if (kind === "versions-off") {
+      run(["plugin-versions", "off", "--push"])
+    } else if (kind === "versions-on") {
+      run(["plugin-versions", "on", "--push"])
     } else if (kind === "resync-repo") {
       run(["resync", "--side", "repo"])
     } else if (kind === "resync-local") {
@@ -1273,7 +1277,11 @@ Panel {
                       ? "Make this machine match the git repo? Incoming plugins, shortcuts, theme, and configs overwrite local copies. A timestamped backup is written first. Extra files that exist only on this machine are left in place."
                       : root.confirmKind === "resync-local"
                         ? "Overwrite the git repo with this machine's config, then push?"
-                        : "Unlink the config repo on this machine? Local files are left as they are."
+                        : root.confirmKind === "versions-off"
+                          ? "Stop comparing plugin versions? Each machine updates its own plugins. This is committed and pushed to the shared repo, so every machine needs v1.6.0 or later first."
+                          : root.confirmKind === "versions-on"
+                            ? "Compare plugin versions again? Version differences between machines show up as Update rows. This is committed and pushed to the shared repo."
+                            : "Unlink the config repo on this machine? Local files are left as they are."
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -1303,7 +1311,7 @@ Panel {
               width: parent.width
 
               Button {
-                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "switch-repo" ? "Switch repo" : (root.confirmKind === "resync-repo" ? "Take repo" : (root.confirmKind === "resync-local" ? "Take this machine" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply"))))
+                text: root.confirmKind === "disconnect" ? "Unlink" : (root.confirmKind === "switch-repo" ? "Switch repo" : (root.confirmKind === "resync-repo" ? "Take repo" : (root.confirmKind === "resync-local" ? "Take this machine" : (root.confirmKind === "versions-off" || root.confirmKind === "versions-on" ? "Change & push" : (root.confirmKind === "publish" ? (root.syncState === "empty" ? "Seed & push" : "Publish") : "Apply")))))
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
@@ -1774,6 +1782,21 @@ Panel {
           root.includeMachine = !root.includeMachine
           Qt.callLater(function() { root.seedPicks() })
         }
+      }
+
+      Toggle {
+        visible: !root.showingHidden && !!root.status && !!root.status.configured && root.syncState !== "empty"
+        width: parent.width
+        label: "Track plugin versions"
+        enabled: !root.busy
+        description: "Off: each machine updates its own git plugins, and plugins.json only lists which are installed. Applies to every machine on this repo (v1.6.0+)."
+        checked: !root.status || root.status.track_versions !== false
+        foreground: root.foreground
+        accent: root.accent
+        fontFamily: root.fontFamily
+        titleSize: Style.font.body
+        descriptionSize: Style.font.caption
+        onClicked: root.confirmKind = (root.status && root.status.track_versions === false) ? "versions-on" : "versions-off"
       }
 
       Column {
