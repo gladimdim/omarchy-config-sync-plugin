@@ -91,11 +91,21 @@ A plugin folder with a `.git` checkout is never copied in either direction, so A
 - **Update** when the repo lists a newer version or a commit this checkout has not seen. It opens `omarchy plugin update <id>`, which pulls the plugin's upstream, not the repo.
 - An outgoing row when this machine is ahead, or when you uninstalled a listed plugin (unticked by default).
 
-To let each machine update its plugins on its own, set this in the repo's `.omarchy-config.json`:
+### Stop version drift from showing as a change
+
+Each machine updates its git plugins on its own schedule, so one machine is often a few commits ahead of what `plugins.json` recorded. By default that shows up in the Changes tab as an outgoing row ("Update the repo's entry: 1.2.0 (2bd80be) → 1.2.0 (04f604e)") or as an incoming **Update**. If you would rather have `plugins.json` only say *which* plugins are installed, turn version tracking off.
+
+**In the panel:** Changes tab → **Track plugin versions** → switch it off and confirm. Config Sync commits and pushes the change for you.
+
+**By hand:** set this in the repo's `.omarchy-config.json`:
 
 ```json
 { "plugin_list": { "track_versions": false } }
 ```
+
+Or from a terminal: `python3 scripts/config_sync.py plugin-versions off --push` (use `on` to undo it).
+
+This is a setting of the repo, not of one machine, so it applies to every machine that syncs it. Update Config Sync to v1.6.0 or later everywhere before you turn it off; an older version ignores the setting and keeps showing version differences.
 
 `plugins.json` then records only id, name, and source. Publish leaves out version and commit (and drops any already in the file), and a version or commit difference between machines no longer shows up as Update or as an outgoing row. Install, uninstall, and source changes still show up.
 

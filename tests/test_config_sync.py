@@ -3616,6 +3616,50 @@ class PluginListTests(unittest.TestCase):
             self.assertEqual((row["status"], row["action"]), ("added-repo", "install"))
             self.assertEqual(row["summary"], f"Not installed here · from {self.SOURCE}")
 
+    def test_plugin_versions_command_toggles_and_commits(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            write_plugin_list(repo, [{"id": self.PID, "name": "Weather", "version": "1.0.0", "commit": "e" * 40, "source": self.SOURCE}])
+            commit_all(repo, "list")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            self.assertTrue(cs.cmd_snapshot(env.ctx, argparse_ns())["status"]["track_versions"])
+
+            snap = cs.cmd_plugin_versions(env.ctx, argparse_ns(args=["off"]))
+            self.assertTrue(snap["committed"])
+            self.assertFalse(snap["status"]["track_versions"])
+            marker = json.loads((repo / cs.MARKER_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(marker["plugin_list"], {"track_versions": False})
+            listed = json.loads((repo / cs.PLUGIN_LIST_REL).read_text(encoding="utf-8"))
+            self.assertEqual(listed["plugins"], [{"id": self.PID, "name": "Weather", "source": self.SOURCE}])
+            self.assertEqual(git(repo, "status", "--porcelain").stdout.strip(), "")
+
+            again = cs.cmd_plugin_versions(env.ctx, argparse_ns(args=["off"]))
+            self.assertFalse(again["committed"])
+
+            snap = cs.cmd_plugin_versions(env.ctx, argparse_ns(args=["on"]))
+            self.assertTrue(snap["committed"])
+            self.assertTrue(snap["status"]["track_versions"])
+            marker = json.loads((repo / cs.MARKER_NAME).read_text(encoding="utf-8"))
+            self.assertNotIn("plugin_list", marker)
+            listed = json.loads((repo / cs.PLUGIN_LIST_REL).read_text(encoding="utf-8"))
+            self.assertEqual(listed["plugins"], [{"id": self.PID, "name": "Weather", "source": self.SOURCE}])
+
+    def test_plugin_versions_command_leaves_other_staged_work_alone(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            write(repo / "notes.txt", "scratch")
+            git(repo, "add", "notes.txt")
+            cs.cmd_plugin_versions(env.ctx, argparse_ns(args=["off"]))
+            self.assertEqual(git(repo, "diff", "--cached", "--name-only").stdout.split(), ["notes.txt"])
+
+    def test_plugin_versions_command_rejects_bad_value(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            with self.assertRaises(cs.SyncError):
+                cs.cmd_plugin_versions(env.ctx, argparse_ns(args=["maybe"]))
+
     def test_unseen_upstream_commit_is_an_update(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
