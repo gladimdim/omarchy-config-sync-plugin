@@ -552,7 +552,9 @@ class ShortcutTests(unittest.TestCase):
                 'o.bind("SUPER + SHIFT + R", "Region screen recording", "screenrecord-region-toggle")\n',
             )
             cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
-            result = cs.cmd_resync(env.ctx, argparse_ns(side="repo"))
+            with patch.object(cs, "fetch_repo", wraps=cs.fetch_repo) as fetch:
+                result = cs.cmd_resync(env.ctx, argparse_ns(side="repo"))
+            fetch.assert_called_once_with(repo)
             self.assertTrue(result["ok"], result)
             text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
             self.assertNotIn("quarter_snap", text)
@@ -1017,6 +1019,12 @@ class KeycodeDuplicateTests(unittest.TestCase):
 
 
 class HelperScriptDiscoveryTests(unittest.TestCase):
+    def test_unrelated_content_skips_shortcut_parsing(self) -> None:
+        text = "run /home/user/.local/bin/my-helper\n"
+        with patch.object(cs, "extract_bind_statements") as parse:
+            self.assertEqual(cs.helper_names_from_text(text), {"my-helper"})
+            parse.assert_not_called()
+
     def test_referenced_local_helper_is_offered_unrelated_bin_is_not(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
@@ -1098,6 +1106,20 @@ class ClassifyTests(unittest.TestCase):
 
 
 class InspectAndSyncTests(unittest.TestCase):
+    def test_snapshot_uses_one_inventory_and_helper_scan(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            with (
+                patch.object(cs, "collect_inventory", wraps=cs.collect_inventory) as inventory,
+                patch.object(cs, "collect_bin_names", wraps=cs.collect_bin_names) as bin_names,
+            ):
+                snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            inventory.assert_called_once()
+            bin_names.assert_called_once()
+            self.assertTrue(snap["inspect"]["configs"])
+            self.assertTrue(snap["diff"]["files"])
+
     def test_inspect_mini_repo(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
