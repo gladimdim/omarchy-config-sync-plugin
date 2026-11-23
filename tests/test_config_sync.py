@@ -2840,7 +2840,7 @@ class DivergedCloneTests(unittest.TestCase):
         clone = Path(snap["status"]["clone_path"])
         return origin, clone
 
-    def _push_from_another_machine(self, env: TempHome, origin: Path, rel: str, content: str) -> None:
+    def _push_from_another_machine(self, env: TempHome, origin: Path, rel: str, content: str | None) -> None:
         other = env.home / "other"
         subprocess.run(
             ["git", "clone", str(origin), str(other)],
@@ -2850,7 +2850,10 @@ class DivergedCloneTests(unittest.TestCase):
         )
         git(other, "config", "user.name", "Other")
         git(other, "config", "user.email", "other@example.com")
-        write(other / rel, content)
+        if content is None:
+            (other / rel).unlink()
+        else:
+            write(other / rel, content)
         commit_all(other, "Sync config from other machine")
         git(other, "push", "origin", "main")
 
@@ -2916,6 +2919,32 @@ class DivergedCloneTests(unittest.TestCase):
             with self.assertRaises(cs.SyncError) as caught:
                 cs.cmd_publish(env.ctx, argparse_ns(dry_run=True))
             self.assertIn("uncommitted changes", str(caught.exception))
+
+    def test_resolve_modify_delete_conflicts(self) -> None:
+        rel = "terminals/kitty.conf"
+        edited = "font_size 20\n"
+        for deleted_side in ("ours", "theirs"):
+            for selected_side in ("ours", "theirs"):
+                with self.subTest(deleted=deleted_side, selected=selected_side), TempHome() as env:
+                    origin, clone = self._connect_to_shared_origin(env)
+                    if deleted_side == "ours":
+                        (clone / rel).unlink()
+                    else:
+                        write(clone / rel, edited)
+                    commit_all(clone, "Sync config from this machine")
+                    self._push_from_another_machine(env, origin, rel, None if deleted_side == "theirs" else edited)
+
+                    snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=True))
+                    self.assertEqual(snap["status"]["conflicts"], [rel])
+                    result = cs.cmd_resolve(env.ctx, argparse_ns(args=[rel], side=selected_side))
+                    self.assertEqual(result["remaining_conflicts"], [])
+                    self.assertFalse((clone / ".git" / "MERGE_HEAD").exists())
+                    self.assertEqual(git(clone, "status", "--porcelain").stdout, "")
+                    self.assertEqual(len(git(clone, "rev-list", "--parents", "-1", "HEAD").stdout.split()), 3)
+                    if deleted_side == selected_side:
+                        self.assertFalse((clone / rel).exists())
+                    else:
+                        self.assertEqual((clone / rel).read_text(), edited)
 
 
 class RemovalSyncTests(unittest.TestCase):
