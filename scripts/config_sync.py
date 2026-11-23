@@ -5331,15 +5331,29 @@ def cmd_resolve(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     if side in {"local", "ours"}:
         checkout = "--ours"
         label = "local (ours)"
+        stage = "2"
     elif side in {"repo", "theirs", "incoming"}:
         checkout = "--theirs"
         label = "incoming (theirs)"
+        stage = "3"
     else:
         raise SyncError("Side must be ours/local or theirs/repo.")
-    result = run_git(repo, ["checkout", checkout, "--", rel], disk_root=repo)
-    if result.returncode != 0:
-        raise SyncError(git_error_message(["checkout", checkout, rel], result))
-    run_git(repo, ["add", "--", rel], check=True)
+
+    unmerged = run_git(repo, ["--literal-pathspecs", "ls-files", "--unmerged", "-z", "--", rel], check=True)
+    stages = set()
+    for entry in unmerged.stdout.split("\0"):
+        metadata, separator, path = entry.partition("\t")
+        if separator and path == rel:
+            stages.add(metadata.split()[-1])
+    if not stages:
+        raise SyncError(f"No unmerged versions found for {rel}.")
+    if stage in stages:
+        run_git(repo, ["--literal-pathspecs", "checkout", checkout, "--", rel], check=True, disk_root=repo)
+        run_git(repo, ["--literal-pathspecs", "add", "--", rel], check=True)
+    else:
+        # Git omits the index stage for the side that deleted the file.
+        run_git(repo, ["--literal-pathspecs", "rm", "--", rel], check=True)
+
     remaining = git_status_fields(repo).get("conflicts") or []
     if not remaining:
         # Finish the merge if one is in progress and everything is staged.
