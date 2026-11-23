@@ -1487,6 +1487,8 @@ def helper_scan_paths(ctx: Context, repo: Path) -> list[tuple[Path, Path]]:
 
 def helper_names_from_text(text: str) -> set[str]:
     names = set(LOCAL_BIN_NAME_RE.findall(text))
+    if "o.bind(" not in text and "o.rebind(" not in text:
+        return names
     for entry in extract_bind_statements(text):
         for raw in (entry.get("raw"), entry.get("sync_raw")):
             if not raw:
@@ -1512,9 +1514,11 @@ def helper_names_from_command(command: str) -> set[str]:
 def referenced_local_helpers(ctx: Context, repo: Path) -> set[str]:
     names: set[str] = set()
     for path, within in helper_scan_paths(ctx, repo):
-        if file_too_large(path):
+        data = read_bytes_bound(path, within=within)
+        # Hook and plugin trees can contain large assets as well as scripts.
+        if not data or not any(marker in data for marker in (b".local/bin/", b"o.bind(", b"o.rebind(")):
             continue
-        names |= helper_names_from_text(read_text(path, within=within))
+        names |= helper_names_from_text(data.decode("utf-8", errors="replace"))
     return names
 
 
@@ -1894,7 +1898,9 @@ def launch_omarchy_terminal(command: str) -> bool:
     return True
 
 
-def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
+def collect_inventory(
+    ctx: Context, repo: Path, *, bin_names: set[str] | None = None,
+) -> list[dict[str, Any]]:
     items: dict[str, dict[str, Any]] = {}
     if _tree_disk_usage(repo, MAX_REPO_DISK_BYTES) > MAX_REPO_DISK_BYTES:
         # The clone is budgeted while git writes it; this catches a tree that
@@ -2027,7 +2033,9 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             add(rel, local, repo_file, "terminal")
 
     repo_bin = repo / "bin"
-    for name in sorted(collect_bin_names(ctx, repo)):
+    if bin_names is None:
+        bin_names = collect_bin_names(ctx, repo)
+    for name in sorted(bin_names):
         add(f"bin/{name}", ctx.local_bin / name, repo_bin / name, "bin")
 
     local_theme = ctx.theme_name_path
@@ -3705,7 +3713,10 @@ def apply_omarchy_theme(slug: str, dry_run: bool) -> str:
     return "ok"
 
 
-def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[str, Any]:
+def inspect_repo(
+    ctx: Context, repo: Path, prefer_local: bool = False, *,
+    bin_names: set[str] | None = None, inventory: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     validation = validate_repo(repo)
     tree_root = ctx.home if prefer_local else repo
     hypr_root = ctx.config_hypr if prefer_local else repo / "hypr"
@@ -3789,7 +3800,9 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
                         }
                     )
 
-    bins = sorted(collect_bin_names(ctx, repo))
+    if bin_names is None:
+        bin_names = collect_bin_names(ctx, repo)
+    bins = sorted(bin_names)
 
     terminals = []
     for rel, local in terminal_map(ctx).items():
@@ -3798,7 +3811,9 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
             terminals.append(Path(rel).stem.replace("ghostty.config", "ghostty"))
 
     configs = []
-    for item in collect_inventory(ctx, repo):
+    if inventory is None:
+        inventory = collect_inventory(ctx, repo, bin_names=bin_names)
+    for item in inventory:
         wanted = item["local_exists"] if prefer_local else item["repo_exists"]
         if item["group"] in {"hypr", "omarchy", "terminal"} and wanted:
             configs.append(
@@ -3929,7 +3944,10 @@ def default_publish_status(status: str) -> bool:
     return status in {"local", "added-local", "differs"}
 
 
-def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, Any]:
+def annotate_diff(
+    ctx: Context, repo: Path, state: dict[str, Any], *,
+    inventory: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     stored = state.get("file_hashes") or {}
     hidden_keys = set(state.get("hidden") or [])
     files = []
@@ -3945,7 +3963,9 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         "changed": 0,
         "hidden": 0,
     }
-    for item in collect_inventory(ctx, repo):
+    if inventory is None:
+        inventory = collect_inventory(ctx, repo)
+    for item in inventory:
         status = classify_file(item, stored.get(item["path"]))
         merge = plan_merge(ctx, repo, item, stored.get(item["path"])) if status == "both" and is_mergeable_path(item) else None
         merge_note = ""
@@ -4188,8 +4208,10 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
     git_fields = integrate_remote(repo, git_fields)
     validation = validate_repo(repo)
     empty = is_seedable_empty(repo)
-    inspect = inspect_repo(ctx, repo, prefer_local=empty)
-    diff = annotate_diff(ctx, repo, state)
+    bin_names = collect_bin_names(ctx, repo)
+    inventory = collect_inventory(ctx, repo, bin_names=bin_names)
+    inspect = inspect_repo(ctx, repo, prefer_local=empty, bin_names=bin_names, inventory=inventory)
+    diff = annotate_diff(ctx, repo, state, inventory=inventory)
     sync_state = rollup_sync_state(git_fields, diff["counts"], has_baseline=bool(state.get("file_hashes")))
     if empty:
         sync_state = "empty"
@@ -4732,6 +4754,13 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     fetch_error = fetch_repo(repo)
     git_fields = git_status_fields(repo, fetch_error)
     git_fields = integrate_remote(repo, git_fields)
+    return apply_changes(ctx, args, repo, state, git_fields)
+
+
+def apply_changes(
+    ctx: Context, args: argparse.Namespace, repo: Path, state: dict[str, Any],
+    git_fields: dict[str, Any], diff: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if git_fields["conflicts"]:
         raise SyncError(
             "The git clone has merge conflicts. Resolve them before applying.",
@@ -4743,7 +4772,8 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             or "The clone has uncommitted changes, so origin could not be merged in. Open the clone and clean it up, then Apply.",
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
-    diff = annotate_diff(ctx, repo, state)
+    if diff is None:
+        diff = annotate_diff(ctx, repo, state)
     shortcut_base_before = current_shortcut_baseline(repo, state)
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
@@ -4961,6 +4991,13 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     fetch_error = fetch_repo(repo)
     git_fields = git_status_fields(repo, fetch_error)
     git_fields = integrate_remote(repo, git_fields)
+    return publish_changes(ctx, args, repo, state, git_fields)
+
+
+def publish_changes(
+    ctx: Context, args: argparse.Namespace, repo: Path, state: dict[str, Any],
+    git_fields: dict[str, Any], diff: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if git_fields["conflicts"]:
         raise SyncError(
             "The git clone has merge conflicts. Resolve them before publishing.",
@@ -4972,7 +5009,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             or "The clone has uncommitted changes, so origin could not be merged in. Open the clone and clean it up, then Publish.",
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
-    diff = annotate_diff(ctx, repo, state)
+    if diff is None:
+        diff = annotate_diff(ctx, repo, state)
     shortcut_base_before = current_shortcut_baseline(repo, state)
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
@@ -5220,6 +5258,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                     extra={"conflicts": conflicts},
                 )
             raise SyncError(git_error_message(["merge"], merge))
+        git_fields = git_status_fields(repo, fetch_error)
 
     state = load_state(ctx)
     diff = annotate_diff(ctx, repo, state)
@@ -5278,7 +5317,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             snap = build_snapshot(ctx, fetch=False)
             snap["message"] = "Nothing from the repo to apply. This machine may already match."
             return snap
-        result = cmd_apply(ctx, nested)
+        result = apply_changes(ctx, nested, repo, state, git_fields, diff)
         result["message"] = "Resynced this machine from the repo. " + str(result.get("message") or "")
         result["resync"] = "repo"
         return result
@@ -5288,7 +5327,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap = build_snapshot(ctx, fetch=False)
         snap["message"] = "Nothing local to publish."
         return snap
-    result = cmd_publish(ctx, nested)
+    result = publish_changes(ctx, nested, repo, state, git_fields, diff)
     result["message"] = "Published this machine as the source of truth. " + str(result.get("message") or "")
     result["resync"] = "local"
     return result
