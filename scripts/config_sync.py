@@ -35,8 +35,10 @@ STATE_VERSION = 1
 SESSION_FILE = ".sync-session"
 MARKER_NAME = ".omarchy-config.json"
 MARKER_FORMAT = "omarchy-config"
-MAX_DIFF_LINES = 48
-MAX_DIFF_BYTES = 12_000
+# A review row shows the whole diff of a config file in most cases; the bytes
+# cap keeps a panel of ~20 changed files well under MAX_RESPONSE_BYTES.
+MAX_DIFF_LINES = 400
+MAX_DIFF_BYTES = 40_000
 CLONE_TIMEOUT = 600
 FETCH_TIMEOUT = 180
 PUSH_TIMEOUT = 600
@@ -1593,6 +1595,65 @@ def plugin_git_commit(plugin_dir: Path) -> str:
     return head if PLUGIN_COMMIT_RE.match(head) else ""
 
 
+PLUGIN_BRANCH_RE = re.compile(r"^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,100}$")
+
+
+def clean_plugin_branch(raw: Any) -> str:
+    return raw if isinstance(raw, str) and PLUGIN_BRANCH_RE.match(raw) and raw != "HEAD" else ""
+
+
+def plugin_git_branch(plugin_dir: Path) -> str:
+    """The checked-out branch, or "" for a detached HEAD."""
+    return clean_plugin_branch(git_out(plugin_dir, "rev-parse", "--abbrev-ref", "HEAD"))
+
+
+# Plugin checkouts carry their own .git/config. These keep a diff or status in
+# one from running a configured external program.
+PLUGIN_GIT_SAFE = ["-c", "core.fsmonitor=", "-c", "diff.external="]
+
+
+def plugin_has_commit(plugin_dir: Path, commit: str) -> bool:
+    if not PLUGIN_COMMIT_RE.match(commit or ""):
+        return False
+    return run_git(plugin_dir, ["cat-file", "-e", f"{commit}^{{commit}}"], timeout=10).returncode == 0
+
+
+def plugin_is_ancestor(plugin_dir: Path, older: str, newer: str) -> bool:
+    return run_git(plugin_dir, ["merge-base", "--is-ancestor", older, newer], timeout=10).returncode == 0
+
+
+def plugin_commit_preview(plugin_dir: Path, here: str, there: str) -> str:
+    """Commits on each side and the diff between them, capped like a file preview.
+
+    `<` lines are commits only this machine has; `>` lines only the listed commit.
+    """
+    if not (plugin_has_commit(plugin_dir, here) and plugin_has_commit(plugin_dir, there)):
+        return ""
+    log = run_git(
+        plugin_dir,
+        [*PLUGIN_GIT_SAFE, "log", "--no-color", "--left-right", "--format=%m %h %s", "-n", "20", f"{here}...{there}"],
+        timeout=10,
+    )
+    diff = run_git(
+        plugin_dir,
+        [*PLUGIN_GIT_SAFE, "diff", "--no-color", "--no-ext-diff", "--no-textconv", here, there],
+        timeout=15,
+    )
+    lines = ["Commits (< this machine only, > listed commit only):"]
+    lines += (log.stdout or "").splitlines()[:20] if log.returncode == 0 else []
+    body = (diff.stdout or "").splitlines() if diff.returncode == 0 else []
+    if body:
+        lines.append("")
+        lines.append("Diff from this machine to the listed commit:")
+        lines += body[:MAX_DIFF_LINES]
+        if len(body) > MAX_DIFF_LINES:
+            lines.append(f"… {len(body) - MAX_DIFF_LINES} more lines")
+    text = "\n".join(lines)
+    if len(text) > MAX_DIFF_BYTES:
+        text = text[: MAX_DIFF_BYTES - 20] + "\n… truncated"
+    return text
+
+
 def _short_text(value: Any, limit: int = 200) -> str:
     return value.strip()[:limit] if isinstance(value, str) else ""
 
@@ -1617,6 +1678,7 @@ def local_plugin_list(ctx: Context) -> dict[str, dict[str, Any]]:
             "name": _short_text(manifest.get("name")) or pid,
             "version": _short_text(manifest.get("version"), 64),
             "commit": plugin_git_commit(child),
+            "branch": plugin_git_branch(child),
             "source": plugin_git_source(child),
         }
     return out
@@ -1641,6 +1703,7 @@ def repo_plugin_list(repo: Path) -> dict[str, dict[str, Any]]:
             "name": _short_text(row.get("name")) or pid,
             "version": _short_text(row.get("version"), 64),
             "commit": commit if PLUGIN_COMMIT_RE.match(commit) else "",
+            "branch": clean_plugin_branch(row.get("branch")),
             "source": clean_plugin_source(row.get("source")),
         }
     return out
@@ -1650,13 +1713,14 @@ def write_plugin_list(repo: Path, entries: dict[str, dict[str, Any]]) -> None:
     if not plugin_versions_tracked(repo):
         # Drop pins already in the file too, so none of them go stale.
         entries = {
-            pid: {k: v for k, v in entry.items() if k not in {"version", "commit"}}
+            pid: {k: v for k, v in entry.items() if k not in {"version", "commit", "branch"}}
             for pid, entry in entries.items()
         }
     payload = {
         "format": PLUGIN_LIST_FORMAT,
         "version": 1,
-        "plugins": [entries[pid] for pid in sorted(entries)],
+        # An empty branch (detached HEAD, or a list from before branches) is left out.
+        "plugins": [{k: v for k, v in entries[pid].items() if v or k != "branch"} for pid in sorted(entries)],
     }
     write_json(repo / PLUGIN_LIST_REL, payload, within=repo)
 
@@ -1672,15 +1736,26 @@ def _version_key(version: str) -> tuple[int, ...] | None:
 
 
 def plugin_newer_side(plugin_dir: Path, here: dict[str, Any], there: dict[str, Any]) -> str:
-    """Which copy of a git plugin is ahead: "local", "repo", "same" or "unknown"."""
+    """Which copy of a git plugin is ahead.
+
+    "local" or "repo" when one commit contains the other, "diverged" when
+    neither does, "unseen" when this checkout has never fetched the listed
+    commit, "same", or "unknown" when only the version strings differ.
+
+    Commit ancestry wins over version strings: two branches can carry the same
+    or a misleading version, and calling either of them newer is wrong.
+    """
+    if here["commit"] and there["commit"] and here["commit"] != there["commit"]:
+        if not plugin_has_commit(plugin_dir, there["commit"]):
+            return "unseen"
+        if plugin_is_ancestor(plugin_dir, there["commit"], here["commit"]):
+            return "local"
+        if plugin_is_ancestor(plugin_dir, here["commit"], there["commit"]):
+            return "repo"
+        return "diverged"
     local_v, repo_v = _version_key(here["version"]), _version_key(there["version"])
     if local_v is not None and repo_v is not None and local_v != repo_v:
         return "local" if local_v > repo_v else "repo"
-    if here["commit"] and there["commit"] and here["commit"] != there["commit"]:
-        # The listed commit being reachable from HEAD means this checkout
-        # already has it. A commit git has never seen here is newer upstream.
-        result = run_git(plugin_dir, ["merge-base", "--is-ancestor", there["commit"], "HEAD"], timeout=10)
-        return "local" if result.returncode == 0 else "repo"
     if here["version"] != there["version"]:
         return "unknown"
     return "same"
@@ -1698,6 +1773,8 @@ def describe_plugin_version(entry: dict[str, Any] | None) -> str:
         return ""
     version = entry.get("version") or ""
     commit = (entry.get("commit") or "")[:7]
+    if commit and entry.get("branch"):
+        commit = f"{commit} on {entry['branch']}"
     if version and commit:
         return f"{version} ({commit})"
     return version or commit or "unknown version"
@@ -1734,6 +1811,8 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
         status = ""
         action = ""
         summary = ""
+        preview = ""
+        diverged = False
         removal = False
         default_publish = False
         if here and not there:
@@ -1743,6 +1822,13 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
             else:
                 summary = f"Add {describe_plugin_version(here)} to the repo's plugin list{drop_note}"
                 default_publish = True
+            if vendored:
+                preview, differing = vendored_plugin_preview(ctx, repo, pid)
+                if differing:
+                    summary += (
+                        f" · the copied files differ from this checkout in {differing} "
+                        f"file{'s' if differing != 1 else ''}, so another machine may run other code"
+                    )
         elif there and not installed:
             if pid in baseline:
                 status = "local"
@@ -1773,9 +1859,29 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
         elif here and there:
             if track_versions:
                 side = plugin_newer_side(ctx.config_plugins / pid, here, there)
+                preview = plugin_commit_preview(ctx.config_plugins / pid, here["commit"], there["commit"]) if side != "same" else ""
             else:
                 side = "same"
-            if side == "repo":
+            if side == "diverged":
+                # Neither commit contains the other: no side is newer, and a
+                # fast-forward is impossible. Publishing lists this machine's
+                # commit; Check out puts the listed one on a new branch here.
+                status = "both"
+                action = "checkout"
+                diverged = True
+                summary = (
+                    f"Histories diverged · this machine has {describe_plugin_version(here)}, "
+                    f"the repo lists {describe_plugin_version(there)} · neither contains the other"
+                )
+            elif side == "unseen":
+                status = "repo"
+                action = "update"
+                summary = (
+                    f"Repo lists {describe_plugin_version(there)}, a commit this checkout has never fetched · "
+                    f"this machine has {describe_plugin_version(here)} · Update fetches it; if the histories "
+                    "diverged it will not fast-forward"
+                )
+            elif side == "repo":
                 status = "repo"
                 action = "update"
                 summary = f"Repo lists {describe_plugin_version(there)} · this machine has {describe_plugin_version(here)}"
@@ -1806,11 +1912,69 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
                 "local_version": describe_plugin_version(here),
                 "repo_version": describe_plugin_version(there),
                 "source": (there or {}).get("source") or (here or {}).get("source") or "",
+                "local_commit": (here or {}).get("commit") or "",
+                "repo_commit": (there or {}).get("commit") or "",
+                "local_branch": (here or {}).get("branch") or "",
+                "repo_branch": (there or {}).get("branch") or "",
+                "diverged": diverged,
+                "preview": preview,
+                "effect": plugin_list_effect(status, diverged, here, there, removal),
                 "default_publish": default_publish and not hidden,
                 "hidden": hidden,
             }
         )
     return rows
+
+
+MAX_VENDORED_DIFF_FILES = 12
+
+
+def vendored_plugin_preview(ctx: Context, repo: Path, plugin_id: str) -> tuple[str, int]:
+    """Diff the repo's copied plugin files against this machine's git checkout.
+
+    Before a plugin is in plugins.json, the copied files are the only record
+    of what another machine runs. Returns the diff (repo → this machine) and
+    the number of files that differ.
+    """
+    repo_dir, local_dir = repo / "plugins" / plugin_id, ctx.config_plugins / plugin_id
+    rels = {rel_posix(p, repo_dir) for p in iter_files(repo_dir)} | {rel_posix(p, local_dir) for p in iter_files(local_dir)}
+    parts: list[str] = []
+    differing = 0
+    for rel in sorted(rels):
+        local_file, repo_file = local_dir / rel, repo_dir / rel
+        local_hash = sha256_file(local_file, within=ctx.home) if local_file.is_file() else None
+        repo_hash = sha256_file(repo_file, within=repo) if repo_file.is_file() else None
+        if local_hash == repo_hash:
+            continue
+        differing += 1
+        if differing > MAX_VENDORED_DIFF_FILES:
+            continue
+        text = unified_preview(local_file, repo_file, local_within=ctx.home, repo_within=repo, status="local")
+        parts.append(f"── {rel}\n{text or '(binary or empty)'}")
+    if differing > MAX_VENDORED_DIFF_FILES:
+        parts.append(f"… {differing - MAX_VENDORED_DIFF_FILES} more files differ")
+    text = "\n".join(parts)
+    if len(text) > MAX_DIFF_BYTES * 2:
+        text = text[: MAX_DIFF_BYTES * 2 - 20] + "\n… truncated"
+    return text, differing
+
+
+def plugin_list_effect(
+    status: str, diverged: bool, here: dict[str, Any] | None, there: dict[str, Any] | None, removal: bool
+) -> str:
+    """One line on what each button changes and on which machine."""
+    if diverged:
+        return (
+            f"Publish: the repo lists this machine's {describe_plugin_version(here)} · "
+            f"Check out: this machine gets {describe_plugin_version(there)} on a new branch; its current branch stays"
+        )
+    if removal:
+        return "Publish: the repo's plugin list loses this plugin"
+    if status in {"local", "added-local"}:
+        return f"Publish: the repo's plugin list gets {describe_plugin_version(here)}; no machine's checkout changes"
+    if status in {"repo", "added-repo"} and there:
+        return f"Install or Update: this machine moves to {describe_plugin_version(there)} through Omarchy's plugin flow"
+    return ""
 
 
 def plugin_list_baseline(ctx: Context, repo: Path, state: dict[str, Any]) -> list[str]:
@@ -2130,7 +2294,18 @@ def classify_file(item: dict[str, Any], stored_hash: str | None) -> str:
     return "differs"
 
 
-def unified_preview(local_path: Path, repo_path: Path, local_within: Path | None = None, repo_within: Path | None = None) -> str:
+def unified_preview(
+    local_path: Path,
+    repo_path: Path,
+    local_within: Path | None = None,
+    repo_within: Path | None = None,
+    status: str = "",
+) -> str:
+    """The file diff, read in the direction the row acts.
+
+    An outgoing row shows repo → this machine (what Publish writes into the
+    repo); every other row shows this machine → repo (what Apply writes here).
+    """
     try:
         import difflib
     except Exception:
@@ -2141,12 +2316,15 @@ def unified_preview(local_path: Path, repo_path: Path, local_within: Path | None
     repo_text = read_text(repo_path, within=repo_within) if repo_path.is_file() else ""
     if len(local_text) + len(repo_text) > MAX_DIFF_BYTES * 4:
         return "Binary or very large file — open the paths to compare."
+    old_text, new_text, old_name, new_name = local_text, repo_text, "this machine", "repo"
+    if status in {"local", "added-local"}:
+        old_text, new_text, old_name, new_name = repo_text, local_text, "repo", "this machine"
     diff = list(
         difflib.unified_diff(
-            local_text.splitlines(),
-            repo_text.splitlines(),
-            fromfile="local",
-            tofile="repo",
+            old_text.splitlines(),
+            new_text.splitlines(),
+            fromfile=old_name,
+            tofile=new_name,
             lineterm="",
         )
     )
@@ -2159,6 +2337,52 @@ def unified_preview(local_path: Path, repo_path: Path, local_within: Path | None
     if len(text) > MAX_DIFF_BYTES:
         text = text[: MAX_DIFF_BYTES - 20] + "\n… truncated"
     return text
+
+
+def text_diff(old_text: str, new_text: str, old_name: str, new_name: str) -> str:
+    """A unified diff between two texts, capped like unified_preview."""
+    import difflib
+
+    diff = list(difflib.unified_diff(old_text.splitlines(), new_text.splitlines(), fromfile=old_name, tofile=new_name, lineterm=""))
+    if not diff:
+        return ""
+    text = "\n".join(diff[:MAX_DIFF_LINES])
+    if len(diff) > MAX_DIFF_LINES:
+        text += f"\n… {len(diff) - MAX_DIFF_LINES} more lines"
+    if len(text) > MAX_DIFF_BYTES:
+        text = text[: MAX_DIFF_BYTES - 20] + "\n… truncated"
+    return text
+
+
+def both_choice_results(
+    local_text: str, repo_text: str, merged_text: str | None, overlaps: list[str]
+) -> dict[str, dict[str, Any]]:
+    """For a file both sides edited: what each choice changes, and where.
+
+    Keep local acts on Publish (the repo takes this machine's file). Take repo
+    acts on Apply (this machine takes the repo's file). Merge writes the
+    combined file through whichever of the two runs.
+    """
+    choices: dict[str, dict[str, Any]] = {
+        "local": {
+            "label": "Keep local",
+            "here": "",
+            "repo": text_diff(repo_text, local_text, "repo now", "repo after Publish"),
+        },
+        "repo": {
+            "label": "Take repo",
+            "here": text_diff(local_text, repo_text, "this machine now", "this machine after Apply"),
+            "repo": "",
+        },
+    }
+    if merged_text is not None:
+        choices["merge"] = {
+            "label": "Merge",
+            "here": text_diff(local_text, merged_text, "this machine now", "this machine after Apply"),
+            "repo": text_diff(repo_text, merged_text, "repo now", "repo after Publish"),
+            "overlaps": list(overlaps),
+        }
+    return choices
 
 
 def format_change_duration(sec: Any) -> str:
@@ -2218,6 +2442,163 @@ def shell_bar_background(data: Any) -> str:
     return "none" if bar.get("transparent") is True else "opaque"
 
 
+def shell_entries(data: Any) -> dict[str, str]:
+    """The decisions inside shell.json that a person names: bar slots and plugin entries.
+
+    Keyed by section so the same widget moved to another section is a change.
+    """
+    out: dict[str, str] = {}
+    if not isinstance(data, dict):
+        return out
+    bar = data.get("bar") if isinstance(data.get("bar"), dict) else {}
+    layout = bar.get("layout") if isinstance(bar.get("layout"), dict) else {}
+    for section, items in layout.items():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            wid = item.get("id") if isinstance(item, dict) else item
+            if isinstance(wid, str) and wid:
+                out[f"slot:{section}:{wid}"] = f"{wid} bar slot ({section})"
+    plugins = data.get("plugins")
+    if isinstance(plugins, list):
+        for item in plugins:
+            pid = item.get("id") if isinstance(item, dict) else item
+            if isinstance(pid, str) and pid:
+                out[f"plugin:{pid}"] = f"{pid} plugin entry"
+    return out
+
+
+def _name_list(names: list[str], limit: int = 4) -> str:
+    names = sorted(names)
+    text = ", ".join(names[:limit])
+    if len(names) > limit:
+        text += f" and {len(names) - limit} more"
+    return text
+
+
+def _gain_loss(gains: list[str], losses: list[str]) -> str:
+    bits = []
+    if gains:
+        bits.append(f"gains {_name_list(gains)}")
+    if losses:
+        bits.append(f"loses {_name_list(losses)}")
+    return "; ".join(bits)
+
+
+def direction_effect(
+    status: str,
+    only_repo: list[str],
+    only_local: list[str],
+    apply_changes: list[str] | None = None,
+    publish_changes: list[str] | None = None,
+) -> str:
+    """Say who gains and loses what for Apply (repo → here) and Publish (here → repo).
+
+    apply_changes and publish_changes are values that change rather than
+    appear, already written in that direction ("bar background opaque → none").
+    """
+    apply_text = "; ".join(filter(None, [_gain_loss(only_repo, only_local), *(apply_changes or [])]))
+    publish_text = "; ".join(filter(None, [_gain_loss(only_local, only_repo), *(publish_changes or [])]))
+    if status in {"repo", "added-repo"}:
+        return f"Apply: this machine {apply_text}" if apply_text else ""
+    if status in {"local", "added-local"}:
+        return f"Publish: the repo {publish_text}" if publish_text else ""
+    parts = []
+    if apply_text:
+        parts.append(f"Take repo: this machine {apply_text}")
+    if publish_text:
+        parts.append(f"Keep local: the repo {publish_text}")
+    return " · ".join(parts)
+
+
+def shell_effect(local_data: Any, repo_data: Any, status: str) -> str:
+    """One line: what each side gains or loses in shell.json, not what stayed put."""
+    local_e, repo_e = shell_entries(local_data), shell_entries(repo_data)
+    only_repo = [repo_e[k] for k in repo_e.keys() - local_e.keys()]
+    only_local = [local_e[k] for k in local_e.keys() - repo_e.keys()]
+    local_bg, repo_bg = shell_bar_background(local_data), shell_bar_background(repo_data)
+    apply_changes, publish_changes = [], []
+    if local_bg != repo_bg:
+        apply_changes.append(f"bar background {local_bg} → {repo_bg}")
+        publish_changes.append(f"bar background {repo_bg} → {local_bg}")
+    return direction_effect(status, only_repo, only_local, apply_changes, publish_changes)
+
+
+def diff_line_counts(local_text: str, repo_text: str) -> tuple[int, int, int]:
+    """Lines only in the repo, lines only here, and lines that only moved.
+
+    A line removed in one place and added in another (same text, ignoring
+    indentation) counts as moved, not as a change on either side.
+    """
+    only_repo, only_local, moved = diff_only_lines(local_text, repo_text)
+    return len(only_repo), len(only_local), moved
+
+
+def diff_only_lines(local_text: str, repo_text: str) -> tuple[list[str], list[str], int]:
+    """The stripped lines only in the repo, only here, and the count that moved."""
+    import difflib
+    from collections import Counter
+
+    added: Counter[str] = Counter()
+    removed: Counter[str] = Counter()
+    in_hunk = False
+    for line in difflib.unified_diff(local_text.splitlines(), repo_text.splitlines(), lineterm="", n=0):
+        # "---"/"+++" are headers only before the first hunk; after it, a
+        # removed "-- comment" line also starts with "---".
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        body = line[1:].strip()
+        if not body:
+            continue
+        if line.startswith("+"):
+            added[body] += 1
+        elif line.startswith("-"):
+            removed[body] += 1
+    both = added & removed
+    return list((added - both).elements()), list((removed - both).elements()), sum(both.values())
+
+
+def line_effect(local_text: str, repo_text: str, status: str) -> str:
+    """Fallback effect for a file with no semantic reader: lines each side gains."""
+    if not local_text and repo_text:
+        return "Apply: this machine gains this file" if status in {"repo", "added-repo"} else "Publish: the repo loses this file"
+    if local_text and not repo_text:
+        return "Publish: the repo gains this file" if status in {"local", "added-local"} else "Apply: this machine loses this file"
+    only_repo, only_local, moved = diff_line_counts(local_text, repo_text)
+
+    def lines(n: int) -> list[str]:
+        return [f"{n} line{'s' if n != 1 else ''}"] if n else []
+
+    moved_note = [f"{moved} line{'s' if moved != 1 else ''} only moved"] if moved else []
+    effect = direction_effect(status, lines(only_repo), lines(only_local), moved_note, moved_note)
+    return effect or (f"Only the order differs: {moved_note[0]}" if moved_note else "")
+
+
+def file_effect(
+    rel: str,
+    local_path: Path,
+    repo_path: Path,
+    status: str,
+    local_within: Path | None = None,
+    repo_within: Path | None = None,
+) -> str:
+    """The row's one-line effect: what Apply or Publish changes, and on which side."""
+    if file_too_large(local_path) or file_too_large(repo_path):
+        return ""
+    local_text = read_text(local_path, within=local_within) if local_path.is_file() else ""
+    repo_text = read_text(repo_path, within=repo_within) if repo_path.is_file() else ""
+    if rel == "omarchy/shell.json" and local_text.strip() and repo_text.strip():
+        try:
+            local_data, repo_data = json.loads(local_text), json.loads(repo_text)
+        except ValueError:
+            return line_effect(local_text, repo_text, status)
+        return shell_effect(local_data, repo_data, status) or "Only settings inside existing entries differ · see the diff"
+    return line_effect(local_text, repo_text, status)
+
+
 def extra_shell_changes(before: dict[str, Any], after: dict[str, Any], status: str) -> list[str]:
     """Describe settings beyond the shell fields with dedicated summaries."""
     handled = {
@@ -2256,10 +2637,11 @@ def extra_shell_changes(before: dict[str, Any], after: dict[str, Any], status: s
                 old_ids = [w["id"] for w in old_widgets]
                 new_ids = [w["id"] for w in new_widgets]
                 if len(set(old_ids)) == len(old_ids) and len(set(new_ids)) == len(new_ids):
-                    if old_ids != new_ids:
-                        changes.append(format_setting_change(
-                            label_for(path) + " widgets", ", ".join(old_ids) or "none", ", ".join(new_ids) or "none", status
-                        ))
+                    # Slots that appear or disappear are the row's effect line.
+                    # Listing every id that stayed put buries them, so only a
+                    # pure reorder is described here.
+                    if old_ids != new_ids and set(old_ids) == set(new_ids):
+                        changes.append(f"{label_for(path)}: order changed")
                     old_by_id = {w["id"]: w for w in old_widgets}
                     for widget in new_widgets:
                         widget_id = widget["id"]
@@ -2421,7 +2803,7 @@ def summarize_file_diff(
         loc_sz = m_loc.group(1) if m_loc else None
         rep_sz = m_rep.group(1) if m_rep else None
         if loc_sz != rep_sz:
-            b_sz, a_sz = (loc_sz, rep_sz) if status in {"repo", "added-repo"} else (rep_sz, loc_sz)
+            b_sz, a_sz = (rep_sz, loc_sz) if status in {"local", "added-local"} else (loc_sz, rep_sz)
             old_str = f"{b_sz}px" if b_sz else None
             new_str = f"{a_sz}px" if a_sz else None
             changes.append(format_setting_change("Font base-size", old_str, new_str, status))
@@ -2431,17 +2813,17 @@ def summarize_file_diff(
         loc_sz, loc_fam = parse_terminal_font_settings(rel, local_text)
         rep_sz, rep_fam = parse_terminal_font_settings(rel, repo_text)
         if loc_sz != rep_sz and (loc_sz or rep_sz):
-            b_sz, a_sz = (loc_sz, rep_sz) if status in {"repo", "added-repo"} else (rep_sz, loc_sz)
+            b_sz, a_sz = (rep_sz, loc_sz) if status in {"local", "added-local"} else (loc_sz, rep_sz)
             changes.append(format_setting_change("Font size", b_sz, a_sz, status))
         if loc_fam != rep_fam and (loc_fam or rep_fam):
-            b_f, a_f = (loc_fam, rep_fam) if status in {"repo", "added-repo"} else (rep_fam, loc_fam)
+            b_f, a_f = (rep_fam, loc_fam) if status in {"local", "added-local"} else (loc_fam, rep_fam)
             changes.append(format_setting_change("Font", b_f, a_f, status))
 
     # 4. hypr/looknfeel.lua
     elif rel == "hypr/looknfeel.lua":
         loc_v = parse_lua_simple_vars(local_text)
         rep_v = parse_lua_simple_vars(repo_text)
-        before_v, after_v = (loc_v, rep_v) if status in {"repo", "added-repo"} else (rep_v, loc_v)
+        before_v, after_v = (rep_v, loc_v) if status in {"local", "added-local"} else (loc_v, rep_v)
 
         b_in = before_v.get("gaps_in")
         a_in = after_v.get("gaps_in")
@@ -2469,7 +2851,7 @@ def summarize_file_diff(
     elif rel == "hypr/input.lua":
         loc_v = parse_lua_simple_vars(local_text)
         rep_v = parse_lua_simple_vars(repo_text)
-        before_v, after_v = (loc_v, rep_v) if status in {"repo", "added-repo"} else (rep_v, loc_v)
+        before_v, after_v = (rep_v, loc_v) if status in {"local", "added-local"} else (loc_v, rep_v)
 
         b_kb = before_v.get("kb_layout")
         a_kb = after_v.get("kb_layout")
@@ -2498,14 +2880,14 @@ def summarize_file_diff(
         loc_t = m_loc.group(1) if m_loc else None
         rep_t = m_rep.group(1) if m_rep else None
         if loc_t != rep_t and (loc_t or rep_t):
-            b_t, a_t = (loc_t, rep_t) if status in {"repo", "added-repo"} else (rep_t, loc_t)
+            b_t, a_t = (rep_t, loc_t) if status in {"local", "added-local"} else (loc_t, rep_t)
             changes.append(format_setting_change("Night light", f"{b_t}K" if b_t else "off", f"{a_t}K" if a_t else "off", status))
 
     # 7. hypr/autostart.lua
     elif rel == "hypr/autostart.lua":
         loc_cmds = set(re.findall(r'o\.launch_on_start\(\s*"([^"]+)"\s*\)', local_text))
         rep_cmds = set(re.findall(r'o\.launch_on_start\(\s*"([^"]+)"\s*\)', repo_text))
-        before_c, after_c = (loc_cmds, rep_cmds) if status in {"repo", "added-repo"} else (rep_cmds, loc_cmds)
+        before_c, after_c = (rep_cmds, loc_cmds) if status in {"local", "added-local"} else (loc_cmds, rep_cmds)
         added_c = [c.split()[0] for c in sorted(after_c - before_c)]
         removed_c = [c.split()[0] for c in sorted(before_c - after_c)]
         if added_c:
@@ -3929,8 +4311,61 @@ def default_publish_status(status: str) -> bool:
     return status in {"local", "added-local", "differs"}
 
 
+def stale_upstream(repo: Path) -> str:
+    """The upstream ref when the clone is behind it and was not moved forward.
+
+    integrate_remote refuses to merge into a dirty clone. Comparing live files
+    to that stale clone makes every file the other machine already pushed look
+    like an edit made here.
+    """
+    if not (repo / ".git").exists():
+        return ""
+    upstream = git_out(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if not upstream:
+        return ""
+    counts = git_out(repo, "rev-list", "--left-right", "--count", f"HEAD...{upstream}").split()
+    if len(counts) != 2 or counts[1] == "0":
+        return ""
+    return upstream
+
+
+def upstream_file_hash(repo: Path, ref: str, rel: str) -> str | None:
+    result = run_git(repo, ["cat-file", "blob", f"{ref}:{rel}"], timeout=10)
+    if result.returncode != 0:
+        return None
+    return file_hash_bytes(rel, (result.stdout or "").encode("utf-8"))
+
+
+def stale_clone_fields(repo: Path, git_fields: dict[str, Any]) -> dict[str, Any] | None:
+    """Why the clone is still behind origin after the snapshot tried to catch up."""
+    if not git_fields.get("behind") or git_fields.get("conflicts"):
+        return None
+    dirty_files = []
+    if git_fields.get("dirty"):
+        # git_out strips the output, which eats the leading space of the first
+        # " M path" line, so split on whitespace instead of slicing columns.
+        for line in git_out(repo, "status", "--porcelain").splitlines()[:20]:
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) == 2:
+                dirty_files.append(parts[1])
+    if dirty_files:
+        reason = "The clone has uncommitted changes, so it was not moved forward."
+    elif git_fields.get("merge_error"):
+        reason = "Git could not merge origin into the clone."
+    else:
+        reason = "The clone has not caught up with origin yet."
+    return {
+        "behind": int(git_fields.get("behind") or 0),
+        "upstream": git_fields.get("upstream") or "",
+        "remote_head": git_fields.get("remote_head") or "",
+        "dirty_files": dirty_files,
+        "reason": reason,
+    }
+
+
 def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, Any]:
     stored = state.get("file_hashes") or {}
+    stale_ref = stale_upstream(repo)
     hidden_keys = set(state.get("hidden") or [])
     files = []
     counts = {
@@ -3944,9 +4379,20 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         "machine": 0,
         "changed": 0,
         "hidden": 0,
+        "already_pushed": 0,
     }
     for item in collect_inventory(ctx, repo):
         status = classify_file(item, stored.get(item["path"]))
+        if (
+            stale_ref
+            and status in {"local", "added-local", "both"}
+            and item["local_exists"]
+            and upstream_file_hash(repo, stale_ref, item["path"]) == item["local_hash"]
+        ):
+            # Origin already has this exact file; only the clone is behind.
+            status = "identical"
+            item["already_pushed"] = True
+            counts["already_pushed"] += 1
         merge = plan_merge(ctx, repo, item, stored.get(item["path"])) if status == "both" and is_mergeable_path(item) else None
         merge_note = ""
         if merge and not merge["overlaps"] and merge["same_as_local"]:
@@ -3990,15 +4436,28 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             # a unified preview per file on a machine with dozens of plugins
             # blows the 5 MiB JSON cap and makes Connect look like it failed.
             if is_bundled_path(item["path"]):
+                # The bundle row fetches these on demand: `bundle-diff <id>`.
                 item["preview"] = ""
+                item["effect"] = ""
                 item["semantic_summary"] = ""
                 item["changes"] = []
             else:
+                item["effect"] = file_effect(
+                    item["path"],
+                    Path(item["local_path"]),
+                    Path(item["repo_path"]),
+                    status,
+                    local_within=ctx.home,
+                    repo_within=repo,
+                )
+                if merge_note:
+                    item["effect"] = f"{item['effect']} · {merge_note}" if item["effect"] else merge_note
                 item["preview"] = unified_preview(
                     Path(item["local_path"]),
                     Path(item["repo_path"]),
                     local_within=ctx.home,
                     repo_within=repo,
+                    status=status,
                 )
                 sem_summary, changes = summarize_file_diff(
                     item["path"],
@@ -4008,16 +4467,33 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
                     local_within=ctx.home,
                     repo_within=repo,
                 )
+                if changes and item["path"] != SHELL_REL and status in {"repo", "added-repo", "local", "added-local"}:
+                    # A named setting ("Font size: 12 → 14") says more than a line count.
+                    side = "Apply: this machine gets" if status in {"repo", "added-repo"} else "Publish: the repo gets"
+                    item["effect"] = f"{side} {'; '.join(changes[:4])}" + (f" and {len(changes) - 4} more" if len(changes) > 4 else "")
+                    if merge_note:
+                        item["effect"] += f" · {merge_note}"
                 if merge_note:
                     sem_summary = f"{merge_note} · {sem_summary}" if sem_summary else merge_note
                 item["semantic_summary"] = sem_summary
                 item["changes"] = changes
+                if status == "both":
+                    local_text = read_text(Path(item["local_path"]), within=ctx.home) if item["local_exists"] else ""
+                    repo_text = read_text(Path(item["repo_path"]), within=repo) if item["repo_exists"] else ""
+                    merged_text = None
+                    if item["mergeable"] and merge is not None:
+                        try:
+                            merged_text = merge["merged"].decode("utf-8")
+                        except UnicodeDecodeError:
+                            merged_text = None
+                    item["choices"] = both_choice_results(local_text, repo_text, merged_text, item["merge_overlaps"])
                 if sem_summary:
                     item["summary"] = sem_summary
             if not item["hidden"]:
                 counts["changed"] += 1
         else:
             item["preview"] = ""
+            item["effect"] = ""
             item["semantic_summary"] = ""
             item["changes"] = []
         if not item["hidden"]:
@@ -4036,7 +4512,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
     )
     for s in shortcuts:
         s["hidden"] = is_hidden_item("s", s["keys"], hidden_keys)
-    drop_bindings_file_without_shortcut_diffs(files, counts, shortcuts)
+    drop_bindings_file_without_shortcut_diffs(files, counts, shortcuts, ctx, repo)
     plugins = plugin_groups(files)
     for plugin in plugins:
         manifest = load_json(repo / "plugins" / plugin["id"] / "manifest.json", default=None, within=repo) or load_json(
@@ -4079,6 +4555,8 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             "status": status,
             "semantic_summary": (name_item or {}).get("semantic_summary", ""),
             "changes": (name_item or {}).get("changes", []),
+            "effect": (name_item or {}).get("effect", ""),
+            "preview": (name_item or {}).get("preview", ""),
             "files": [f["path"] for f in theme_files],
             "custom": any(f["path"].startswith("omarchy/themes/") for f in theme_files),
             "default_apply": (status in {"repo", "added-repo", "differs"} or (name_item or {}).get("default_apply")) and not is_hidden_item("t", "selected", hidden_keys),
@@ -4104,14 +4582,29 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
     }
 
 
-def drop_bindings_file_without_shortcut_diffs(
-    files: list[dict[str, Any]], counts: dict[str, int], shortcuts: list[dict[str, Any]]
-) -> None:
-    """Ignore hypr/bindings.lua when every effective keybind already matches.
+# Lines in bindings.lua that parse_shortcuts does not model.
+UNREAD_BIND_PATTERNS = (
+    (r"\bbind_hold\s*\(", "o.bind_hold"),
+    (r"^(if|elseif)\b|^else$|^end$", "an if block"),
+    (r"^(local\s+)?function\b", "a function"),
+)
 
-    Comment, order, and cherry-pick-section drift still change the file hash, but
-    the Changes list is per-shortcut. Counting that file as incoming left the
-    header on "Incoming updates" with an empty review list.
+
+def drop_bindings_file_without_shortcut_diffs(
+    files: list[dict[str, Any]],
+    counts: dict[str, int],
+    shortcuts: list[dict[str, Any]],
+    ctx: Context | None = None,
+    repo: Path | None = None,
+) -> None:
+    """Keep hypr/bindings.lua as an unticked row, not pending, when every keybind matches.
+
+    Comment, order, and guard drift (an `if o.dictation_installed()` block, a
+    hold bind the parser does not model) still differ on disk. The file stays a
+    row with its diff and its Keep local / Take repo choices, so that drift can
+    be seen and settled, but nothing is ticked by default. It leaves the status
+    counts, so the badge does not read "Incoming updates" over a file whose
+    shortcuts already match.
     """
     if any(not s.get("hidden") for s in shortcuts):
         return
@@ -4122,22 +4615,53 @@ def drop_bindings_file_without_shortcut_diffs(
         if status in {"identical", "machine"}:
             return
         hidden = bool(item.get("hidden"))
-        item["status"] = "identical"
-        item["preview"] = ""
+        item["shortcuts_match"] = True
+        effect = "Shortcuts already match, so this row starts unticked; Keep local or Take repo copies the whole file"
+        if ctx is not None and repo is not None:
+            local_text = read_text(Path(item["local_path"]), within=ctx.home) if item.get("local_exists") else ""
+            repo_text = read_text(Path(item["repo_path"]), within=repo) if item.get("repo_exists") else ""
+            repo_lines, local_lines, moved = diff_only_lines(local_text, repo_text)
+            only_repo, only_local = len(repo_lines), len(local_lines)
+            # The shortcut reader skips bind_hold and cannot see a bind's if
+            # block, so "match" is only as good as the lines it reads.
+            unread = sorted({
+                label
+                for line in repo_lines + local_lines
+                for pattern, label in UNREAD_BIND_PATTERNS
+                if re.search(pattern, line)
+            })
+            if unread:
+                effect = (
+                    "The shortcuts the reader understands already match, so this row starts unticked. "
+                    f"Some differing lines are ones it does not read ({', '.join(unread)}), so check the diff"
+                )
+            bits = []
+            if only_local:
+                bits.append(f"{only_local} line{'s' if only_local != 1 else ''} only on this machine")
+            if only_repo:
+                bits.append(f"{only_repo} line{'s' if only_repo != 1 else ''} only in the repo")
+            if moved:
+                bits.append(f"{moved} line{'s' if moved != 1 else ''} only moved")
+            if bits:
+                effect += f". The text still differs: {', '.join(bits)}"
+        item["effect"] = effect
         item["default_apply"] = False
         item["default_publish"] = False
+        item["default_side"] = ""
         if hidden:
             counts["hidden"] = max(0, int(counts.get("hidden") or 0) - 1)
         else:
             counts["changed"] = max(0, int(counts.get("changed") or 0) - 1)
             counts[status] = max(0, int(counts.get(status) or 0) - 1)
-            counts["identical"] = int(counts.get("identical") or 0) + 1
+        counts["text_only"] = int(counts.get("text_only") or 0) + 1
         return
 
 
 def rollup_sync_state(git_fields: dict[str, Any], counts: dict[str, int], has_baseline: bool) -> str:
     if git_fields.get("conflicts"):
         return "conflicts"
+    if git_fields.get("stale_clone"):
+        return "stale"
     both = counts.get("both", 0)
     local_n = counts.get("local", 0) + counts.get("added-local", 0)
     repo_n = counts.get("repo", 0) + counts.get("added-repo", 0)
@@ -4186,6 +4710,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         fetch_error = fetch_repo(repo)
     git_fields = git_status_fields(repo, fetch_error)
     git_fields = integrate_remote(repo, git_fields)
+    git_fields["stale_clone"] = stale_clone_fields(repo, git_fields)
     validation = validate_repo(repo)
     empty = is_seedable_empty(repo)
     inspect = inspect_repo(ctx, repo, prefer_local=empty)
@@ -4981,7 +5506,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     list_rows = [
         row
         for row in diff.get("plugin_list") or []
-        if row["id"] in list_ids and row["status"] in {"local", "added-local"}
+        # A diverged row is only ever published by an explicit tick.
+        if row["id"] in list_ids and (row["status"] in {"local", "added-local"} or row.get("diverged"))
     ]
     wanted = parse_files_arg(args.files, explicit=explicit)
     if plugin_ids:
@@ -5251,7 +5777,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     list_plugins = [
         row["id"]
         for row in (diff.get("plugin_list") or [])
-        if side == "local" and not row.get("hidden") and row.get("status") in {"local", "added-local"}
+        if side == "local" and not row.get("hidden") and (row.get("status") in {"local", "added-local"} or row.get("diverged"))
     ]
 
     nested = argparse.Namespace(
@@ -5699,6 +6225,84 @@ def cmd_update_plugin(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return snap
 
 
+def cmd_checkout_plugin(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Check out the listed commit of a diverged git plugin on a new branch.
+
+    Never a fast-forward and never a reset: the branch this checkout was on
+    stays in the repo, so going back is `git switch <old branch>`.
+    """
+    pid = listed_plugin_arg(args)
+    repo = configured_repo(ctx)
+    entry = repo_plugin_list(repo).get(pid)
+    if not entry or not entry["commit"]:
+        raise SyncError(f"The repo's plugin list has no commit for {pid}.")
+    plugin_dir = ctx.config_plugins / pid
+    if plugin_dir.is_symlink() or not plugin_dir.is_dir() or not is_git_plugin_dir(plugin_dir):
+        raise SyncError(f"{pid} is not a git-installed plugin on this machine.")
+    commit = entry["commit"]
+    if not plugin_has_commit(plugin_dir, commit):
+        raise SyncError(f"This checkout of {pid} has never fetched {commit[:7]}. Fetch it in {plugin_dir} first.")
+    dirty = run_git(plugin_dir, [*PLUGIN_GIT_SAFE, "status", "--porcelain"], timeout=15)
+    if dirty.returncode != 0 or (dirty.stdout or "").strip():
+        raise SyncError(f"{pid} has uncommitted changes. Commit or stash them in {plugin_dir} first.")
+    previous = plugin_git_branch(plugin_dir) or plugin_git_commit(plugin_dir)[:7]
+    branch = f"config-sync/{commit[:7]}"
+    if run_git(plugin_dir, ["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], timeout=10).returncode == 0:
+        raise SyncError(f"{pid} already has a branch {branch}. Switch to it by hand: git -C {plugin_dir} switch {branch}")
+    run_git(plugin_dir, [*PLUGIN_GIT_SAFE, "switch", "-c", branch, commit], timeout=30, check=True)
+    snap = build_snapshot(ctx, fetch=False)
+    snap["message"] = (
+        f"{pid} is now on {branch} at {commit[:7]}. Its previous branch {previous} is still there. "
+        "Reload the shell to run the new code."
+    )
+    return snap
+
+
+MAX_BUNDLE_DIFF_FILES = 40
+
+
+def cmd_bundle_diff(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Per-file diffs for one bundle row (a plugin, hook folder, or bin).
+
+    The snapshot leaves these out to stay small; the panel asks for one bundle
+    when its row is opened. Only changed files are returned.
+    """
+    bundle_id = args.args[0] if args.args else ""
+    if not bundle_id or len(bundle_id) > 200:
+        raise SyncError("Pass the id of a bundle row.")
+    state = load_state(ctx)
+    repo = configured_repo(ctx, state)
+    diff = annotate_diff(ctx, repo, state)
+    bundle = next((b for b in file_bundles(diff["files"]) if b["id"] == bundle_id), None)
+    if not bundle:
+        raise SyncError(f"No pending changes in {bundle_id}.")
+    by_path = {f["path"]: f for f in diff["files"]}
+    out = []
+    for rel in bundle["files"][:MAX_BUNDLE_DIFF_FILES]:
+        item = by_path.get(rel)
+        if not item:
+            continue
+        local_path, repo_path = Path(item["local_path"]), Path(item["repo_path"])
+        out.append(
+            {
+                "path": rel,
+                "status": item["status"],
+                "removal": bool(item.get("removal")),
+                "effect": file_effect(rel, local_path, repo_path, item["status"], local_within=ctx.home, repo_within=repo),
+                "preview": unified_preview(local_path, repo_path, local_within=ctx.home, repo_within=repo, status=item["status"]),
+            }
+        )
+    return ok(
+        {
+            "bundle_diff": {
+                "id": bundle_id,
+                "files": out,
+                "more": max(0, len(bundle["files"]) - MAX_BUNDLE_DIFF_FILES),
+            }
+        }
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Omarchy config-sync backend")
     parser.add_argument(
@@ -5722,6 +6326,8 @@ def build_parser() -> argparse.ArgumentParser:
             "install-plugin",
             "update-plugin",
             "reinstall-plugin",
+            "checkout-plugin",
+            "bundle-diff",
         ],
     )
     parser.add_argument("args", nargs="*")
@@ -5779,6 +6385,10 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_update_plugin(ctx, args)
     if command == "reinstall-plugin":
         return cmd_reinstall_plugin(ctx, args)
+    if command == "checkout-plugin":
+        return cmd_checkout_plugin(ctx, args)
+    if command == "bundle-diff":
+        return cmd_bundle_diff(ctx, args)
     raise SyncError(f"Unknown command: {command}")
 
 

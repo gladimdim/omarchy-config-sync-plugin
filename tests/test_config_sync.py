@@ -22,6 +22,43 @@ import config_sync as cs  # noqa: E402
 
 OMARCHY_CONFIG = Path("/home/gladimdim/Github/omarchy-config")
 
+# Programs that act on the running desktop. Apply calls `hyprctl reload` and
+# `omarchy-shell shell reloadConfig`, which reload the live session the tests
+# run in: the bar blinks and typing is interrupted. The helper finds each one
+# with shutil.which, so the suite hides them. Tests that check a launch patch
+# the launcher itself.
+DESKTOP_PROGRAMS = {
+    "hyprctl",
+    "omarchy",
+    "omarchy-shell",
+    cs.PLUGIN_TERMINAL_LAUNCHER,
+    "uwsm-app",
+    "xdg-terminal-exec",
+    "xdg-open",
+    "dbus-send",
+    "nautilus",
+    "thunar",
+    "dolphin",
+    "nemo",
+    "pcmanfm",
+    "alacritty",
+    "kitty",
+    "ghostty",
+    "foot",
+}
+_real_which = shutil.which
+_desktop_guard = patch.object(
+    cs.shutil, "which", side_effect=lambda name, *a, **kw: None if name in DESKTOP_PROGRAMS else _real_which(name, *a, **kw)
+)
+
+
+def setUpModule() -> None:
+    _desktop_guard.start()
+
+
+def tearDownModule() -> None:
+    _desktop_guard.stop()
+
 
 def git_test_env() -> dict[str, str]:
     """Isolate test git from the host's global config and hooksPath.
@@ -342,7 +379,13 @@ class ShortcutTests(unittest.TestCase):
             snap = cs.cmd_snapshot(env.ctx, argparse_ns())
             self.assertEqual(snap["sync_state"], "in-sync", snap["status"].get("counts"))
             bindings = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/bindings.lua")
-            self.assertEqual(bindings["status"], "identical")
+            # The text still differs, so the file keeps its diff as a view-only
+            # row. It is not a pick and does not make the badge pending.
+            self.assertNotEqual(bindings["status"], "identical")
+            self.assertTrue(bindings["shortcuts_match"])
+            self.assertIn("+-- only a comment changed", bindings["preview"])
+            self.assertFalse(bindings["default_apply"])
+            self.assertFalse(bindings["default_publish"])
             self.assertEqual(snap["diff"]["shortcuts"], [])
             self.assertEqual(snap["status"]["repo_changes"], 0)
 
@@ -835,6 +878,34 @@ class FileMergeTests(unittest.TestCase):
             self.assertFalse(row["mergeable"])
             self.assertTrue(row["default_publish"])
             self.assertIn("Already has the repo's edits", row["semantic_summary"])
+
+    def test_both_row_shows_what_each_choice_changes_on_each_side(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            self._edit(local, "setting_2 = 2", "setting_2 = 20")
+            self._edit(repo / "hypr" / "looknfeel.lua", "setting_2 = 2", "setting_2 = 200")
+            self._edit(repo / "hypr" / "looknfeel.lua", "setting_11 = 11", "setting_11 = 110")
+            commit_all(repo, "Overlapping edit")
+            choices = self._file(env, "hypr/looknfeel.lua")["choices"]
+
+            # Keep local: this machine is untouched, the repo takes this machine's lines.
+            self.assertEqual(choices["local"]["here"], "")
+            self.assertIn("+setting_2 = 20", choices["local"]["repo"].splitlines())
+            self.assertIn("-setting_11 = 110", choices["local"]["repo"].splitlines())
+            # Take repo: the repo is untouched, this machine takes the repo's lines.
+            self.assertEqual(choices["repo"]["repo"], "")
+            self.assertIn("+setting_2 = 200", choices["repo"]["here"].splitlines())
+            # Merge: this machine gains only the repo's other edit; the overlap keeps this machine's.
+            merge = choices["merge"]
+            self.assertIn("+setting_11 = 110", merge["here"].splitlines())
+            self.assertNotIn("+setting_2 = 200", merge["here"].splitlines())
+            self.assertIn("-setting_2 = 200", merge["repo"].splitlines())
+            self.assertEqual(merge["overlaps"], ["1 overlapping edit"])
+
+            text = run_model(f"console.log(JSON.stringify(ctx.choiceDiffText({json.dumps(choices)}, 'merge')));")
+            self.assertIn("── Merge: this machine", text)
+            self.assertIn("── Merge: the repo", text)
+            self.assertIn("Merge keeps this machine's version there", text)
 
     def test_overlapping_edit_keeps_this_machine_and_is_not_ticked(self) -> None:
         with TempHome() as env:
@@ -2703,11 +2774,24 @@ class SemanticDiffTests(unittest.TestCase):
                 self.assertEqual(changes, [expected])
                 self.assertIn("+2, -2 lines", summary)
 
+    def test_both_sides_summary_puts_this_machine_first(self) -> None:
+        loc, rep = self.tmp / "local.lua", self.tmp / "repo.lua"
+        write(loc, "hl.general({ gaps_in = 5, gaps_out = 20 })\nhl.decoration({ rounding = 4 })\n")
+        write(rep, "hl.general({ gaps_in = 5, gaps_out = 10 })\nhl.decoration({ rounding = 8 })\n")
+        _, changes = cs.summarize_file_diff("hypr/looknfeel.lua", loc, rep, "both")
+        self.assertIn("Gaps: local 5/20 vs repo 5/10", changes)
+        self.assertIn("Corners: local 4px vs repo 8px", changes)
+        # One-sided rows still read old → new in the direction of the action.
+        _, incoming = cs.summarize_file_diff("hypr/looknfeel.lua", loc, rep, "repo")
+        self.assertIn("Corners: 4px → 8px", incoming)
+        _, outgoing = cs.summarize_file_diff("hypr/looknfeel.lua", loc, rep, "local")
+        self.assertIn("Corners: 8px → 4px", outgoing)
+
     def test_shell_widget_reorder_does_not_misattribute_settings(self) -> None:
         before = {"bar": {"layout": {"right": [{"id": "a", "size": 10}, {"id": "b", "size": 20}]}}}
         after = {"bar": {"layout": {"right": [{"id": "b", "size": 20}, {"id": "a", "size": 12}]}}}
         self.assertEqual(cs.extra_shell_changes(before, after, "local"), [
-            "Bar right widgets: a, b → b, a",
+            "Bar right: order changed",
             "Bar right · a · size: 10 → 12",
         ])
 
@@ -3859,6 +3943,332 @@ class BackupNameTests(unittest.TestCase):
                 self.assertNotIn(name, paths, "a backup file was offered for syncing")
             self.assertIn("omarchy/hooks/post-update.d/setup-agent.hook", paths)
             self.assertIn("plugins/demo.widget/Main.qml", paths)
+
+
+def run_model(script_body: str) -> dict:
+    """Load Model.js in node the way ModelJsTests does and print one JSON value."""
+    node = shutil.which("node")
+    if not node:
+        raise unittest.SkipTest("node not available")
+    script = f"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync({json.dumps(str(ROOT / "Model.js"))}, 'utf8').replace(/^\\.pragma\\s+library\\s*/m, '');
+const ctx = {{}};
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+{script_body}
+"""
+    proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+    return json.loads(proc.stdout.strip())
+
+
+def connect_and_apply(env: TempHome, repo: Path) -> None:
+    """Connect, then take everything the repo has so the baseline is set."""
+    cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+    applied = cs.cmd_apply(env.ctx, argparse_ns())
+    assert applied["ok"], applied
+    bundle = cs.cmd_apply(
+        env.ctx,
+        argparse_ns(
+            explicit=True,
+            files="bin/useful-tool,omarchy/hooks/post-update.d/setup-agent.hook",
+            plugin=["demo.widget"],
+        ),
+    )
+    assert bundle["ok"], bundle
+
+
+class ReviewRowDiffTests(unittest.TestCase):
+    """A person with no agent can read what a row changes, where, and the diff."""
+
+    def _file(self, snap: dict, rel: str) -> dict:
+        return next(f for f in snap["diff"]["files"] if f["path"] == rel)
+
+    def test_shell_json_row_carries_diff_and_names_what_appears_and_disappears(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            connect_and_apply(env, repo)
+            local_shell = env.ctx.config_omarchy / "shell.json"
+            data = json.loads(local_shell.read_text(encoding="utf-8"))
+            data["bar"]["layout"]["right"] = [{"id": "acme.basecamp"}]  # drops omarchy.audio
+            data["plugins"] = [{"id": "io.voxtype.settings"}]
+            data["bar"]["background"] = "none"
+            write(local_shell, json.dumps(data, indent=2) + "\n")
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            shell = self._file(snap, "omarchy/shell.json")
+            self.assertEqual(shell["status"], "local")
+            effect = shell["effect"]
+            self.assertTrue(effect.startswith("Publish: the repo gains"), effect)
+            self.assertIn("acme.basecamp bar slot (right)", effect)
+            self.assertIn("io.voxtype.settings plugin entry", effect)
+            self.assertIn("bar background opaque → none", effect)
+            self.assertIn("loses omarchy.audio bar slot (right)", effect)
+            # Slots that stayed put are not the effect.
+            self.assertNotIn("omarchy.menu", effect)
+            self.assertNotIn("omarchy.clock", effect)
+            lines = shell["preview"].splitlines()
+            # Outgoing, so the diff reads repo → this machine.
+            self.assertEqual(lines[:2], ["--- repo", "+++ this machine"])
+            self.assertTrue(any(l.startswith("-") and '"omarchy.audio"' in l for l in lines))
+            self.assertTrue(any(l.startswith("+") and '"acme.basecamp"' in l for l in lines))
+
+            # The panel row carries both, not only the semantic pills.
+            model_files = [f for f in snap["diff"]["files"] if f["path"] == "omarchy/shell.json"]
+            row = run_model(
+                f"const rows = ctx.buildOutgoingItems([], [], [], [], {json.dumps(model_files)}, [], {{}}, []);"
+                "console.log(JSON.stringify(rows[0]));"
+            )
+            self.assertEqual(row["effect"], effect)
+            self.assertEqual(row["preview"], shell["preview"])
+
+    def test_bindings_file_keeps_its_diff_as_a_view_only_row(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            connect_and_apply(env, repo)
+            local = env.ctx.config_hypr / "bindings.lua"
+            write(local, local.read_text(encoding="utf-8") + "if o.dictation_installed() then end\n")
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            bindings = self._file(snap, "hypr/bindings.lua")
+            self.assertNotEqual(bindings["status"], "identical")
+            self.assertTrue(bindings["shortcuts_match"])
+            self.assertIn("+if o.dictation_installed() then end", bindings["preview"])
+            row = run_model(
+                f"const rows = ctx.buildOutgoingItems([], [], [], [], {json.dumps([bindings])}, [], {{}}, []);"
+                "console.log(JSON.stringify(rows[0]));"
+            )
+            # Pickable, but unticked: Keep local / Take repo copy the whole file.
+            self.assertTrue(row["pickable"])
+            self.assertTrue(row["shortcutsMatch"])
+            self.assertIn("already match", row["effect"])
+            self.assertTrue(row["preview"])
+            self.assertFalse(bindings["default_publish"])
+            self.assertEqual(snap["sync_state"], "in-sync")
+
+            # Picking Keep local and publishing copies this machine's whole file.
+            published = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="hypr/bindings.lua"))
+            self.assertTrue(published["ok"], published)
+            self.assertIn("hypr/bindings.lua", published["published"])
+            self.assertEqual((repo / "hypr" / "bindings.lua").read_text(encoding="utf-8"), local.read_text(encoding="utf-8"))
+
+    def test_bundle_diff_returns_only_the_changed_files(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            connect_and_apply(env, repo)
+            hook = env.ctx.config_omarchy / "hooks" / "post-update.d" / "setup-agent.hook"
+            write(hook, "#!/bin/bash\necho changed\n")
+            # The snapshot keeps bundle previews out of the payload.
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            hook_item = self._file(snap, "omarchy/hooks/post-update.d/setup-agent.hook")
+            self.assertEqual(hook_item["preview"], "")
+            result = cs.cmd_bundle_diff(env.ctx, argparse_ns(args=["hooks:post-update.d"]))
+            self.assertTrue(result["ok"], result)
+            files = result["bundle_diff"]["files"]
+            self.assertEqual([f["path"] for f in files], ["omarchy/hooks/post-update.d/setup-agent.hook"])
+            self.assertIn("+echo changed", files[0]["preview"])
+            self.assertTrue(files[0]["effect"].startswith("Publish:"), files[0]["effect"])
+
+
+class DiffPaletteTests(unittest.TestCase):
+    def test_theme_green_and_red_color_the_diff_unless_they_are_too_close(self) -> None:
+        tokyo = 'accent = "#7aa2f7"\nred = "#f7768e"\ngreen = "#9ece6a"\nbright_green = "#b9f27c"\n'
+        hackerman = 'red = "#50f872"\ngreen = "#4fe88f"\n'
+        out = run_model(
+            f"console.log(JSON.stringify([ctx.diffPalette(ctx.parsePalette({json.dumps(tokyo)})),"
+            f" ctx.diffPalette(ctx.parsePalette({json.dumps(hackerman)})),"
+            " ctx.diffPalette(ctx.parsePalette('accent = \"#ffffff\"'))]));"
+        )
+        self.assertEqual(out[0], {"add": "#9ece6a", "remove": "#f7768e"})
+        self.assertIsNone(out[1])  # both "green": the panel's own pair is used
+        self.assertIsNone(out[2])  # no green or red in the file
+
+
+class MovedLineTests(unittest.TestCase):
+    """A bind that only moved is not a change on either side."""
+
+    LOCAL = 'o.bind("SUPER + B", "Browser", "b")\n-- note\no.bind("SUPER + A", "IkeA", "ikea")\n'
+    REPO = 'o.bind("SUPER + A", "IkeA", "ikea")\no.bind("SUPER + B", "Browser", "b")\n--- Disable a default\n'
+
+    def test_line_counts_separate_moved_lines(self) -> None:
+        only_repo, only_local, moved = cs.diff_line_counts(self.LOCAL, self.REPO)
+        self.assertEqual((only_repo, only_local, moved), (1, 1, 1))
+        effect = cs.line_effect(self.LOCAL, self.REPO, "repo")
+        self.assertEqual(effect, "Apply: this machine gains 1 line; loses 1 line; 1 line only moved")
+
+    def test_model_marks_moved_lines_and_reads_comment_removals_as_content(self) -> None:
+        preview = "--- this machine\n+++ repo\n@@ -1,3 +1,3 @@\n+o.bind(A)\n keep\n--- Disable a default\n-o.bind(A)\n+o.bind(F9)"
+        kinds = run_model(f"console.log(JSON.stringify(ctx.diffLines({json.dumps(preview)}).map(x => x.kind)));")
+        self.assertEqual(kinds, ["head", "head", "hunk", "moved", "same", "remove", "moved", "add"])
+
+
+class DiffLegendTests(unittest.TestCase):
+    def test_legend_names_the_sides_from_the_diff_header(self) -> None:
+        out = run_model(
+            "console.log(JSON.stringify(["
+            "ctx.diffLegend('--- this machine\\n+++ repo\\n@@'),"
+            "ctx.diffLegend('--- repo\\n+++ this machine\\n@@'),"
+            "ctx.diffLegend('Commits (x)\\ndiff --git a/P b/P\\n--- a/P.qml\\n+++ b/P.qml'),"
+            "ctx.diffLegend('── Take repo: this machine\\n--- this machine now\\n+++ this machine after Apply')]));"
+        )
+        self.assertTrue(out[0].startswith("+ green: only in the repo · − red: only on this machine"))
+        self.assertTrue(out[1].startswith("+ green: only on this machine · − red: only in the repo"))
+        self.assertTrue(out[2].startswith("+ green: only in the listed commit · − red: only on this machine"))
+        self.assertTrue(out[3].startswith("+ green: after the choice · − red: before it"))
+
+    def test_bindings_row_warns_about_lines_the_shortcut_reader_skips(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            connect_and_apply(env, repo)
+            local = env.ctx.config_hypr / "bindings.lua"
+            write(local, local.read_text(encoding="utf-8") + (
+                'if o.dictation_installed() then\n'
+                '  o.bind_hold("F9", "Start", "start", "Stop", "stop")\n'
+                'end\n'))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            bindings = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/bindings.lua")
+            self.assertTrue(bindings["shortcuts_match"])
+            self.assertIn("ones it does not read (an if block, o.bind_hold)", bindings["effect"])
+
+
+class StaleCloneTests(DivergedCloneTests):
+    """A clone stuck behind origin must not turn already-pushed files into local edits."""
+
+    test_snapshot_auto_merges_a_clean_divergence = None
+    test_apply_and_publish_are_not_blocked_by_a_clean_divergence = None
+    test_overlapping_edits_still_surface_per_file_conflicts = None
+    test_dirty_clone_reports_why_the_merge_was_skipped = None
+
+    def test_file_that_matches_origin_is_not_outgoing_when_a_dirty_marker_blocks_the_merge(self) -> None:
+        with TempHome() as env:
+            origin, clone = self._connect_to_shared_origin(env)
+            marker = clone / cs.MARKER_NAME
+            write(marker, json.dumps({"format": "omarchy-config", "version": 1}, indent=2) + "\n")
+            commit_all(clone, "add marker")
+            git(clone, "push", "-q", "origin", "main")
+            self.assertTrue(cs.cmd_apply(env.ctx, argparse_ns())["ok"])
+            pushed = "hl.decoration({ rounding = 12 })\n"
+            self._push_from_another_machine(env, origin, "hypr/looknfeel.lua", pushed)
+            # This machine already has the pushed file live (it was the publisher
+            # earlier, or the user copied it), and the clone has an uncommitted
+            # machine_local line in the marker.
+            write(env.ctx.config_hypr / "looknfeel.lua", pushed)
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            data["machine_local"] = ["omarchy/shell.toml"]
+            write(marker, json.dumps(data, indent=2) + "\n")
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns(fetch=True))
+            self.assertTrue(snap["ok"], snap)
+            looknfeel = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/looknfeel.lua")
+            self.assertNotIn(looknfeel["status"], {"local", "added-local", "both"})
+            self.assertTrue(looknfeel.get("already_pushed"))
+            self.assertEqual(snap["status"]["local_changes"], 0)
+            stale = snap["status"]["stale_clone"]
+            self.assertEqual(stale["behind"], 1)
+            self.assertIn(cs.MARKER_NAME, stale["dirty_files"])
+            self.assertEqual(snap["sync_state"], "stale")
+            # Nothing was committed or stashed in the user's clone.
+            self.assertIn(cs.MARKER_NAME, git(clone, "status", "--porcelain").stdout)
+            self.assertEqual(git(clone, "stash", "list").stdout.strip(), "")
+
+            hint = run_model(
+                f"console.log(JSON.stringify(ctx.stateHint('stale', {json.dumps(snap['status'])})));"
+            )
+            self.assertIn("1 commit behind origin", hint)
+            self.assertIn(cs.MARKER_NAME, hint)
+
+
+class DivergedPluginTests(unittest.TestCase):
+    """Two checkouts whose commits are not ancestors of each other."""
+
+    PID = "k53n0.browser-picker"
+    SOURCE = "https://github.com/k53n0/omarchy-browser-picker.git"
+
+    def _diverged_checkout(self, env: TempHome) -> tuple[Path, str, str]:
+        plugin = make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "0.3.0", self.SOURCE)
+        git(plugin, "switch", "-q", "-c", "picker-fix")
+        write(plugin / "Main.qml", "import QtQuick\nItem { /* other machine */ }\n")
+        commit_all(plugin, "fix on the other machine")
+        theirs = git(plugin, "rev-parse", "HEAD").stdout.strip()
+        git(plugin, "switch", "-q", "main")
+        write(plugin / "Main.qml", "import QtQuick\nItem { /* this machine */ }\n")
+        commit_all(plugin, "fix on this machine")
+        ours = git(plugin, "rev-parse", "HEAD").stdout.strip()
+        return plugin, ours, theirs
+
+    def _row(self, env: TempHome) -> dict:
+        snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+        return {r["id"]: r for r in snap["diff"]["plugin_list"]}[self.PID]
+
+    def test_neither_ancestor_is_a_diverged_row_not_newer_on_the_other_side(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            plugin, ours, theirs = self._diverged_checkout(env)
+            write_plugin_list(
+                repo,
+                [{"id": self.PID, "name": "Browser Picker", "version": "0.3.0", "commit": theirs,
+                  "branch": "picker-fix", "source": self.SOURCE}],
+            )
+            commit_all(repo, "list browser picker")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            row = self._row(env)
+            self.assertTrue(row["diverged"])
+            self.assertEqual(row["status"], "both")
+            self.assertEqual(row["action"], "checkout")  # never "update": no fast-forward exists
+            self.assertFalse(row["default_publish"])
+            self.assertIn("diverged", row["summary"])
+            for text in (ours[:7], theirs[:7], "on main", "on picker-fix"):
+                self.assertIn(text, row["summary"])
+            self.assertIn("< ", row["preview"])
+            self.assertIn("> ", row["preview"])
+            self.assertIn("+Item { /* other machine */ }", row["preview"])
+            self.assertIn("Check out", row["effect"])
+
+            model = run_model(
+                f"const rows = ctx.buildBothItems([], [], [], [], [], {{}}, {json.dumps([row])});"
+                "console.log(JSON.stringify(rows[0]));"
+            )
+            self.assertTrue(model["pickable"])
+            self.assertFalse(model["both"])  # no Keep local / Take repo buttons
+            self.assertEqual(model["preview"], row["preview"])
+
+            # Check out is explicit, lands on a new branch, and keeps main.
+            out = cs.cmd_checkout_plugin(env.ctx, argparse_ns(args=[self.PID]))
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(git(plugin, "rev-parse", "HEAD").stdout.strip(), theirs)
+            self.assertEqual(git(plugin, "branch", "--show-current").stdout.strip(), f"config-sync/{theirs[:7]}")
+            self.assertEqual(git(plugin, "rev-parse", "main").stdout.strip(), ours)
+
+    def test_unlisted_checkout_shows_the_diff_against_the_repos_copied_files(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "0.3.0", self.SOURCE)
+            write(repo / "plugins" / self.PID / "manifest.json", (env.ctx.config_plugins / self.PID / "manifest.json").read_text(encoding="utf-8"))
+            write(repo / "plugins" / self.PID / "Main.qml", "import QtQuick\nItem { /* other machine */ }\n")
+            commit_all(repo, "vendored copy from the other machine")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            row = self._row(env)
+            self.assertEqual(row["status"], "added-local")
+            self.assertIn("differ from this checkout in 1 file", row["summary"])
+            self.assertIn("── Main.qml", row["preview"])
+            self.assertIn("-Item { /* other machine */ }", row["preview"])
+            self.assertIn("+Item { /* 0.3.0 */ }", row["preview"])
+
+    def test_publishing_a_diverged_row_lists_this_machines_commit_and_branch(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            _, ours, theirs = self._diverged_checkout(env)
+            write_plugin_list(
+                repo,
+                [{"id": self.PID, "name": "Browser Picker", "version": "0.3.0", "commit": theirs, "source": self.SOURCE}],
+            )
+            commit_all(repo, "list browser picker")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            published = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", list_plugin=[self.PID]))
+            self.assertTrue(published["ok"], published)
+            entry = json.loads((repo / cs.PLUGIN_LIST_REL).read_text(encoding="utf-8"))["plugins"][0]
+            self.assertEqual((entry["commit"], entry["branch"]), (ours, "main"))
 
 
 if __name__ == "__main__":
