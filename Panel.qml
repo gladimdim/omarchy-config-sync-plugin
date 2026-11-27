@@ -2045,62 +2045,74 @@ Panel {
             id: hiddenRowBox
             required property var modelData
             width: parent.width
-            implicitHeight: hiddenRowInner.implicitHeight + Style.space(16)
+            implicitHeight: hiddenRowStack.implicitHeight + Style.space(16)
             radius: Style.cornerRadius
             color: root.cardBg
             border.width: 1
             border.color: root.cardBorder
 
-            Row {
-              id: hiddenRowInner
+            Column {
+              id: hiddenRowStack
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               anchors.leftMargin: Style.space(10)
               anchors.rightMargin: Style.space(10)
-              spacing: Style.space(10)
+              spacing: Style.space(6)
 
-              Column {
-                width: parent.width - unhideRowBtn.width - parent.spacing
-                spacing: 2
-                anchors.verticalCenter: parent.verticalCenter
+              Row {
+                id: hiddenRowInner
+                width: parent.width
+                spacing: Style.space(10)
 
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: (hiddenRowBox.modelData.typeLabel ? hiddenRowBox.modelData.typeLabel + "  ·  " : "") + hiddenRowBox.modelData.label
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  wrapMode: Text.WordWrap
-                }
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: {
-                    var st = Model.fileStatusLabel(hiddenRowBox.modelData.status, hiddenRowBox.modelData.removal)
-                    var sum = String(hiddenRowBox.modelData.summary || "")
-                    return (st ? st + " · " : "") + sum + " · Ignored"
+                Column {
+                  width: parent.width - unhideRowBtn.width - parent.spacing
+                  spacing: 2
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: (hiddenRowBox.modelData.typeLabel ? hiddenRowBox.modelData.typeLabel + "  ·  " : "") + hiddenRowBox.modelData.label
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    wrapMode: Text.WordWrap
                   }
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: {
+                      var st = Model.fileStatusLabel(hiddenRowBox.modelData.status, hiddenRowBox.modelData.removal)
+                      var sum = String(hiddenRowBox.modelData.summary || "")
+                      return (st ? st + " · " : "") + sum + " · Ignored"
+                    }
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
+                }
+
+                Button {
+                  id: unhideRowBtn
+                  text: "Unhide"
+                  iconText: "󰈈"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                  enabled: !root.busy
+                  onClicked: root.unhideItem(hiddenRowBox.modelData.kind, hiddenRowBox.modelData.itemId)
                 }
               }
 
-              Button {
-                id: unhideRowBtn
-                text: "Unhide"
-                iconText: "󰈈"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                anchors.verticalCenter: parent.verticalCenter
-                enabled: !root.busy
-                onClicked: root.unhideItem(hiddenRowBox.modelData.kind, hiddenRowBox.modelData.itemId)
+              // Hiding a row does not make the two sides the same: its diff stays readable.
+              RowDiff {
+                width: parent.width
+                item: hiddenRowBox.modelData
               }
             }
           }
