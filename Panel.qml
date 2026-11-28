@@ -20,6 +20,14 @@ Panel {
   readonly property color urgent: Color.urgent
   readonly property color muted: Color.muted
   readonly property color dim: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.65)
+  // Diff line colors come from the theme's own palette when it has a usable
+  // green and red; otherwise from a pair at the text's lightness.
+  property var themePalette: ({})
+  readonly property var diffPal: Model.diffPalette(themePalette)
+  readonly property real textLightness: Math.max(0.35, Math.min(0.72, foreground.hslLightness))
+  readonly property color diffAdd: diffPal ? diffPal.add : Qt.hsla(0.36, 0.55, textLightness, 1)
+  readonly property color diffRemove: diffPal ? diffPal.remove : Qt.hsla(0.0, 0.65, textLightness, 1)
+  readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")
   readonly property color cardBg: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.05)
   readonly property color cardBorder: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.12)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -46,7 +54,12 @@ Panel {
   property var bundleDiffs: []
   property var pluginListDiffs: []
   property var themeDiff: null
+  // Per-file diffs for bundle rows, fetched one bundle at a time on demand.
+  property var bundleDiffCache: ({})
+  property string bundleDiffLoading: ""
   property bool openOnChanges: false
+  // 0 normal, 1 half screen, 2 full screen. Cycled by the header button or "f".
+  property int sizeMode: 0
   property bool showingHidden: false
 
   readonly property bool configured: !!(status && status.configured)
@@ -63,7 +76,7 @@ Panel {
     }
     return raw
   }
-  readonly property bool alarming: syncState === "conflicts" || syncState === "diverged" || syncState === "invalid"
+  readonly property bool alarming: syncState === "conflicts" || syncState === "diverged" || syncState === "invalid" || syncState === "stale"
   readonly property bool pending: syncState === "ready" || syncState === "empty" || syncState === "remote-ahead" || syncState === "local-ahead" || alarming
   readonly property color stateColor: alarming ? urgent : (pending ? accent : foreground)
   readonly property var tabs: [
@@ -130,6 +143,8 @@ Panel {
   readonly property var bothBundles: Model.filesByStatus(bundleDiffs, ["both"])
   readonly property var incomingPluginList: Model.filesByStatus(pluginListDiffs, ["repo", "added-repo"])
   readonly property var outgoingPluginList: Model.filesByStatus(pluginListDiffs, ["local", "added-local"])
+  // Git plugins whose histories diverged: neither side is newer.
+  readonly property var bothPluginList: Model.filesByStatus(pluginListDiffs, ["both"])
   readonly property var incomingTheme: {
     if (!themeDiff) return []
     var st = String(themeDiff.status)
@@ -149,7 +164,7 @@ Panel {
   }
   readonly property var incomingItems: Model.buildIncomingItems(incomingTheme, incomingAddedShortcuts, incomingChangedShortcuts, incomingBundles, incomingFiles.concat(differsFiles), diffFiles, hiddenMap, incomingPluginList)
   readonly property var outgoingItems: Model.buildOutgoingItems(outgoingTheme, localAddedShortcuts, localChangedShortcuts, localBundles, localFiles, diffFiles, hiddenMap, outgoingPluginList)
-  readonly property var bothItems: Model.buildBothItems(bothTheme, bothShortcuts, bothBundles, bothFiles, diffFiles, hiddenMap)
+  readonly property var bothItems: Model.buildBothItems(bothTheme, bothShortcuts, bothBundles, bothFiles, diffFiles, hiddenMap, bothPluginList)
   readonly property var hiddenItems: Model.buildHiddenItems((themeDiff ? [themeDiff] : []), shortcutDiffs, bundleDiffs, diffFiles, diffFiles, hiddenMap, pluginListDiffs)
   readonly property int incomingCount: incomingItems.length
   readonly property int outgoingCount: outgoingItems.length
@@ -272,8 +287,11 @@ Panel {
       // Hooks/agents/branding/extensions/bin run code or steer an agent: same rule as plugins.
       next[key] = (key in picks) ? picks[key] : !!item.default_publish
     }
-    for (i = 0; i < outgoingPluginList.length; i++) {
-      item = outgoingPluginList[i]
+    // Diverged rows are listed too: publishing one replaces the commit another
+    // machine listed, so it is only ever an explicit tick (default_publish is false).
+    var listRows = outgoingPluginList.concat(bothPluginList)
+    for (i = 0; i < listRows.length; i++) {
+      item = listRows[i]
       key = pickId("l", item.id)
       next[key] = (key in picks) ? picks[key] : !!item.default_publish
     }
@@ -553,8 +571,9 @@ Panel {
   // Only outgoing rows are picks; installs and updates go through Omarchy.
   function selectedPublishListPlugins() {
     var out = []
-    for (var i = 0; i < outgoingItems.length; i++) {
-      var row = outgoingItems[i]
+    var rows = outgoingItems.concat(bothItems)
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
       if (row.kind === "l" && row.pickable !== false && isPicked("l", row.itemId)) out.push(row.itemId)
     }
     return out
@@ -564,6 +583,36 @@ Panel {
     if (action === "install") run(["install-plugin", id])
     else if (action === "update") run(["update-plugin", id])
     else if (action === "reinstall") run(["reinstall-plugin", id])
+    else if (action === "checkout") run(["checkout-plugin", id])
+  }
+
+  function loadBundleDiff(id) {
+    if (!id || bundleDiffCache[id] || diffProc.running) return
+    bundleDiffLoading = id
+    diffProc.command = ["python3", "-u", root.scriptPath, "bundle-diff", id]
+    diffProc.running = true
+  }
+
+  function storeBundleDiff(text) {
+    var id = bundleDiffLoading
+    bundleDiffLoading = ""
+    var entry = { files: [], more: 0, error: "" }
+    try {
+      var data = JSON.parse(String(text || "").trim())
+      if (data.ok && data.bundle_diff) {
+        entry.files = data.bundle_diff.files || []
+        entry.more = Number(data.bundle_diff.more || 0)
+      } else {
+        entry.error = String(data.error || "Could not load the diff.")
+      }
+    } catch (e) {
+      entry.error = "Could not load the diff."
+    }
+    var next = {}
+    var keys = Object.keys(bundleDiffCache)
+    for (var i = 0; i < keys.length; i++) next[keys[i]] = bundleDiffCache[keys[i]]
+    next[id] = entry
+    bundleDiffCache = next
   }
 
   function selectSide(kind, id, side) {
@@ -734,6 +783,7 @@ Panel {
     bundleDiffs = (data.diff && data.diff.bundles) ? data.diff.bundles : []
     pluginListDiffs = (data.diff && data.diff.plugin_list) ? data.diff.plugin_list : []
     themeDiff = (data.diff && data.diff.theme) ? data.diff.theme : null
+    bundleDiffCache = ({})
     if (data.sync_state && status)
       status = Object.assign({}, status, { sync_state: data.sync_state })
     if (!editingRepo && status.repo_url)
@@ -817,6 +867,7 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      paletteFile.reload()
       confirmKind = ""
       lastError = ""
       openOnChanges = true
@@ -849,6 +900,25 @@ Panel {
           root.run(next, nextStdin)
         }
       }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // Read on open, like the shell reads colors.toml at startup.
+  FileView {
+    id: paletteFile
+    path: root.stateHome + "/omarchy/current/theme/colors.toml"
+    watchChanges: false
+    printErrors: false
+    onLoaded: root.themePalette = Model.parsePalette(text())
+    onLoadFailed: root.themePalette = ({})
+  }
+
+  Process {
+    id: diffProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.storeBundleDiff(text)
     }
     stderr: StdioCollector { waitForEnd: true }
   }
@@ -899,8 +969,12 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(560))
-    contentHeight: panel.fittedContentHeight(Style.space(580))
+    // Normal, half the screen, or as large as the screen allows. The panel's
+    // fitted* functions clamp to what the screen has room for.
+    contentWidth: root.sizeMode === 0 ? panel.fittedContentWidth(Style.space(560))
+      : root.sizeMode === 1 ? panel.fittedContentWidth(Math.max(Style.space(560), panel.screenW / 2))
+      : panel.fittedContentWidth(100000)
+    contentHeight: root.sizeMode === 0 ? panel.fittedContentHeight(Style.space(580)) : panel.fittedContentHeight(100000)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -923,6 +997,7 @@ Panel {
         else if (t === "a" || t === "A") root.requestApply()
         else if (t === "p" || t === "P") root.requestPublish()
         else if (t === "c" || t === "C") root.reviewChanges()
+        else if (t === "f" || t === "F") root.sizeMode = (root.sizeMode + 1) % 3
         else if (t >= "1" && t <= String(root.tabs.length)) root.activeTab = parseInt(t) - 1
       }
 
@@ -1001,6 +1076,19 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(6)
             height: Math.max(btnRefresh.implicitHeight, btnEdit.implicitHeight, btnClose.implicitHeight)
+
+            Button {
+              id: btnSize
+              visible: root.configured
+              iconText: root.sizeMode === 2 ? "󰊔" : "󰊓"
+              tooltipText: root.sizeMode === 0 ? "Half screen (f)" : root.sizeMode === 1 ? "Full screen (f)" : "Normal size (f)"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              height: parent.height
+              onClicked: root.sizeMode = (root.sizeMode + 1) % 3
+            }
 
             Button {
               id: btnRefresh
@@ -1811,6 +1899,31 @@ Panel {
         }
       }
 
+      // A clone stuck behind origin: say so here, where the rows are read, and
+      // name the file that blocks it. Already-pushed files are not listed.
+      Rectangle {
+        visible: !root.showingHidden && root.syncState === "stale"
+        width: parent.width
+        implicitHeight: staleText.implicitHeight + Style.space(16)
+        radius: Style.cornerRadius
+        color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.12)
+        border.width: 1
+        border.color: root.urgent
+        Text {
+          id: staleText
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.margins: Style.space(10)
+          textFormat: Text.PlainText
+          text: Model.stateHint("stale", root.status)
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+      }
+
       ChangeSection {
         visible: !root.showingHidden && root.incomingItems.length > 0
         title: "Incoming"
@@ -1843,7 +1956,9 @@ Panel {
           textFormat: Text.PlainText
           text: root.hiddenCount > 0
             ? ("No active config differences (" + root.hiddenCount + " ignored).")
-            : "No portable config differences. This machine matches the repo."
+            : (root.syncState === "stale"
+              ? "Nothing else to review until the repo copy catches up with origin."
+              : "No portable config differences. This machine matches the repo.")
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -1930,62 +2045,74 @@ Panel {
             id: hiddenRowBox
             required property var modelData
             width: parent.width
-            implicitHeight: hiddenRowInner.implicitHeight + Style.space(16)
+            implicitHeight: hiddenRowStack.implicitHeight + Style.space(16)
             radius: Style.cornerRadius
             color: root.cardBg
             border.width: 1
             border.color: root.cardBorder
 
-            Row {
-              id: hiddenRowInner
+            Column {
+              id: hiddenRowStack
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               anchors.leftMargin: Style.space(10)
               anchors.rightMargin: Style.space(10)
-              spacing: Style.space(10)
+              spacing: Style.space(6)
 
-              Column {
-                width: parent.width - unhideRowBtn.width - parent.spacing
-                spacing: 2
-                anchors.verticalCenter: parent.verticalCenter
+              Row {
+                id: hiddenRowInner
+                width: parent.width
+                spacing: Style.space(10)
 
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: (hiddenRowBox.modelData.typeLabel ? hiddenRowBox.modelData.typeLabel + "  ·  " : "") + hiddenRowBox.modelData.label
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  wrapMode: Text.WordWrap
-                }
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: {
-                    var st = Model.fileStatusLabel(hiddenRowBox.modelData.status, hiddenRowBox.modelData.removal)
-                    var sum = String(hiddenRowBox.modelData.summary || "")
-                    return (st ? st + " · " : "") + sum + " · Ignored"
+                Column {
+                  width: parent.width - unhideRowBtn.width - parent.spacing
+                  spacing: 2
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: (hiddenRowBox.modelData.typeLabel ? hiddenRowBox.modelData.typeLabel + "  ·  " : "") + hiddenRowBox.modelData.label
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    wrapMode: Text.WordWrap
                   }
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: {
+                      var st = Model.fileStatusLabel(hiddenRowBox.modelData.status, hiddenRowBox.modelData.removal)
+                      var sum = String(hiddenRowBox.modelData.summary || "")
+                      return (st ? st + " · " : "") + sum + " · Ignored"
+                    }
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
+                }
+
+                Button {
+                  id: unhideRowBtn
+                  text: "Unhide"
+                  iconText: "󰈈"
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                  enabled: !root.busy
+                  onClicked: root.unhideItem(hiddenRowBox.modelData.kind, hiddenRowBox.modelData.itemId)
                 }
               }
 
-              Button {
-                id: unhideRowBtn
-                text: "Unhide"
-                iconText: "󰈈"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                anchors.verticalCenter: parent.verticalCenter
-                enabled: !root.busy
-                onClicked: root.unhideItem(hiddenRowBox.modelData.kind, hiddenRowBox.modelData.itemId)
+              // Hiding a row does not make the two sides the same: its diff stays readable.
+              RowDiff {
+                width: parent.width
+                item: hiddenRowBox.modelData
               }
             }
           }
@@ -2720,183 +2847,196 @@ Panel {
             readonly property string rowAction: String(modelData.action || "")
 
             width: catRoot.width
-            implicitHeight: catRowInner.implicitHeight + Style.space(16)
+            implicitHeight: catRowInnerStack.implicitHeight + Style.space(16)
             radius: Style.cornerRadius
             color: included ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : root.cardBg
             border.width: 2
             border.color: included ? root.accent : root.foreground
 
-            Row {
-              id: catRowInner
+            Column {
+              id: catRowInnerStack
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               anchors.leftMargin: Style.space(10)
               anchors.rightMargin: Style.space(10)
-              spacing: Style.space(10)
+              spacing: Style.space(6)
 
-              Rectangle {
-                width: 28
-                height: 28
-                radius: 4
-                anchors.verticalCenter: parent.verticalCenter
-                visible: catRowBox.pickable
-                color: catRowBox.included ? root.accent : Color.background
-                border.width: 2
-                border.color: root.foreground
+              Row {
+                id: catRowInner
+                width: parent.width
+                spacing: Style.space(10)
 
-                Text {
-                  textFormat: Text.PlainText
-                  anchors.centerIn: parent
-                  text: catRowBox.included ? "✓" : ""
-                  color: Color.background
-                  font.family: root.fontFamily
-                  font.pixelSize: 18
-                  font.bold: true
-                }
+                Rectangle {
+                  width: 28
+                  height: 28
+                  radius: 4
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: catRowBox.pickable
+                  color: catRowBox.included ? root.accent : Color.background
+                  border.width: 2
+                  border.color: root.foreground
 
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.togglePick(catRowBox.rowKind, catRowBox.rowId)
-                }
-              }
-
-              Column {
-                width: parent.width - (catRowBox.pickable ? 28 + catIncludeBtn.width : 0) - (catActionBtn.visible ? catActionBtn.width : 0) - catHideBtn.width - (catRowBox.rowBoth ? 168 : 0) - parent.spacing * (1 + (catRowBox.pickable ? 2 : 0) + (catActionBtn.visible ? 1 : 0) + (catRowBox.rowBoth ? 1 : 0))
-                spacing: 2
-                anchors.verticalCenter: parent.verticalCenter
-
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: (catRowBox.typeLabel ? catRowBox.typeLabel + "  ·  " : "") + catRowBox.rowLabel
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  wrapMode: Text.WordWrap
-                }
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: {
-                    var st = Model.fileStatusLabel(catRowBox.modelData.status, catRowBox.modelData.removal)
-                    var sum = catRowBox.rowSummary
-                    var verb = catRowBox.modelData.removal ? " · will delete" : " · will sync"
-                    if (!catRowBox.pickable) return Model.statusPrefix(st, sum) + sum
-                    return Model.statusPrefix(st, sum) + sum + (catRowBox.included ? verb : " · skipped")
+                  Text {
+                    textFormat: Text.PlainText
+                    anchors.centerIn: parent
+                    text: catRowBox.included ? "✓" : ""
+                    color: Color.background
+                    font.family: root.fontFamily
+                    font.pixelSize: 18
+                    font.bold: true
                   }
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.togglePick(catRowBox.rowKind, catRowBox.rowId)
+                  }
                 }
 
-                Flow {
-                  visible: catRowBox.modelData && catRowBox.modelData.changes && catRowBox.modelData.changes.length > 0
-                  width: parent.width
-                  spacing: Style.space(4)
-                  Repeater {
-                    model: (catRowBox.modelData && catRowBox.modelData.changes) ? catRowBox.modelData.changes : []
-                    Rectangle {
-                      radius: Style.cornerRadius > 0 ? Style.space(4) : 2
-                      color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
-                      border.width: 1
-                      border.color: root.accent
-                      implicitWidth: Math.min(parent.width, catChangeText.implicitWidth + Style.space(10))
-                      implicitHeight: catChangeText.implicitHeight + Style.space(4)
-                      Text {
-                        id: catChangeText
-                        anchors.centerIn: parent
-                        width: Math.max(0, parent.width - Style.space(10))
-                        wrapMode: Text.Wrap
-                        textFormat: Text.PlainText
-                        text: String(modelData)
-                        color: root.foreground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.bold: true
+                Column {
+                  width: parent.width - (catRowBox.pickable ? 28 + catIncludeBtn.width : 0) - (catActionBtn.visible ? catActionBtn.width : 0) - catHideBtn.width - (catRowChoices.visible ? catRowChoices.width : 0) - parent.spacing * (1 + (catRowBox.pickable ? 2 : 0) + (catActionBtn.visible ? 1 : 0) + (catRowChoices.visible ? 1 : 0))
+                  spacing: 2
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: (catRowBox.typeLabel ? catRowBox.typeLabel + "  ·  " : "") + catRowBox.rowLabel
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                  }
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: {
+                      var st = Model.fileStatusLabel(catRowBox.modelData.status, catRowBox.modelData.removal)
+                      var sum = catRowBox.rowSummary
+                      var verb = catRowBox.modelData.removal ? " · will delete" : " · will sync"
+                      if (!catRowBox.pickable) return Model.statusPrefix(st, sum) + sum
+                      return Model.statusPrefix(st, sum) + sum + (catRowBox.included ? verb : " · skipped")
+                    }
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
+
+                  Flow {
+                    visible: catRowBox.modelData && catRowBox.modelData.changes && catRowBox.modelData.changes.length > 0
+                    width: parent.width
+                    spacing: Style.space(4)
+                    Repeater {
+                      model: (catRowBox.modelData && catRowBox.modelData.changes) ? catRowBox.modelData.changes : []
+                      Rectangle {
+                        radius: Style.cornerRadius > 0 ? Style.space(4) : 2
+                        color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
+                        border.width: 1
+                        border.color: root.accent
+                        implicitWidth: Math.min(parent.width, catChangeText.implicitWidth + Style.space(10))
+                        implicitHeight: catChangeText.implicitHeight + Style.space(4)
+                        Text {
+                          id: catChangeText
+                          anchors.centerIn: parent
+                          width: Math.max(0, parent.width - Style.space(10))
+                          wrapMode: Text.Wrap
+                          textFormat: Text.PlainText
+                          text: String(modelData)
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                        }
                       }
                     }
                   }
                 }
-              }
 
-              Row {
-                visible: catRowBox.rowBoth && catRowBox.pickable
-                spacing: Style.space(4)
-                anchors.verticalCenter: parent.verticalCenter
+                Row {
+                  id: catRowChoices
+                  visible: catRowBox.rowBoth && catRowBox.pickable
+                  spacing: Style.space(4)
+                  anchors.verticalCenter: parent.verticalCenter
+                  Button {
+                    text: "Keep local"
+                    fontSize: Style.font.caption
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    selected: root.bothPicks[catRowBox.bothKey] === "local"
+                    bordered: true
+                    onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "local")
+                  }
+                  Button {
+                    text: "Take repo"
+                    fontSize: Style.font.caption
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    selected: root.bothPicks[catRowBox.bothKey] === "repo"
+                    bordered: true
+                    onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "repo")
+                  }
+                  Button {
+                    visible: !!catRowBox.modelData.mergeable
+                    text: "Merge"
+                    fontSize: Style.font.caption
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    selected: root.bothPicks[catRowBox.bothKey] === "merge"
+                    bordered: true
+                    onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "merge")
+                  }
+                }
+
                 Button {
-                  text: "Keep local"
-                  fontSize: Style.font.caption
+                  id: catActionBtn
+                  visible: catRowBox.rowAction !== ""
+                  text: Model.pluginActionLabel(catRowBox.rowAction)
+                  iconText: Model.pluginActionIcon(catRowBox.rowAction)
+                  tooltipText: Model.pluginActionTip(catRowBox.rowAction)
+                  bordered: true
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  selected: root.bothPicks[catRowBox.bothKey] === "local"
-                  bordered: true
-                  onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "local")
-                }
-                Button {
-                  text: "Take repo"
                   fontSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                  enabled: !root.busy
+                  onClicked: root.runPluginAction(catRowBox.rowAction, catRowBox.rowId)
+                }
+
+                Button {
+                  id: catIncludeBtn
+                  visible: catRowBox.pickable
+                  text: catRowBox.included ? "Included" : "Skip"
+                  selected: catRowBox.included
+                  bordered: true
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  selected: root.bothPicks[catRowBox.bothKey] === "repo"
-                  bordered: true
-                  onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "repo")
-                }
-                Button {
-                  visible: !!catRowBox.modelData.mergeable
-                  text: "Merge"
                   fontSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                  onClicked: root.togglePick(catRowBox.rowKind, catRowBox.rowId)
+                }
+
+                Button {
+                  id: catHideBtn
+                  text: "Hide"
+                  iconText: "󰈉"
+                  tooltipText: "Hide this change so it doesn't bother you"
+                  bordered: true
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  selected: root.bothPicks[catRowBox.bothKey] === "merge"
-                  bordered: true
-                  onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "merge")
+                  fontSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                  enabled: !root.busy
+                  onClicked: root.hideItem(catRowBox.rowKind, catRowBox.rowId)
                 }
               }
 
-              Button {
-                id: catActionBtn
-                visible: catRowBox.rowAction !== ""
-                text: Model.pluginActionLabel(catRowBox.rowAction)
-                iconText: Model.pluginActionIcon(catRowBox.rowAction)
-                tooltipText: Model.pluginActionTip(catRowBox.rowAction)
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                anchors.verticalCenter: parent.verticalCenter
-                enabled: !root.busy
-                onClicked: root.runPluginAction(catRowBox.rowAction, catRowBox.rowId)
-              }
-
-              Button {
-                id: catIncludeBtn
-                visible: catRowBox.pickable
-                text: catRowBox.included ? "Included" : "Skip"
-                selected: catRowBox.included
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                anchors.verticalCenter: parent.verticalCenter
-                onClicked: root.togglePick(catRowBox.rowKind, catRowBox.rowId)
-              }
-
-              Button {
-                id: catHideBtn
-                text: "Hide"
-                iconText: "󰈉"
-                tooltipText: "Hide this change so it doesn't bother you"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.caption
-                anchors.verticalCenter: parent.verticalCenter
-                enabled: !root.busy
-                onClicked: root.hideItem(catRowBox.rowKind, catRowBox.rowId)
+              // The effect and the diff get the full row width, not the text column.
+              RowDiff {
+                width: parent.width
+                item: catRowBox.modelData
               }
             }
 
@@ -3110,183 +3250,196 @@ Panel {
         readonly property string rowAction: String(modelData.action || "")
 
         width: sectionRoot.width
-        implicitHeight: rowInner.implicitHeight + Style.space(16)
+        implicitHeight: rowInnerStack.implicitHeight + Style.space(16)
         radius: Style.cornerRadius
         color: included ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : root.cardBg
         border.width: 2
         border.color: included ? root.accent : root.foreground
 
-        Row {
-          id: rowInner
+        Column {
+          id: rowInnerStack
           anchors.left: parent.left
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
           anchors.leftMargin: Style.space(10)
           anchors.rightMargin: Style.space(10)
-          spacing: Style.space(10)
+          spacing: Style.space(6)
 
-          Rectangle {
-            width: 28
-            height: 28
-            radius: 4
-            anchors.verticalCenter: parent.verticalCenter
-            visible: rowBox.pickable
-            color: rowBox.included ? root.accent : Color.background
-            border.width: 2
-            border.color: root.foreground
+          Row {
+            id: rowInner
+            width: parent.width
+            spacing: Style.space(10)
 
-            Text {
-              textFormat: Text.PlainText
-              anchors.centerIn: parent
-              text: rowBox.included ? "✓" : ""
-              color: Color.background
-              font.family: root.fontFamily
-              font.pixelSize: 18
-              font.bold: true
-            }
+            Rectangle {
+              width: 28
+              height: 28
+              radius: 4
+              anchors.verticalCenter: parent.verticalCenter
+              visible: rowBox.pickable
+              color: rowBox.included ? root.accent : Color.background
+              border.width: 2
+              border.color: root.foreground
 
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
-            }
-          }
-
-          Column {
-            width: parent.width - (rowBox.pickable ? 28 + includeBtn.width : 0) - (actionBtn.visible ? actionBtn.width : 0) - hideBtn.width - (rowBox.rowBoth ? 168 : 0) - parent.spacing * (1 + (rowBox.pickable ? 2 : 0) + (actionBtn.visible ? 1 : 0) + (rowBox.rowBoth ? 1 : 0))
-            spacing: 2
-            anchors.verticalCenter: parent.verticalCenter
-
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: (rowBox.typeLabel ? rowBox.typeLabel + "  ·  " : "") + rowBox.rowLabel
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-              wrapMode: Text.WordWrap
-            }
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: {
-                var st = Model.fileStatusLabel(rowBox.modelData.status, rowBox.modelData.removal)
-                var sum = rowBox.rowSummary
-                var verb = rowBox.modelData.removal ? " · will delete" : " · will sync"
-                if (!rowBox.pickable) return Model.statusPrefix(st, sum) + sum
-                return Model.statusPrefix(st, sum) + sum + (rowBox.included ? verb : " · skipped")
+              Text {
+                textFormat: Text.PlainText
+                anchors.centerIn: parent
+                text: rowBox.included ? "✓" : ""
+                color: Color.background
+                font.family: root.fontFamily
+                font.pixelSize: 18
+                font.bold: true
               }
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+              }
             }
 
-            Flow {
-              visible: rowBox.modelData && rowBox.modelData.changes && rowBox.modelData.changes.length > 0
-              width: parent.width
-              spacing: Style.space(4)
-              Repeater {
-                model: (rowBox.modelData && rowBox.modelData.changes) ? rowBox.modelData.changes : []
-                Rectangle {
-                  radius: Style.cornerRadius > 0 ? Style.space(4) : 2
-                  color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
-                  border.width: 1
-                  border.color: root.accent
-                  implicitWidth: Math.min(parent.width, changeText.implicitWidth + Style.space(10))
-                  implicitHeight: changeText.implicitHeight + Style.space(4)
-                  Text {
-                    id: changeText
-                    anchors.centerIn: parent
-                    width: Math.max(0, parent.width - Style.space(10))
-                    wrapMode: Text.Wrap
-                    textFormat: Text.PlainText
-                    text: String(modelData)
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
+            Column {
+              width: parent.width - (rowBox.pickable ? 28 + includeBtn.width : 0) - (actionBtn.visible ? actionBtn.width : 0) - hideBtn.width - (rowChoices.visible ? rowChoices.width : 0) - parent.spacing * (1 + (rowBox.pickable ? 2 : 0) + (actionBtn.visible ? 1 : 0) + (rowChoices.visible ? 1 : 0))
+              spacing: 2
+              anchors.verticalCenter: parent.verticalCenter
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: (rowBox.typeLabel ? rowBox.typeLabel + "  ·  " : "") + rowBox.rowLabel
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: {
+                  var st = Model.fileStatusLabel(rowBox.modelData.status, rowBox.modelData.removal)
+                  var sum = rowBox.rowSummary
+                  var verb = rowBox.modelData.removal ? " · will delete" : " · will sync"
+                  if (!rowBox.pickable) return Model.statusPrefix(st, sum) + sum
+                  return Model.statusPrefix(st, sum) + sum + (rowBox.included ? verb : " · skipped")
+                }
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Flow {
+                visible: rowBox.modelData && rowBox.modelData.changes && rowBox.modelData.changes.length > 0
+                width: parent.width
+                spacing: Style.space(4)
+                Repeater {
+                  model: (rowBox.modelData && rowBox.modelData.changes) ? rowBox.modelData.changes : []
+                  Rectangle {
+                    radius: Style.cornerRadius > 0 ? Style.space(4) : 2
+                    color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
+                    border.width: 1
+                    border.color: root.accent
+                    implicitWidth: Math.min(parent.width, changeText.implicitWidth + Style.space(10))
+                    implicitHeight: changeText.implicitHeight + Style.space(4)
+                    Text {
+                      id: changeText
+                      anchors.centerIn: parent
+                      width: Math.max(0, parent.width - Style.space(10))
+                      wrapMode: Text.Wrap
+                      textFormat: Text.PlainText
+                      text: String(modelData)
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
                   }
                 }
               }
             }
-          }
 
-          Row {
-            visible: rowBox.rowBoth && rowBox.pickable
-            spacing: Style.space(4)
-            anchors.verticalCenter: parent.verticalCenter
+            Row {
+              id: rowChoices
+              visible: rowBox.rowBoth && rowBox.pickable
+              spacing: Style.space(4)
+              anchors.verticalCenter: parent.verticalCenter
+              Button {
+                text: "Keep local"
+                fontSize: Style.font.caption
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                selected: root.bothPicks[rowBox.bothKey] === "local"
+                bordered: true
+                onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "local")
+              }
+              Button {
+                text: "Take repo"
+                fontSize: Style.font.caption
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                selected: root.bothPicks[rowBox.bothKey] === "repo"
+                bordered: true
+                onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "repo")
+              }
+              Button {
+                visible: !!rowBox.modelData.mergeable
+                text: "Merge"
+                fontSize: Style.font.caption
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                selected: root.bothPicks[rowBox.bothKey] === "merge"
+                bordered: true
+                onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "merge")
+              }
+            }
+
             Button {
-              text: "Keep local"
-              fontSize: Style.font.caption
+              id: actionBtn
+              visible: rowBox.rowAction !== ""
+              text: Model.pluginActionLabel(rowBox.rowAction)
+              iconText: Model.pluginActionIcon(rowBox.rowAction)
+              tooltipText: Model.pluginActionTip(rowBox.rowAction)
+              bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
-              selected: root.bothPicks[rowBox.bothKey] === "local"
-              bordered: true
-              onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "local")
-            }
-            Button {
-              text: "Take repo"
               fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              enabled: !root.busy
+              onClicked: root.runPluginAction(rowBox.rowAction, rowBox.rowId)
+            }
+
+            Button {
+              id: includeBtn
+              visible: rowBox.pickable
+              text: rowBox.included ? "Included" : "Skip"
+              selected: rowBox.included
+              bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
-              selected: root.bothPicks[rowBox.bothKey] === "repo"
-              bordered: true
-              onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "repo")
-            }
-            Button {
-              visible: !!rowBox.modelData.mergeable
-              text: "Merge"
               fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+            }
+
+            Button {
+              id: hideBtn
+              text: "Hide"
+              iconText: "󰈉"
+              tooltipText: "Hide this change so it doesn't bother you"
+              bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
-              selected: root.bothPicks[rowBox.bothKey] === "merge"
-              bordered: true
-              onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "merge")
+              fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              enabled: !root.busy
+              onClicked: root.hideItem(rowBox.rowKind, rowBox.rowId)
             }
           }
 
-          Button {
-            id: actionBtn
-            visible: rowBox.rowAction !== ""
-            text: Model.pluginActionLabel(rowBox.rowAction)
-            iconText: Model.pluginActionIcon(rowBox.rowAction)
-            tooltipText: Model.pluginActionTip(rowBox.rowAction)
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            anchors.verticalCenter: parent.verticalCenter
-            enabled: !root.busy
-            onClicked: root.runPluginAction(rowBox.rowAction, rowBox.rowId)
-          }
-
-          Button {
-            id: includeBtn
-            visible: rowBox.pickable
-            text: rowBox.included ? "Included" : "Skip"
-            selected: rowBox.included
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            anchors.verticalCenter: parent.verticalCenter
-            onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
-          }
-
-          Button {
-            id: hideBtn
-            text: "Hide"
-            iconText: "󰈉"
-            tooltipText: "Hide this change so it doesn't bother you"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            anchors.verticalCenter: parent.verticalCenter
-            enabled: !root.busy
-            onClicked: root.hideItem(rowBox.rowKind, rowBox.rowId)
+          // The effect and the diff get the full row width, not the text column.
+          RowDiff {
+            width: parent.width
+            item: rowBox.modelData
           }
         }
 
@@ -3296,6 +3449,145 @@ Panel {
           enabled: rowBox.pickable
           cursorShape: Qt.PointingHandCursor
           onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+        }
+      }
+    }
+  }
+
+  // The row's effect line and its evidence: the file diff, the commit diff of
+  // a git plugin, or (for a bundle) the diffs of the files that changed,
+  // loaded only when opened so the snapshot stays small.
+  component RowDiff: Column {
+    id: diffRoot
+    property var item: null
+    property bool open: false
+    readonly property string effect: item ? String(item.effect || "") : ""
+    readonly property string preview: item ? String(item.preview || "") : ""
+    readonly property bool lazy: !!(item && item.lazyDiff)
+    readonly property string bundleId: item ? String(item.itemId || "") : ""
+    readonly property var bundleEntry: lazy ? root.bundleDiffCache[bundleId] : null
+    readonly property bool hasDiff: preview !== "" || lazy
+    // On a both-sides row, the picked choice's result replaces the plain diff.
+    readonly property var choices: item ? item.choices : null
+    readonly property string choiceKey: {
+      if (!item) return ""
+      var k = String(item.kind || "f") === "f" ? String(item.itemId || "") : (item.kind + ":" + item.itemId)
+      return String(root.bothPicks[k] || "")
+    }
+    readonly property bool showingChoice: !!(choices && choiceKey && choices[choiceKey])
+    spacing: Style.space(4)
+    visible: effect !== "" || hasDiff
+
+    // "Take repo: …" and "Keep local: …" each get a line of their own.
+    Repeater {
+      model: diffRoot.effect ? diffRoot.effect.split(" · ") : []
+      Text {
+        required property string modelData
+        width: diffRoot.width
+        textFormat: Text.PlainText
+        text: modelData
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: modelData.indexOf(":") > 0 && modelData.indexOf(":") < 12
+        wrapMode: Text.WordWrap
+      }
+    }
+
+    Text {
+      visible: diffRoot.hasDiff
+      textFormat: Text.PlainText
+      text: (diffRoot.open ? "▼ Hide " : "▶ Show ")
+        + (diffRoot.showingChoice ? "what " + diffRoot.choices[diffRoot.choiceKey].label + " changes" : "diff")
+      color: root.accent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: {
+          diffRoot.open = !diffRoot.open
+          if (diffRoot.open && diffRoot.lazy) root.loadBundleDiff(diffRoot.bundleId)
+        }
+      }
+    }
+
+    readonly property string diffBody: {
+      if (diffRoot.showingChoice) return Model.choiceDiffText(diffRoot.choices, diffRoot.choiceKey)
+      if (!diffRoot.lazy) return diffRoot.preview
+      var e = diffRoot.bundleEntry
+      if (!e) return "Loading…"
+      if (e.error) return e.error
+      var parts = []
+      for (var i = 0; i < e.files.length; i++) {
+        var f = e.files[i]
+        parts.push("── " + f.path + (f.effect ? "  ·  " + f.effect : ""))
+        parts.push(f.preview || "(no text diff)")
+      }
+      if (e.more > 0) parts.push("… " + e.more + " more changed files")
+      return parts.join("\n")
+    }
+
+    Text {
+      visible: diffRoot.open
+      width: parent.width
+      textFormat: Text.PlainText
+      text: (diffRoot.choices && !diffRoot.showingChoice
+          ? "Pick Keep local, Take repo or Merge to see what that choice changes on each side. "
+          : "")
+        + Model.diffLegend(diffRoot.diffBody)
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+    readonly property color addColor: root.diffAdd
+    readonly property color removeColor: root.diffRemove
+
+    Rectangle {
+      visible: diffRoot.open
+      width: parent.width
+      implicitHeight: diffLines.implicitHeight + Style.space(12)
+      radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+      color: Color.background
+      border.width: 1
+      border.color: root.cardBorder
+
+      Column {
+        id: diffLines
+        x: Style.space(6)
+        y: Style.space(6)
+        width: parent.width - Style.space(12)
+        Repeater {
+          model: diffRoot.open ? Model.diffLines(diffRoot.diffBody) : []
+          Rectangle {
+            required property var modelData
+            readonly property string kind: modelData.kind
+            width: diffLines.width
+            implicitHeight: lineText.implicitHeight
+            color: kind === "add" ? Qt.rgba(diffRoot.addColor.r, diffRoot.addColor.g, diffRoot.addColor.b, 0.12)
+              : kind === "remove" ? Qt.rgba(diffRoot.removeColor.r, diffRoot.removeColor.g, diffRoot.removeColor.b, 0.12)
+              : "transparent"
+            Text {
+              id: lineText
+              x: Style.space(2)
+              width: parent.width - Style.space(4)
+              textFormat: Text.PlainText
+              wrapMode: Text.WrapAnywhere
+              font.family: "monospace"
+              font.pixelSize: Style.font.caption
+              font.bold: parent.kind === "head"
+              // A moved line shows ↕ in place of its +/- sign.
+              text: parent.kind === "moved" ? "↕" + parent.modelData.text.substring(1) : (parent.modelData.text === "" ? " " : parent.modelData.text)
+              color: parent.kind === "moved" ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.45)
+                : parent.kind === "add" ? diffRoot.addColor
+                : parent.kind === "remove" ? diffRoot.removeColor
+                : parent.kind === "hunk" ? root.accent
+                : parent.kind === "head" ? root.dim
+                : root.foreground
+            }
+          }
         }
       }
     }

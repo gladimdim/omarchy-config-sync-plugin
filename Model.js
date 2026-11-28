@@ -20,6 +20,7 @@ function stateTitle(state) {
     case "remote-ahead": return "Incoming updates"
     case "diverged": return "Both sides changed"
     case "conflicts": return "Merge conflicts"
+    case "stale": return "Repo copy is behind"
     case "invalid": return "Not an Omarchy config"
     case "not-configured": return "Not linked"
     default: return "Omarchy Config Sync"
@@ -48,11 +49,28 @@ function stateHint(state, status) {
       return "This machine and the repo both moved. Review Changes to pick a side item by item, or Resync from repo to make this machine match git (usual on a second machine)."
     case "conflicts":
       return "Git could not merge automatically. Keep the local copy or take the incoming copy for each conflicted file."
+    case "stale":
+      return staleHint(status && status.stale_clone)
     case "invalid":
       return "The linked git repo is missing Hyprland / Omarchy config files."
     default:
       return "Paste the git URL of your omarchy-config repo to get started."
   }
+}
+
+// The clone is behind origin and was not moved forward. Say why, and name the
+// files that block it, so nobody reads already-pushed files as local edits.
+function staleHint(stale) {
+  var s = stale || {}
+  var n = Number(s.behind || 0)
+  var text = "The local copy of the repo is " + n + (n === 1 ? " commit" : " commits") + " behind origin"
+  if (s.remote_head) text += " (" + s.remote_head + ")"
+  text += ". " + String(s.reason || "")
+  var dirty = s.dirty_files || []
+  if (dirty.length > 0)
+    text += " Uncommitted in the clone: " + dirty.join(", ") + ". Commit or discard them there, then Refresh."
+  text += " Files that already match origin are not listed as local changes."
+  return text
 }
 
 function fileStatusLabel(status, removal) {
@@ -132,8 +150,37 @@ function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCo
     // Rows with an action (Install/Update) are buttons, not Apply/Publish picks.
     pickable: true,
     action: "",
-    changes: changes || []
+    changes: changes || [],
+    // One line: what Apply or Publish changes, and on which machine.
+    effect: "",
+    // The unified diff (files) or commit log and diff (git plugins).
+    preview: "",
+    // Bundle rows load their per-file diffs on demand (bundle-diff).
+    lazyDiff: false
   }
+}
+
+function withDiff(row, src) {
+  row.effect = String((src && src.effect) || "")
+  row.preview = String((src && src.preview) || "")
+  // Both-sides files: what Keep local, Take repo and Merge each change.
+  row.choices = (src && src.choices) ? src.choices : null
+  return row
+}
+
+// The diff text for one both-sides choice: this machine, then the repo.
+function choiceDiffText(choices, side) {
+  var c = choices && choices[side]
+  if (!c) return ""
+  var parts = []
+  parts.push("── " + c.label + ": this machine")
+  parts.push(c.here || "(no change here)")
+  parts.push("── " + c.label + ": the repo")
+  parts.push(c.repo || "(no change in the repo)")
+  var o = c.overlaps || []
+  if (o.length > 0)
+    parts.push("── Both machines changed " + o.join(", ") + "; Merge keeps this machine's version there")
+  return parts.join("\n")
 }
 
 function unbundledFiles(files) {
@@ -262,7 +309,7 @@ function appendThemes(out, list, hiddenMap) {
     var t = rows[i]
     var id = t.id || "selected"
     if (isItemHidden("t", id, hiddenMap, t)) continue
-    out.push(reviewItem("t", id, t.display || t.slug, t.semantic_summary || t.slug, t.status, "Theme", t.status === "both", 0, false, t.changes || []))
+    out.push(withDiff(reviewItem("t", id, t.display || t.slug, t.semantic_summary || t.slug, t.status, "Theme", t.status === "both", 0, false, t.changes || []), t))
   }
 }
 
@@ -284,6 +331,19 @@ function appendShortcuts(out, list, summaryField, both, hiddenMap) {
   }
 }
 
+function bundleEffect(b) {
+  var n = Number(b.changed_count || 0)
+  var files = n + (n === 1 ? " file" : " files")
+  var st = String(b.status || "")
+  if (b.removal) {
+    if (st === "local" || st === "added-local") return "Publish: the repo loses " + files
+    return "Apply: this machine loses " + files
+  }
+  if (st === "repo" || st === "added-repo") return "Apply: this machine gets " + files + " from the repo"
+  if (st === "local" || st === "added-local") return "Publish: the repo gets " + files + " from this machine"
+  return files + " differ · open the diff to compare"
+}
+
 function appendBundles(out, list, both, hiddenMap) {
   var rows = list || []
   for (var i = 0; i < rows.length; i++) {
@@ -294,6 +354,8 @@ function appendBundles(out, list, both, hiddenMap) {
     var sum = b.summary || (n + (n === 1 ? " file" : " files"))
     var bundleRow = reviewItem("g", b.id, b.name || b.plugin_id || b.id, sum, b.status, typeLabel, both || b.status === "both", n, false)
     bundleRow.removal = !!b.removal
+    bundleRow.lazyDiff = true
+    bundleRow.effect = bundleEffect(b)
     out.push(bundleRow)
   }
 }
@@ -304,8 +366,12 @@ function pluginListItem(p, hidden) {
   var row = reviewItem("l", p.id, p.name || p.id, p.summary || "", p.status, "Plugin", false, 0, hidden)
   row.removal = !!p.removal
   row.action = String(p.action || "")
-  row.pickable = p.status === "local" || p.status === "added-local"
-  return row
+  // A diverged row is a Publish pick (list this machine's commit) and has a
+  // Check out button; it never gets Keep local / Take repo file buttons.
+  row.both = false
+  row.diverged = !!p.diverged
+  row.pickable = p.status === "local" || p.status === "added-local" || row.diverged
+  return withDiff(row, p)
 }
 
 function appendPluginList(out, list, hiddenMap) {
@@ -328,6 +394,10 @@ function appendLooseFiles(out, files, both, hiddenMap) {
     var fileRow = reviewItem("f", p, p, sum, f.status, "File", both || f.status === "both", 0, false, f.changes || [])
     fileRow.removal = !!f.removal
     fileRow.mergeable = !!f.mergeable
+    withDiff(fileRow, f)
+    // A bindings.lua whose shortcuts already match keeps its choices; the
+    // backend leaves it unticked (default_apply/default_publish false).
+    fileRow.shortcutsMatch = !!f.shortcuts_match
     out.push(fileRow)
   }
 }
@@ -354,11 +424,12 @@ function buildOutgoingItems(theme, addedShortcuts, changedShortcuts, bundles, fi
   return out
 }
 
-function buildBothItems(theme, shortcuts, bundles, files, allFiles, hiddenMap) {
+function buildBothItems(theme, shortcuts, bundles, files, allFiles, hiddenMap, pluginList) {
   var out = []
   appendThemes(out, theme, hiddenMap)
   appendShortcuts(out, shortcuts, "label", true, hiddenMap)
   appendBundles(out, bundles, true, hiddenMap)
+  appendPluginList(out, pluginList, hiddenMap)
   appendLooseFiles(out, files, true, hiddenMap)
   return out
 }
@@ -451,20 +522,126 @@ function relativeAgo(iso) {
 
 function pluginActionLabel(action) {
   if (action === "update") return "Update"
+  if (action === "checkout") return "Check out"
   if (action === "reinstall") return "Reinstall"
   return "Install"
 }
 
 function pluginActionIcon(action) {
   if (action === "update") return "󰚰"
+  if (action === "checkout") return "󰘬"
   if (action === "reinstall") return "󰑐"
   return "󰏗"
 }
 
 function pluginActionTip(action) {
   if (action === "update") return "Open Omarchy's plugin updater in a terminal"
+  if (action === "checkout") return "Check out the repo's commit on a new branch here; the current branch stays"
   if (action === "reinstall") return "Move this plain copy to a backup and install it from git in a terminal"
   return "Open Omarchy's plugin installer in a terminal"
+}
+
+// Each diff line with what it is, for coloring. Header lines (---, +++,
+// diff --git, index) only count before a file's first @@: after that a
+// removed "-- comment" line is content, not a header. A line removed in one
+// place and added in another (same text) is "moved", so the real
+// differences stand out.
+function diffLines(text) {
+  var lines = String(text || "").split("\n")
+  var out = []
+  var inHeader = true
+  var section = ""
+  var removed = {}, added = {}
+  var i, line, kind, body
+  for (i = 0; i < lines.length; i++) {
+    line = lines[i]
+    if (line.indexOf("diff --git") === 0 || line.indexOf("── ") === 0 || line.indexOf("Diff from") === 0) { inHeader = true; section = "diff"; kind = "head" }
+    else if (line.indexOf("Commits (") === 0) { inHeader = false; section = "log"; kind = "head" }
+    else if (inHeader && (line.indexOf("--- ") === 0 || line.indexOf("+++ ") === 0 || line.indexOf("index ") === 0 || line.indexOf("new file") === 0 || line.indexOf("deleted file") === 0)) kind = "head"
+    else if (line.indexOf("@@") === 0) { inHeader = false; section = "diff"; kind = "hunk" }
+    else if (section === "log" && line.indexOf("> ") === 0) kind = "add"
+    else if (section === "log" && line.indexOf("< ") === 0) kind = "remove"
+    else if (!inHeader && line.charAt(0) === "+") kind = "add"
+    else if (!inHeader && line.charAt(0) === "-") kind = "remove"
+    else kind = "same"
+    if (section !== "log" && (kind === "add" || kind === "remove")) {
+      body = line.substring(1).trim()
+      if (body) {
+        var bag = kind === "add" ? added : removed
+        bag[body] = (bag[body] || 0) + 1
+      }
+    }
+    out.push({ text: line, kind: kind, section: section })
+  }
+  for (i = 0; i < out.length; i++) {
+    var o = out[i]
+    if (o.section === "log" || (o.kind !== "add" && o.kind !== "remove")) continue
+    body = o.text.substring(1).trim()
+    if (!body) continue
+    var other = o.kind === "add" ? removed : added
+    if (other[body] > 0) o.kind = "moved"
+  }
+  return out
+}
+
+// What the colors mean for this diff, from its own --- / +++ names. A choice
+// preview compares now with after; a plain row compares two machines.
+function diffSide(name) {
+  var n = String(name || "").trim()
+  if (n === "this machine" || n.indexOf("a/") === 0) return "on this machine"
+  if (n === "repo") return "in the repo"
+  if (n.indexOf("b/") === 0) return "in the listed commit"
+  return "in " + n
+}
+
+function diffLegend(text) {
+  var t = String(text || "")
+  var moved = " · ↕ same line, only moved"
+  if (t.indexOf("── ") === 0 && t.indexOf(" after ") >= 0)
+    return "+ green: after the choice · − red: before it" + moved
+  var from = t.match(/^--- (.+)$/m), to = t.match(/^\+\+\+ (.+)$/m)
+  if (from && to) return "+ green: only " + diffSide(to[1]) + " · − red: only " + diffSide(from[1]) + moved
+  return "+ green: added · − red: removed" + moved
+}
+
+// The active theme's colors.toml as { name: "#rrggbb" }. Every stock Omarchy
+// theme names a green and a red there; the shell only exposes red (as urgent).
+function parsePalette(raw) {
+  var out = {}
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^\s*([A-Za-z0-9_-]+)\s*=\s*["']?(#[0-9A-Fa-f]{6})/)
+    if (m) out[m[1]] = m[2].toLowerCase()
+  }
+  return out
+}
+
+function hexHueSat(hex) {
+  var x = parseInt(String(hex).substring(1), 16)
+  var r = ((x >> 16) & 255) / 255, g = ((x >> 8) & 255) / 255, b = (x & 255) / 255
+  var max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min
+  var l = (max + min) / 2
+  var sat = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1))
+  var hue = 0
+  if (d !== 0) {
+    if (max === r) hue = 60 * (((g - b) / d) % 6)
+    else if (max === g) hue = 60 * ((b - r) / d + 2)
+    else hue = 60 * ((r - g) / d + 4)
+  }
+  return { hue: (hue + 360) % 360, sat: sat }
+}
+
+// Diff colors from the theme: its green for added lines, its red for removed.
+// Some themes make the two grey or nearly the same hue (hackerman, white,
+// lumon); then null, and the panel falls back to its own pair.
+function diffPalette(palette) {
+  var p = palette || {}
+  if (!p.green || !p.red) return null
+  var g = hexHueSat(p.green), r = hexHueSat(p.red)
+  var apart = Math.abs(g.hue - r.hue)
+  apart = Math.min(apart, 360 - apart)
+  if (g.sat < 0.15 || r.sat < 0.15 || apart < 60) return null
+  return { add: p.green, remove: p.red }
 }
 
 // Repo URL field: a local path, HTTPS/SSH URL, or owner/repo never needs more.
