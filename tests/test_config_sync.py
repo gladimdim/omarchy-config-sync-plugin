@@ -4255,6 +4255,43 @@ class DivergedPluginTests(unittest.TestCase):
             self.assertIn("-Item { /* other machine */ }", row["preview"])
             self.assertIn("+Item { /* 0.3.0 */ }", row["preview"])
 
+    def _unlisted_row_with_remote_refs(self, refs: dict[str, str]) -> tuple[dict, str]:
+        """An unlisted checkout whose remote-tracking refs are set by hand (no fetch)."""
+        with TempHome() as env:
+            make_config_repo(env.home / "cfg")
+            plugin = make_git_plugin(env.ctx.config_plugins / self.PID, self.PID, "0.3.0", self.SOURCE)
+            first = git(plugin, "rev-parse", "HEAD").stdout.strip()
+            git(plugin, "switch", "-q", "-c", "feat/zoom")
+            write(plugin / "Main.qml", "import QtQuick\nItem { /* zoom */ }\n")
+            commit_all(plugin, "zoom")
+            head = git(plugin, "rev-parse", "HEAD").stdout.strip()
+            for ref, which in refs.items():
+                git(plugin, "update-ref", f"refs/remotes/{ref}", head if which == "head" else first)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(env.home / "cfg")]))
+            return self._row(env), head
+
+    def test_commit_only_on_a_fork_warns_that_other_machines_cannot_check_it_out(self) -> None:
+        row, head = self._unlisted_row_with_remote_refs(
+            {"origin/main": "first", "origin/HEAD": "head", "fork/feat/zoom": "head"}
+        )
+        self.assertEqual(row["status"], "added-local")
+        self.assertTrue(row["commit_not_on_origin"])
+        self.assertFalse(row["default_publish"])
+        for text in (f"Commit {head[:7]} is on no origin branch", "only fork has it", "Check out cannot find it"):
+            self.assertIn(text, row["summary"])
+            self.assertIn(text, row["effect"])
+
+    def test_commit_on_an_origin_branch_has_no_warning(self) -> None:
+        row, _ = self._unlisted_row_with_remote_refs({"origin/feat/zoom": "head", "fork/feat/zoom": "head"})
+        self.assertFalse(row["commit_not_on_origin"])
+        self.assertTrue(row["default_publish"])
+        self.assertNotIn("origin branch", row["effect"])
+
+    def test_checkout_that_never_fetched_has_no_warning(self) -> None:
+        row, _ = self._unlisted_row_with_remote_refs({})
+        self.assertFalse(row["commit_not_on_origin"])
+        self.assertNotIn("origin branch", row["summary"])
+
     def test_publishing_a_diverged_row_lists_this_machines_commit_and_branch(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")

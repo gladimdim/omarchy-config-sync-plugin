@@ -1622,6 +1622,58 @@ def plugin_is_ancestor(plugin_dir: Path, older: str, newer: str) -> bool:
     return run_git(plugin_dir, ["merge-base", "--is-ancestor", older, newer], timeout=10).returncode == 0
 
 
+def plugin_commit_remotes(plugin_dir: Path, commit: str) -> dict[str, bool] | None:
+    """Which remotes have a branch that contains the commit, as of the last fetch.
+
+    Reads remote-tracking refs only, with no fetch. Returns {remote: contains}
+    for every remote that has tracking refs, or None when the commit is unknown
+    or nothing has been fetched.
+    """
+    if not plugin_has_commit(plugin_dir, commit):
+        return None
+    every = run_git(plugin_dir, [*PLUGIN_GIT_SAFE, "for-each-ref", "--format=%(refname)", "refs/remotes/"], timeout=10)
+    holding = run_git(
+        plugin_dir,
+        [*PLUGIN_GIT_SAFE, "for-each-ref", "--format=%(refname)", f"--contains={commit}", "refs/remotes/"],
+        timeout=10,
+    )
+    if every.returncode != 0 or holding.returncode != 0:
+        return None
+
+    def remote_names(text: str) -> set[str]:
+        names = set()
+        for ref in text.splitlines():
+            parts = ref.strip().split("/")
+            # refs/remotes/<remote>/<branch>; refs/remotes/<remote>/HEAD is a pointer, not a branch.
+            if len(parts) >= 4 and parts[-1] != "HEAD":
+                names.add(parts[2])
+        return names
+
+    known = remote_names(every.stdout)
+    if not known:
+        return None
+    have = remote_names(holding.stdout)
+    return {name: name in have for name in sorted(known)}
+
+
+def commit_not_on_origin_note(plugin_dir: Path, entry: dict[str, Any]) -> str:
+    """A warning when the listed commit is on no origin branch, so another machine cannot check it out.
+
+    plugins.json records origin's URL. A commit pushed only to another remote
+    (a fork) installs from origin's default branch, and Check out then fails.
+    """
+    commit = entry.get("commit") or ""
+    remotes = plugin_commit_remotes(plugin_dir, commit)
+    if not remotes or "origin" not in remotes or remotes["origin"]:
+        return ""
+    others = [name for name, has in remotes.items() if has and name != "origin"]
+    where = f"only {', '.join(others)} has it" if others else "no remote has it"
+    return (
+        f"Commit {commit[:7]} is on no origin branch as of the last fetch; {where} · "
+        "the list would point other machines at origin, where Check out cannot find it"
+    )
+
+
 def plugin_commit_preview(plugin_dir: Path, here: str, there: str) -> str:
     """Commits on each side and the diff between them, capped like a file preview.
 
@@ -1899,6 +1951,13 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
                 default_publish = True
         if not status:
             continue
+        origin_note = ""
+        lists_here = here and not removal and (status == "added-local" or status == "local" or diverged)
+        if lists_here and track_versions and here.get("commit"):
+            origin_note = commit_not_on_origin_note(ctx.config_plugins / pid, here)
+        if origin_note:
+            summary += " · " + origin_note
+            default_publish = False
         hidden = is_hidden_item("l", pid, hidden_keys)
         rows.append(
             {
@@ -1918,7 +1977,10 @@ def plugin_list_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> list[di
                 "repo_branch": (there or {}).get("branch") or "",
                 "diverged": diverged,
                 "preview": preview,
-                "effect": plugin_list_effect(status, diverged, here, there, removal),
+                "effect": " · ".join(
+                    x for x in (plugin_list_effect(status, diverged, here, there, removal), origin_note) if x
+                ),
+                "commit_not_on_origin": bool(origin_note),
                 "default_publish": default_publish and not hidden,
                 "hidden": hidden,
             }
